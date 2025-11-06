@@ -20,19 +20,19 @@ class InContextPathStar:
         """
         self.d = d
         self.l = l
-        self.vocab_size = vocab_size
+        self.vocab_size = vocab_size + 9 # account for special tokens below
         
         # Define special tokens
         self.SPECIAL_TOKENS = {
-            'PAUSE': vocab_size,
-            'PAD': vocab_size + 1,
-            'GT': vocab_size + 2,  # > directional token
-            'LT': vocab_size + 3,  # < directional token
-            'SEP': vocab_size + 4,  # separator token
-            'START': vocab_size + 5,  # start marker
-            'GOAL': vocab_size + 6,   # goal marker
-            'PATH_START': vocab_size + 7,  # path start marker
-            'EOS': vocab_size + 8,  # end of sequence
+            'PAD': 0,
+            'PAUSE': 1,
+            'GT': 2,  # > directional token
+            'LT': 3,  # < directional token
+            'SEP': 4,  # separator token
+            'START': 5,  # start marker
+            'GOAL': 6,   # goal marker
+            'PATH_START': 7,  # path start marker
+            'EOS': 8,  # end of sequence
         }
         
         # Effective vocabulary size: |V| = |nodes| + 9
@@ -50,7 +50,7 @@ class InContextPathStar:
             dict: Mapping from canonical node ID (0 to total_nodes-1) to random token
         """
         # Sample random tokens from vocabulary (without replacement)
-        available_tokens = list(range(self.vocab_size))
+        available_tokens = list(range(9, self.vocab_size + 9))
         selected_tokens = random.sample(available_tokens, self.total_nodes)
         
         # Create mapping: canonical_id -> random_token
@@ -424,23 +424,35 @@ class InWeightsPathStar:
         
         # Apply mapping if provided
         self.mapping = mapping
+        # modify the mapping to accomodate for the special tokens 
+        self.mapping = {k:v+11 for k,v in self.mapping.items()}
+
         if mapping is not None:
             assert len(mapping) == self.total_vert and set(mapping.keys()) == set(self.vertices)
             self._apply_mapping()
         
+        # Define special tokens
+        self.SPECIAL_TOKENS = {
+            'PAD': 0,
+            'PAUSE': 1,
+            'GT': 2,  # > directional token
+            'LT': 3,  # < directional token
+            'SEP': 4,  # separator token
+            'START': 5,  # start marker
+            'GOAL': 6,   # goal marker
+            'PATH_START': 7,  # path start marker
+            'EOS': 8,  # end of sequence
+            'PATH': 9,
+            'EDGE': 10,
+        }
         # Determine pause token based on mapping
-        if mapping is not None:
-            self.pause_token = 1 + max(mapping.values())
-        else:
-            self.pause_token = 1 + max(self.vertices)
-        
-        # Define pad token (after pause token)
-        self.pad_token = self.pause_token + 1
+        self.pause_token = self.SPECIAL_TOKENS['PAUSE']
+        self.pad_token = self.SPECIAL_TOKENS['PAD']
         
         # Define task prefix tokens (after pad token)
         self.TASK_TOKENS = {
-            'PATH': self.pause_token + 2,
-            'EDGE': self.pause_token + 3,
+            'PATH': self.SPECIAL_TOKENS['PATH'],
+            'EDGE': self.SPECIAL_TOKENS['EDGE'],
         }
         
         # Set up holdout paths
@@ -878,7 +890,9 @@ class InWeightsPathStar:
         # Create vocabulary mappings
         # Vocab includes all vertices plus the pause token, pad token, and task tokens
         all_tokens = sorted(set(self.vertices) | {self.pause_token, self.pad_token} | set(self.TASK_TOKENS.values()))
-        vocab_size = len(all_tokens)
+        # vocab_size must be max_token_id + 1 for PyTorch embedding layers
+        # also add <PAUSE> <PAD> <PATH> <EDGE> into consideration
+        vocab_size = max(all_tokens) + 1
         
         itos = {}
         stoi = {}
