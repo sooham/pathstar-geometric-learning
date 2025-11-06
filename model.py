@@ -251,7 +251,7 @@ class GPT(nn.Module):
         return optimizer
 
     def estimate_mfu(self, fwdbwd_per_iter, dt):
-        """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
+        """ estimate model flops utilization (MFU) in units of device peak FLOPS """
         # first estimate the number of flops we do per iteration.
         # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
         N = self.get_num_params()
@@ -260,11 +260,70 @@ class GPT(nn.Module):
         flops_per_token = 6*N + 12*L*H*Q*T
         flops_per_fwdbwd = flops_per_token * T
         flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
-        # express our flops throughput as ratio of A100 bfloat16 peak flops
+        
+        # Auto-detect device and get peak FLOPS
+        flops_promised = self._get_device_peak_flops()
+        
+        # express our flops throughput as ratio of device peak flops
         flops_achieved = flops_per_iter * (1.0/dt) # per second
-        flops_promised = 312e12 # A100 GPU bfloat16 peak flops is 312 TFLOPS
         mfu = flops_achieved / flops_promised
         return mfu
+    
+    def _get_device_peak_flops(self):
+        """
+        Get peak FLOPS for the current device.
+        Returns peak FLOPS in FLOPS (not TFLOPS).
+        """
+        # Check if model parameters exist and get device from them
+        device = next(self.parameters()).device
+        device_type = device.type
+        
+        if device_type == 'cuda':
+            # Try to identify the specific GPU
+            try:
+                gpu_name = torch.cuda.get_device_name(device.index or 0).upper()
+                
+                # Common GPU peak FLOPS (bfloat16/float16)
+                if 'A100' in gpu_name:
+                    return 312e12  # 312 TFLOPS for A100
+                elif 'H100' in gpu_name:
+                    return 989e12  # 989 TFLOPS for H100
+                elif 'V100' in gpu_name:
+                    return 125e12  # 125 TFLOPS for V100
+                elif 'A6000' in gpu_name or 'RTX A6000' in gpu_name:
+                    return 155e12  # 155 TFLOPS for RTX A6000
+                elif 'RTX 4090' in gpu_name or '4090' in gpu_name:
+                    return 330e12  # 330 TFLOPS for RTX 4090
+                elif 'RTX 3090' in gpu_name or '3090' in gpu_name:
+                    return 142e12  # 142 TFLOPS for RTX 3090
+                elif 'A10' in gpu_name:
+                    return 125e12  # 125 TFLOPS for A10
+                elif 'T4' in gpu_name:
+                    return 65e12   # 65 TFLOPS for T4
+                else:
+                    # Default to A100 if unknown CUDA GPU
+                    print(f"Unknown GPU: {gpu_name}, defaulting to A100 peak FLOPS")
+                    return 312e12
+            except:
+                # If we can't get GPU name, default to A100
+                return 312e12
+                
+        elif device_type == 'mps':
+            # Apple Silicon MPS
+            # M1/M2/M3 vary, but rough estimates:
+            # M1: ~10-11 TFLOPS, M2: ~13-15 TFLOPS, M3: ~15-18 TFLOPS
+            # Using a conservative estimate for M2 as baseline
+            return 13e12  # 13 TFLOPS (conservative estimate for Apple Silicon)
+            
+        elif device_type == 'cpu':
+            # CPU peak FLOPS varies widely, use a conservative estimate
+            # Modern high-end CPUs: 1-2 TFLOPS
+            return 1e12  # 1 TFLOPS (conservative estimate)
+            
+        else:
+            # Unknown device, default to A100
+            print(f"Unknown device type: {device_type}, defaulting to A100 peak FLOPS")
+            return 312e12
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
