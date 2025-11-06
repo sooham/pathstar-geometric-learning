@@ -373,7 +373,7 @@ class InContextPathStar:
 
 
 class InWeightsPathStar:
-    def __init__(self, d=5, l=5, vocab=None, mapping=None, holdout_percentage=0.0):
+    def __init__(self, d=5, l=5, vocab_size=None, holdout_percentage=0.0):
         """
         Generator instance for a pathstar graph with d spokes
         of length l
@@ -381,22 +381,26 @@ class InWeightsPathStar:
         Args:
             d: Number of spokes/paths in the path-star
             l: Length of each path (number of nodes from root to leaf)
-            vocab: Optional vocabulary list
+            vocab_size: Optional vocabulary mapping size
             mapping: Optional mapping from canonical node IDs to vocabulary tokens
             holdout_percentage: Percentage of paths to hold out (0.0 to 1.0)
         """
+
         self.d = d
         self.l = l
+        self.vocab_size = vocab_size
 
         self.adj_list = {}
-        self.vertices = set()
-        if vocab:
-            self.vocab = vocab
-        else:
-            self.vocab = list(range(2000))
+        self.num_vertices = d * (l-1) + 1
+        # Sample random tokens from vocabulary without replacement
+        canonical_nodes = list(range(self.num_vertices))
+        vocab_tokens = random.sample(range(vocab_size), num_vertices)
+        self.mapping = None
+        if vocab_size:
+            self.mapping = dict(zip(canonical_nodes, vocab_tokens))
 
         # populate the vertices with d * (l-1) + 1 vertices
-        # 0 is the root node
+        # 0 jis the root node
         # Spokes start at: 1, l, 2l-1, 3l-2, ... = 1+(l-1)*k for k in [0, d-1]
         self.vertices = list(range(d * (l-1) + 1))
         self.v_root = 0
@@ -422,13 +426,11 @@ class InWeightsPathStar:
                 path_list.append(node_val)
             self.paths_by_leaf[node_val] = path_list
         
-        # Apply mapping if provided
-        self.mapping = mapping
-        # modify the mapping to accomodate for the special tokens 
-        self.mapping = {k:v+11 for k,v in self.mapping.items()}
 
-        if mapping is not None:
-            assert len(mapping) == self.total_vert and set(mapping.keys()) == set(self.vertices)
+        if self.mapping is not None:
+            # modify the mapping to accomodate for the special tokens 
+            self.mapping = {k:v+11 for k,v in self.mapping.items()}
+            assert len(self.mapping) == self.total_vert and set(self.mapping.keys()) == set(self.vertices)
             self._apply_mapping()
         
         # Define special tokens
@@ -699,8 +701,9 @@ class InWeightsPathStar:
                 + (f" or {2 * self.total_edges} undirected edges." if undirected else ".")
             )
         
-        # Sample edges with replacement
-        sampled_edges = random.choices(edges, k=size)
+        # Shuffle edges and take the first k
+        random.shuffle(edges)
+        sampled_edges = edges[:size]
         
         # Split into x (predecessors) and y (successors)
         x = torch.tensor([edge[0] for edge in sampled_edges], dtype=torch.long)
@@ -822,11 +825,23 @@ class InWeightsPathStar:
         print(f"  Final dataset sizes:")
         print(f"    Training set: {train_size} ({num_train_path_samples} paths + {num_edge_samples} edges)")
         print(f"    Validation set: {val_size} (holdout paths only, no edges)")
+        print(f"    2d dimension of training set is : {self.l + num_pause_tokens + 2}")
         print(f"  Output directory: {full_output_dir}")
         print(f"  Pause token: {self.pause_token}")
         print(f"  Pad token: {self.pad_token}")
+        print(f"  EDGE token: {self.SPECIAL_TOKENS['EDGE']}")
+        print(f"  PATH token: {self.SPECIAL_TOKENS['PATH']}")
         print(f"  Number of pause tokens: {num_pause_tokens}")
         print(f"  Holdout percentage: {self.holdout_percentage}")
+        
+        # Print paths_by_leaf in a pretty manner
+        print(f"\n  Paths by leaf node:")
+        for leaf, path in sorted(self.paths_by_leaf.items()):
+            path_str = ' -> '.join(map(str, path))
+            is_train = leaf in self.train_leaves
+            is_holdout = leaf in self.holdout_leaves
+            status = "TRAIN" if is_train else ("HOLDOUT" if is_holdout else "UNKNOWN")
+            print(f"    Leaf {leaf} [{status}]: {path_str}")
         
         # Generate training set: paths + edges
         print("\nGenerating training set (training paths + edges)...")
@@ -873,6 +888,12 @@ class InWeightsPathStar:
             holdout_only=True  # Uses holdout_leaves
         )
         
+        # Debug: Print train and val sequences
+        print(f"\nDebug - Train sequences (numpy):")
+        print(train_sequences.numpy())
+        print(f"\nDebug - Val sequences (numpy):")
+        print(val_sequences.numpy())
+        
         # Save training data
         train_path = os.path.join(full_output_dir, 'train.bin')
         print(f"\nSaving training data to {train_path}...")
@@ -892,7 +913,7 @@ class InWeightsPathStar:
         all_tokens = sorted(set(self.vertices) | {self.pause_token, self.pad_token} | set(self.TASK_TOKENS.values()))
         # vocab_size must be max_token_id + 1 for PyTorch embedding layers
         # also add <PAUSE> <PAD> <PATH> <EDGE> into consideration
-        vocab_size = max(all_tokens) + 1
+        vocab_size = self.vocab_size + 11
         
         itos = {}
         stoi = {}
@@ -1015,16 +1036,12 @@ if __name__ == '__main__':
                 f"Please increase vocab_size to at least {num_vertices}."
             )
         
-        # Sample random tokens from vocabulary without replacement
-        canonical_nodes = list(range(num_vertices))
-        vocab_tokens = random.sample(range(args.vocab_size), num_vertices)
-        mapping = dict(zip(canonical_nodes, vocab_tokens))
         
         generator = InWeightsPathStar(
             d=args.d, 
             l=args.l, 
             holdout_percentage=holdout_percentage,
-            mapping=mapping
+            vocab_size=args.vocab_size
         )
         
         # Visualize the graph if requested
