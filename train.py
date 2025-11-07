@@ -60,7 +60,7 @@ dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
 learning_rate = 1e-3 # max learning rate
-epochs = 5000
+epochs = 15000
 TRAIN_DATASET_SIZE = total_edge_size + total_train_paths 
 VAL_DATASET_SIZE = num_holdout
 batch_per_dataset = int(np.ceil(TRAIN_DATASET_SIZE / (batch_size * gradient_accumulation_steps)))
@@ -81,7 +81,7 @@ wandb_run_name = f"{dataset}_L{n_layer}H{n_head}E{n_embd}_lr{learning_rate}_bs{b
 decay_lr = True # whether to decay the learning rate (cosine decay with linear warmup)
 warmup_iters = int(max_iters * 0.25) # how many steps to warm up for (linear increase from 0 to learning_rate)
 lr_decay_iters = int(max_iters * 0.99) # total steps for warmup + decay phase; should be ~= max_iters per Chinchilla
-min_lr = 6e-5 # minimum learning rate after decay completes, should be ~= learning_rate/10 per Chinchilla
+min_lr = 6e-4 # minimum learning rate after decay completes, should be ~= learning_rate/10 per Chinchilla
 # system
 # Auto-detect device
 if torch.cuda.is_available():
@@ -168,6 +168,7 @@ print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 # Load special token IDs for masking in loss calculation
 edge_token = None
 path_token = None
+root_vertex = None
 
 if 'task_tokens' in meta:
     edge_token = meta['task_tokens']['EDGE']
@@ -191,6 +192,7 @@ else:
 # Load stoi and itos for token visualization
 stoi = meta.get('stoi', {})
 itos = meta.get('itos', {})
+root_vertex = meta.get('root_vertex')
 if itos:
     print(f"Loaded vocabulary mappings: {len(itos)} tokens")
 
@@ -354,7 +356,7 @@ if compile:
     unoptimized_model = model
     model = torch.compile(model) # requires PyTorch 2.0
 
-def compute_per_token_loss(logits, input,  targets, token_positions):
+def compute_per_token_loss(logits, input,  targets, token_positions, debug=False, split=''):
     """
     Compute per-token loss for specified token positions.
     
@@ -363,6 +365,8 @@ def compute_per_token_loss(logits, input,  targets, token_positions):
         input: Input tokens of shape (batch_size, seq_length) that will be used to predict the targets
         targets: Target tokens of shape (batch_size, seq_length)
         token_positions: List or range of token positions (1-indexed) to compute loss for based on context
+        debug: If True, print debug information about misclassifications
+        split: Dataset split name ('train' or 'val') for debug messages
 
     The context is automatically determined by looking at the TASK token used : either PATH or EDGE
     
@@ -399,11 +403,15 @@ def compute_per_token_loss(logits, input,  targets, token_positions):
             logits_at_pos = torch.zeros(batch_size, logits.size(2), device=logits.device)
             targets_at_pos = torch.zeros(batch_size, dtype=targets.dtype, device=targets.device)
             
+            # Track which batch indices are valid for debug purposes
+            valid_batch_indices = []
+            
             for b in range(batch_size):
                 if valid_idx_mask[b]:
                     idx = y_idx[b].item()
                     logits_at_pos[b] = logits[b, idx, :]
                     targets_at_pos[b] = targets[b, idx]
+                    valid_batch_indices.append(b)
                 else:
                     print("Warning: masking happening in compute per token loss")
                     targets_at_pos[b] = -1  # Mark as invalid
@@ -414,6 +422,60 @@ def compute_per_token_loss(logits, input,  targets, token_positions):
                 logits_valid = logits_at_pos[valid_mask]
                 targets_valid = targets_at_pos[valid_mask]
                 
+                # Debug: check predictions vs ground truth
+                if debug and split == 'train':
+                    predicted_classes = torch.argmax(logits_valid, dim=1)
+                    mismatches = predicted_classes != targets_valid
+                    num_mismatches = mismatches.sum().item()
+                    total_samples = len(targets_valid)
+                    accuracy = (total_samples - num_mismatches) / total_samples if total_samples > 0 else 0.0
+                    
+                    # Compute probabilities for detailed analysis
+                    probs = F.softmax(logits_valid, dim=1)
+                    
+                    print(f"\n[DEBUG {split.upper()}] Token position {token_pos}:")
+                    print(f"  Accuracy: {accuracy*100:.2f}% ({total_samples - num_mismatches}/{total_samples})")
+                    print(f"  Mismatches: {num_mismatches}")
+                    
+                    # Count mismatches where the context node is the root node
+                    if root_vertex is not None and num_mismatches > 0:
+                        root_mismatches = 0
+                        mismatch_indices = torch.where(mismatches)[0]
+                        for idx in mismatch_indices:
+                            original_batch_idx = valid_batch_indices[idx.item()]
+                            # Get the node from context (second token in context for EDGE tasks)
+                            context_node = input[original_batch_idx, 1].item()
+                            if context_node == root_vertex:
+                                root_mismatches += 1
+                        print(f"  Root node mismatches: {root_mismatches}/{num_mismatches} ({root_mismatches/num_mismatches*100:.1f}%)")
+                    
+                    # Show first few mismatches
+                    if num_mismatches > 0:
+                        mismatch_indices = torch.where(mismatches)[0][:10]  # Show up to 10 mismatches
+                        print(f"  First {min(num_mismatches, 10)} misclassifications:")
+                        for i, idx in enumerate(mismatch_indices):
+                            pred = predicted_classes[idx].item()
+                            truth = targets_valid[idx].item()
+                            
+                            # Get probabilities
+                            pred_prob = probs[idx, pred].item()  # Probability of predicted class
+                            truth_prob = probs[idx, truth].item()  # Probability of correct class
+                            individual_loss = -np.log(max(truth_prob, 1e-10))  # Avoid log(0)
+                            
+                            # Convert to token strings if available
+                            pred_str = itos.get(pred, f"<{pred}>") if itos else str(pred)
+                            truth_str = itos.get(truth, f"<{truth}>") if itos else str(truth)
+                            
+                            # Get the original batch index to access the input context
+                            original_batch_idx = valid_batch_indices[idx.item()]
+                            input_context = input[original_batch_idx, :context_length_per_input[original_batch_idx]].cpu().numpy()
+                            # Convert input context to readable strings
+                            context_str = ' '.join([itos.get(int(tok), f"<{int(tok)}>") if itos else str(int(tok)) for tok in input_context])
+                            
+                            print(f"    [{i+1}] Input Context: {context_str}")
+                            print(f"        Predicted:\t\t{pred_str} (ID={pred}, prob={pred_prob:.4f})")
+                            print(f"        Ground Truth:\t\t{truth_str} (ID={truth}, prob={truth_prob:.6f})")
+                            print(f"        Individual Loss: {individual_loss:.4f}")
                 # Compute cross-entropy loss for this token position
                 token_loss = F.cross_entropy(logits_valid, targets_valid, reduction='mean')
                 per_token_losses[token_pos] = token_loss.item()
@@ -454,12 +516,14 @@ def estimate_loss():
             # Compute per-token losses based on split
             if split == 'train':
                 # Only compute 1st token loss for training
-                batch_per_token = compute_per_token_loss(logits, X, Y, [1])
+                # Enable debug for the first batch only to avoid flooding the output
+                debug_enabled = (k == 0)
+                batch_per_token = compute_per_token_loss(logits, X, Y, [1], debug=debug_enabled, split='train')
                 if 1 in batch_per_token:
                     train_token_losses[1].append(batch_per_token[1])
             else:  # val
                 # Compute all token positions for validation
-                batch_per_token = compute_per_token_loss(logits, X, Y, range(1, graph_length + 1))
+                batch_per_token = compute_per_token_loss(logits, X, Y, range(1, graph_length + 1), debug=False, split='val')
                 for token_pos, token_loss in batch_per_token.items():
                     if not math.isnan(token_loss):
                         val_token_losses[token_pos].append(token_loss)
@@ -644,6 +708,7 @@ while True:
                 }
                 print(f"saving checkpoint to {out_dir}/{checkpoint_filename}")
                 torch.save(checkpoint, os.path.join(out_dir, checkpoint_filename))
+
     if iter_num == 0 and eval_only:
         break
 
