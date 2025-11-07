@@ -268,7 +268,7 @@ class GPT(nn.Module):
         flops_achieved = flops_per_iter * (1.0/dt) # per second
         mfu = flops_achieved / flops_promised
         return mfu
-    
+
     def _get_device_peak_flops(self):
         """
         Get peak FLOPS for the current device.
@@ -296,6 +296,8 @@ class GPT(nn.Module):
                     return 330e12  # 330 TFLOPS for RTX 4090
                 elif 'RTX 3090' in gpu_name or '3090' in gpu_name:
                     return 142e12  # 142 TFLOPS for RTX 3090
+                elif 'RTX 5060 TI' in gpu_name or '5060 TI' in gpu_name:
+                    return 300e12  # 300 TFLOPS for RTX 5060 Ti (estimated)
                 elif 'A10' in gpu_name:
                     return 125e12  # 125 TFLOPS for A10
                 elif 'T4' in gpu_name:
