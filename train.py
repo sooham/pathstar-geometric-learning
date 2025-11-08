@@ -799,7 +799,8 @@ while True:
                 "val/loss/overall": losses['val'],
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
-                "gen/avg_accuracy": avg_accuracy,
+                "gen/val_avg_accuracy": val_avg_accuracy,
+                "gen/train_avg_accuracy": train_avg_accuracy
             }
             
             # Add training 1st token loss to wandb
