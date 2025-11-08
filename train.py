@@ -18,6 +18,19 @@ import torch.nn.functional as F
 
 from model import GPTConfig, GPT
 
+def load_meta(dataset):
+    # Data loading setup
+    data_dir = os.path.join('data', dataset)
+    # Load metadata once at initialization
+    meta_path = os.path.join(data_dir, 'meta.pkl')
+    if not os.path.exists(meta_path):
+        raise ValueError(f"Metadata file not found at {meta_path}")
+
+    with open(meta_path, 'rb') as f:
+        meta = pickle.load(f)
+    
+    return meta
+
 # -----------------------------------------------------------------------------
 # default config values designed to train a customized small GPT
 # I/O
@@ -32,13 +45,16 @@ wandb_log = True # disabled by default
 wandb_project = 'pathstar'
 # data
 ###################################################
-dataset = 'inweights_pathstar_d500_l9'
+dataset = 'inweights_pathstar_d500_l9_p3_undirected_dt'
+
+meta = load_meta(dataset)
 gradient_accumulation_steps = 5 # used to simulate larger batch sizes (effective batch = 512 * 8 = 4096)
-graph_length = 9 
-graph_spokes = 500
-holdout_ratio = 0.5
-bidirectional = False
-pause_length = 3
+graph_length = meta['l']  # this can be determined by meta.pkl
+graph_spokes = meta['d'] # this can be determined by meta.pkl
+holdout_ratio = meta['holdout_percentage'] # this can be determined by meta.pkl
+bidirectional = meta['use_undirected'] # this can be determined by meta.pkl
+pause_length = meta['num_pause_tokens'] # this can be determined by meta.pkl
+use_directional_tokens = meta['use_directional_tokens']
 total_edge_size = (2 if bidirectional else 1) * (graph_length - 1) * graph_spokes 
 num_holdout = round(graph_spokes * holdout_ratio)
 total_train_paths =  (graph_spokes - num_holdout)
@@ -70,7 +86,7 @@ weight_decay = 0.01 # weight decay for AdamW optimizer
 beta1 = 0.9  # AdamW optimizer beta1 parameter (exponential decay rate for first moment estimates)
 beta2 = 0.95  # AdamW optimizer beta2 parameter (exponential decay rate for second moment estimates)
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
-wandb_run_name = f"{dataset}_L{n_layer}H{n_head}E{n_embd}_lr{learning_rate}_bs{batch_size}_ga{gradient_accumulation_steps}_pl{pause_length}_bi{bidirectional}_{time.time()}"
+wandb_run_name = f"{dataset}_L{n_layer}H{n_head}E{n_embd}_lr{learning_rate}_bs{batch_size}_ga{gradient_accumulation_steps}_{time.time()}"
 
 # learning rate decay settings
 # Learning rate schedule with cosine decay and linear warmup:
@@ -147,20 +163,10 @@ device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.aut
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
-# Data loading setup
-data_dir = os.path.join('data', dataset)
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
 best_val_loss = 1e9
-
-# Load metadata once at initialization
-meta_path = os.path.join(data_dir, 'meta.pkl')
-if not os.path.exists(meta_path):
-    raise ValueError(f"Metadata file not found at {meta_path}")
-
-with open(meta_path, 'rb') as f:
-    meta = pickle.load(f)
 
 meta_vocab_size = meta['vocab_size']
 print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
@@ -376,9 +382,10 @@ def compute_per_token_loss(logits, input,  targets, token_positions, debug=False
     per_token_losses = {}
     # Compute context length per input based on task token
     # Shape: (batch_size,) where each element is either 2 (EDGE) or (2 + pause_length) (PATH)
+    # 3 for EDGE depending on if directional tokens are used
     context_length_per_input = torch.where(
         input[:, 0] == edge_token,
-        torch.tensor(2, device=input.device),
+        torch.tensor(3 if use_directional_tokens else 2, device=input.device), # (EDGE , u)
         torch.where(
             input[:, 0] == path_token,
             torch.tensor(2 + pause_length, device=input.device),

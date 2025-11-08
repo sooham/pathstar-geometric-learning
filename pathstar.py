@@ -971,6 +971,7 @@ class InWeightsPathStar:
             'train_leaves': self.train_leaves,
             'holdout_leaves': self.holdout_leaves,
             'use_undirected': use_undirected,
+            'use_directional_tokens': use_directional_tokens,
             'train_size': train_size,
             'val_size': val_size,
             'num_train_path_samples': num_train_path_samples,
