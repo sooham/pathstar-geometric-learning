@@ -276,7 +276,7 @@ class InContextPathStar:
             output_dir: Base directory for output (default: './data')
         """
         # Create output directory with parameters in name
-        dir_name = f'incontext_pathstar_d{self.d}_l{self.l}_v{self.vocab_size}'
+        dir_name = f'incontext_pathstar_d{self.d}_l{self.l}_v{self.vocab_size}_p{num_pause_tokens}{"_dir" if use_directional_tokens else ""}'
         full_output_dir = os.path.join(output_dir, dir_name)
         os.makedirs(full_output_dir, exist_ok=True)
         
@@ -437,8 +437,8 @@ class InWeightsPathStar:
         self.SPECIAL_TOKENS = {
             'PAD': 0,
             'PAUSE': 1,
-            'GT': 2,  # > directional token
-            'LT': 3,  # < directional token
+            'GT': 2,  # > directional token means parent > child
+            'LT': 3,  # < directional token child < parent
             'SEP': 4,  # separator token
             'START': 5,  # start marker
             'GOAL': 6,   # goal marker
@@ -672,7 +672,7 @@ class InWeightsPathStar:
         else:
             plt.show()
     
-    def generate_edge_memorization_training_set(self, size, undirected=True):
+    def generate_edge_memorization_training_set(self, size, undirected=True, use_directional_tokens=True):
         """
         Generate a training set of edges sampled randomly from the path-star graph.
         
@@ -681,16 +681,21 @@ class InWeightsPathStar:
             undirected: If True, also include reverse edges (y -> x) in the sampling pool
         
         Returns:
-            x: torch tensor of predecessor vertices (shape: [size])
-            y: torch tensor of successor vertices (shape: [size])
+            edges: shape (size, 2) or (size, 3) if use directional otkesn 
         """
         # Collect all edges from the adjacency list
         edges = []
         for u in self.adj_list:
             for v in self.adj_list[u]:
-                edges.append((u, v))
+                if use_directional_tokens:
+                    edges.append([self.SPECIAL_TOKENS['GT'], u, v])
+                else:
+                    edges.append([u, v])
                 if undirected:
-                    edges.append((v, u))
+                    if use_directional_tokens:
+                        edges.append([self.SPECIAL_TOKENS['LT'], v, u])
+                    else:
+                        edges.append([v, u])
         
         # Validate size
         max_edges = len(edges)
@@ -705,11 +710,8 @@ class InWeightsPathStar:
         random.shuffle(edges)
         sampled_edges = edges[:size]
         
-        # Split into x (predecessors) and y (successors)
-        x = torch.tensor([edge[0] for edge in sampled_edges], dtype=torch.long)
-        y = torch.tensor([edge[1] for edge in sampled_edges], dtype=torch.long)
-        
-        return x, y
+        # Return as torch tensor
+        return torch.tensor(sampled_edges, dtype=torch.long)
 
     def generate_path_prediction_training_set(self, size, num_pause_tokens=1, 
                                              obey_holdout=True, holdout_only=False):
@@ -773,7 +775,7 @@ class InWeightsPathStar:
         return sequences
     
     def prepare(self, num_pause_tokens=1, output_dir='./data', 
-                use_undirected=True):
+                use_undirected=True, use_directional_tokens=True):
         """
         Prepare and save training and validation datasets to disk for in-weights path-star.
         
@@ -790,6 +792,7 @@ class InWeightsPathStar:
             num_pause_tokens: Number of PAUSE tokens between leaf and path
             output_dir: Base directory for output (default: './data')
             use_undirected: If True, use undirected edges (both x->y and y->x) (default: True)
+            use_directional_tokens: If True, use special tokens to demarcate edge directions in the edge training set
         """
         # Calculate dataset sizes based on graph structure
         num_edges = self.d * (self.l - 1)
@@ -806,7 +809,7 @@ class InWeightsPathStar:
         val_size = num_val_path_samples
         
         # Create output directory with parameters in name
-        dir_name = f'inweights_pathstar_d{self.d}_l{self.l}'
+        dir_name = f'inweights_pathstar_d{self.d}_l{self.l}_p{num_pause_tokens}_{"un" if use_undirected else ""}directed_{"dt" if use_directional_tokens else ""}'
         full_output_dir = os.path.join(output_dir, dir_name)
         os.makedirs(full_output_dir, exist_ok=True)
         
@@ -854,14 +857,14 @@ class InWeightsPathStar:
         )
         
         # Generate edge sequences
-        edge_x, edge_y = self.generate_edge_memorization_training_set(
+        edges = self.generate_edge_memorization_training_set(
             size=num_edge_samples,
-            undirected=use_undirected
+            undirected=use_undirected,
+            use_directional_tokens=use_directional_tokens
         )
-        
-        # Convert edge pairs to sequences: [<EDGE>, x, y]
-        edge_task_tokens = torch.full((num_edge_samples,), self.TASK_TOKENS['EDGE'], dtype=torch.long)
-        edge_sequences = torch.stack([edge_task_tokens, edge_x, edge_y], dim=1)
+        # Convert edge pairs to sequences: [<EDGE>,<optional direction token>, x, y]
+        edge_task_tokens = torch.full((num_edge_samples, 1), self.TASK_TOKENS['EDGE'], dtype=torch.long)
+        edge_sequences = torch.cat([edge_task_tokens, edges], dim=1)
         
         # Pad edge sequences to match path sequence length using <PAD> token
         path_seq_len = train_path_sequences.shape[1]
@@ -910,7 +913,7 @@ class InWeightsPathStar:
         
         # Create vocabulary mappings
         # Vocab includes all vertices plus the pause token, pad token, and task tokens
-        all_tokens = sorted(set(self.vertices) | {self.pause_token, self.pad_token} | set(self.TASK_TOKENS.values()))
+        all_tokens = sorted(set(self.vertices) | set(self.SPECIAL_TOKENS.values()))
         # vocab_size must be max_token_id + 1 for PyTorch embedding layers
         # also add <PAUSE> <PAD> <PATH> <EDGE> into consideration
         vocab_size = self.vocab_size + 11
@@ -919,18 +922,24 @@ class InWeightsPathStar:
         stoi = {}
         
         for token in all_tokens:
-            if token == self.pause_token:
+            if token == self.SPECIAL_TOKENS['PAUSE']:
                 itos[token] = '<PAUSE>'
                 stoi['<PAUSE>'] = token
-            elif token == self.pad_token:
+            elif token == self.SPECIAL_TOKENS['PAD']:
                 itos[token] = '<PAD>'
                 stoi['<PAD>'] = token
-            elif token == self.TASK_TOKENS['PATH']:
+            elif token == self.SPECIAL_TOKENS['PATH']:
                 itos[token] = '<PATH>'
                 stoi['<PATH>'] = token
-            elif token == self.TASK_TOKENS['EDGE']:
+            elif token == self.SPECIAL_TOKENS['EDGE']:
                 itos[token] = '<EDGE>'
                 stoi['<EDGE>'] = token
+            elif token == self.SPECIAL_TOKENS['GT']:
+                itos[token] = '>'
+                stoi['>'] = token
+            elif token == self.SPECIAL_TOKENS['LT']:
+                itos[token] = '<'
+                stoi['<'] = token
             elif token == self.v_root:
                 itos[token] = f'ROOT_{token}'
                 stoi[f'ROOT_{token}'] = token
@@ -950,8 +959,9 @@ class InWeightsPathStar:
             'l': self.l,
             'total_vertices': self.total_vert,
             'total_edges': num_edges,
-            'pause_token': self.pause_token,
-            'pad_token': self.pad_token,
+            'pause_token': self.SPECIAL_TOKENS["PAUSE"],
+            'pad_token': self.SPECIAL_TOKENS["PAD"],
+            'special_tokens': self.SPECIAL_TOKENS,
             'task_tokens': self.TASK_TOKENS,
             'num_pause_tokens': num_pause_tokens,
             'root_vertex': self.v_root,
@@ -1054,5 +1064,6 @@ if __name__ == '__main__':
         generator.prepare(
             num_pause_tokens=args.num_pause_tokens,
             output_dir=args.output_dir,
-            use_undirected=not args.use_directed
+            use_undirected=not args.use_directed,
+            use_directional_tokens=args.use_directional_tokens
         )

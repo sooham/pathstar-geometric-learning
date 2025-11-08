@@ -25,8 +25,8 @@ out_dir = 'out'
 eval_interval = 50
 log_interval = 10
 eval_only = False # if True, script exits right after the first eval
-always_save_checkpoint = False # if True, always save a checkpoint after each eval
-init_from = 'scratch' # 'scratch' or 'resume'
+always_save_checkpoint = True # if True, always save a checkpoint after each eval
+init_from = 'resume' # 'scratch' or 'resume'
 # wandb logging
 wandb_log = True # disabled by default
 wandb_project = 'pathstar'
@@ -38,7 +38,7 @@ graph_length = 9
 graph_spokes = 500
 holdout_ratio = 0.5
 bidirectional = False
-pause_length = 1
+pause_length = 3
 total_edge_size = (2 if bidirectional else 1) * (graph_length - 1) * graph_spokes 
 num_holdout = round(graph_spokes * holdout_ratio)
 total_train_paths =  (graph_spokes - num_holdout)
@@ -59,8 +59,8 @@ n_embd =  384   # defulat is 384
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
-learning_rate = 1e-3 # max learning rate
-epochs = 15000
+learning_rate = 1e-4 # max learning rate
+epochs = 10000
 TRAIN_DATASET_SIZE = total_edge_size + total_train_paths 
 VAL_DATASET_SIZE = num_holdout
 batch_per_dataset = int(np.ceil(TRAIN_DATASET_SIZE / (batch_size * gradient_accumulation_steps)))
@@ -70,7 +70,7 @@ weight_decay = 0.01 # weight decay for AdamW optimizer
 beta1 = 0.9  # AdamW optimizer beta1 parameter (exponential decay rate for first moment estimates)
 beta2 = 0.95  # AdamW optimizer beta2 parameter (exponential decay rate for second moment estimates)
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
-wandb_run_name = f"{dataset}_L{n_layer}H{n_head}E{n_embd}_lr{learning_rate}_bs{batch_size}_ga{gradient_accumulation_steps}_{time.time()}"
+wandb_run_name = f"{dataset}_L{n_layer}H{n_head}E{n_embd}_lr{learning_rate}_bs{batch_size}_ga{gradient_accumulation_steps}_pl{pause_length}_bi{bidirectional}_{time.time()}"
 
 # learning rate decay settings
 # Learning rate schedule with cosine decay and linear warmup:
@@ -78,10 +78,10 @@ wandb_run_name = f"{dataset}_L{n_layer}H{n_head}E{n_embd}_lr{learning_rate}_bs{b
 # 2. Cosine decay: LR decays following a cosine curve from learning_rate to min_lr over (lr_decay_iters - warmup_iters) steps
 # 3. Constant minimum: LR stays at min_lr for all iterations beyond lr_decay_iters
 # Example: learning_rate=1e-3, min_lr=6e-5 means LR goes 0 -> 1e-3 (warmup) -> 6e-5 (decay) -> 6e-5 (constant)
-decay_lr = True # whether to decay the learning rate (cosine decay with linear warmup)
+decay_lr = False # whether to decay the learning rate (cosine decay with linear warmup)
 warmup_iters = int(max_iters * 0.25) # how many steps to warm up for (linear increase from 0 to learning_rate)
 lr_decay_iters = int(max_iters * 0.99) # total steps for warmup + decay phase; should be ~= max_iters per Chinchilla
-min_lr = 6e-4 # minimum learning rate after decay completes, should be ~= learning_rate/10 per Chinchilla
+min_lr = 6e-5 # minimum learning rate after decay completes, should be ~= learning_rate/10 per Chinchilla
 # system
 # Auto-detect device
 if torch.cuda.is_available():
@@ -136,7 +136,7 @@ if experiment_name is None:
     experiment_name = wandb_run_name
 
 # Create unique checkpoint filename based on experiment and GPU
-checkpoint_filename = f'ckpt_exp_{experiment_name}_gpu_{gpu_id}.pt'
+checkpoint_filename = f'ckpt_exp_{experiment_name}_pl{pause_length}_bi{bidirectional}_gpu_{gpu_id}.pt'
 print(f"Checkpoint will be saved as: {checkpoint_filename}")
 
 torch.manual_seed(1337)
@@ -517,8 +517,7 @@ def estimate_loss():
             if split == 'train':
                 # Only compute 1st token loss for training
                 # Enable debug for the first batch only to avoid flooding the output
-                debug_enabled = (k == 0)
-                batch_per_token = compute_per_token_loss(logits, X, Y, [1], debug=debug_enabled, split='train')
+                batch_per_token = compute_per_token_loss(logits, X, Y, [1], debug=False, split='train')
                 if 1 in batch_per_token:
                     train_token_losses[1].append(batch_per_token[1])
             else:  # val
