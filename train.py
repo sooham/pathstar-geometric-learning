@@ -53,7 +53,7 @@ wandb_project = 'pathstar_small'
 dataset = 'inweights_pathstar_d5_l5_p1_undirected_dt'
 
 meta, train_data, val_data = load_dataset(dataset)
-gradient_accumulation_steps = 1 # used to simulate larger batch sizes (effective batch = 512 * 8 = 4096)
+gradient_accumulation_steps = 1 #7 # used to simulate larger batch sizes (effective batch = 512 * 8 = 4096)
 graph_length = meta['l']  # this can be determined by meta.pkl
 graph_spokes = meta['d'] # this can be determined by meta.pkl
 holdout_ratio = meta['holdout_percentage'] # this can be determined by meta.pkl
@@ -63,13 +63,20 @@ use_directional_tokens = meta['use_directional_tokens']
 total_edge_size = (2 if bidirectional else 1) * (graph_length - 1) * graph_spokes 
 num_holdout = round(graph_spokes * holdout_ratio)
 total_train_paths =  (graph_spokes - num_holdout)
-batch_size = 43  #850 # 8250 # if gradient_accumulation_steps > 1, this is the micro-batch size
-block_size = graph_length + 2 + pause_length
+# Account for path replication to balance classes (added in pathstar.py)
+replication_factor = total_edge_size // total_train_paths if total_train_paths > 0 else 1
+if replication_factor < 1:
+    replication_factor = 1
+replicated_train_paths = total_train_paths * replication_factor
+print(f"Class balancing: {total_train_paths} training paths replicated by factor {replication_factor} → {replicated_train_paths} replicated paths")
+print(f"Training dataset composition: {replicated_train_paths} replicated paths + {total_edge_size} edges = {replicated_train_paths + total_edge_size} total samples")
+max_allowed_batch_size = total_edge_size + replicated_train_paths
+batch_size = max_allowed_batch_size  # 2000 # 8250 # if gradient_accumulation_steps > 1, this is the micro-batch size
 effective_batch_size = gradient_accumulation_steps * batch_size
-max_allowed_batch_size = total_edge_size + total_train_paths
+block_size = graph_length + 2 + pause_length
 assert effective_batch_size <= max_allowed_batch_size, (
     f"Effective batch size ({effective_batch_size} = {gradient_accumulation_steps} * {batch_size}) "
-    f"exceeds total training dataset size ({max_allowed_batch_size} = {total_edge_size} + {total_train_paths}). "
+    f"exceeds total training dataset size ({max_allowed_batch_size} = {total_edge_size} + {replicated_train_paths}). "
     f"Reduce batch_size or gradient_accumulation_steps."
 )
 ###################################################
@@ -81,8 +88,8 @@ dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
 learning_rate = 1e-3 # max learning rate
-epochs = 10000 # 20000
-TRAIN_DATASET_SIZE = total_edge_size + total_train_paths 
+epochs = 2000 # 20000
+TRAIN_DATASET_SIZE = total_edge_size + replicated_train_paths 
 VAL_DATASET_SIZE = num_holdout
 batch_per_dataset = int(np.ceil(TRAIN_DATASET_SIZE / (batch_size * gradient_accumulation_steps)))
 eval_iters = int(np.ceil(TRAIN_DATASET_SIZE / batch_size))  # eval for one epoch, no gradient accumulation
