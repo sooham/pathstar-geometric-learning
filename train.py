@@ -18,9 +18,13 @@ import torch.nn.functional as F
 
 from model import GPTConfig, GPT
 
-def load_meta(dataset):
+
+def load_dataset(dataset):
     # Data loading setup
     data_dir = os.path.join('data', dataset)
+    # Load data once as memory-mapped arrays
+    train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+    val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
     # Load metadata once at initialization
     meta_path = os.path.join(data_dir, 'meta.pkl')
     if not os.path.exists(meta_path):
@@ -29,7 +33,7 @@ def load_meta(dataset):
     with open(meta_path, 'rb') as f:
         meta = pickle.load(f)
     
-    return meta
+    return meta, train_data, val_data
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a customized small GPT
@@ -47,7 +51,7 @@ wandb_project = 'pathstar'
 ###################################################
 dataset = 'inweights_pathstar_d500_l9_p3_undirected_dt'
 
-meta = load_meta(dataset)
+meta, train_data, val_data = load_dataset(dataset)
 gradient_accumulation_steps = 5 # used to simulate larger batch sizes (effective batch = 512 * 8 = 4096)
 graph_length = meta['l']  # this can be determined by meta.pkl
 graph_spokes = meta['d'] # this can be determined by meta.pkl
@@ -202,9 +206,6 @@ root_vertex = meta.get('root_vertex')
 if itos:
     print(f"Loaded vocabulary mappings: {len(itos)} tokens")
 
-# Load data once as memory-mapped arrays
-train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
 
 # Calculate dataset structure from metadata
 train_size = meta.get('train_size', TRAIN_DATASET_SIZE)
