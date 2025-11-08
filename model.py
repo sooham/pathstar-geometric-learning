@@ -184,7 +184,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, label_smoothing=0.0):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -204,7 +204,8 @@ class GPT(nn.Module):
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), 
+                                   ignore_index=-1, label_smoothing=label_smoothing)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
@@ -353,3 +354,34 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+
+    @torch.no_grad()
+    def compute_token_entropy(self, idx):
+        """
+        Compute the token-level entropy for a given input sequence.
+        Args:
+            idx: LongTensor of shape (b, t) containing the input token indices
+        Returns:
+            entropy: Tensor of shape (b, t) containing the entropy at each token position
+                    Entropy is computed as H(p) = -∑(p_i * log(p_i)) where p_i are the 
+                    probabilities over the vocabulary at each position.
+        Note:
+            Make sure to be in model.eval() mode for this operation.
+            Higher entropy indicates more uncertainty/uniformity in the model's predictions.
+        """
+        # if the sequence context is too long, crop it at block_size
+        idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+        
+        # forward the model to get the logits for all positions in the sequence
+        logits, _ = self(idx_cond)
+        
+        # convert logits to probabilities using softmax
+        # logits shape: (b, t, vocab_size)
+        probs = F.softmax(logits, dim=-1)
+        
+        # compute entropy: H(p) = -∑(p_i * log(p_i))
+        # add small epsilon to avoid log(0)
+        log_probs = torch.log(probs + 1e-10)
+        entropy = -torch.sum(probs * log_probs, dim=-1)  # shape: (b, t)
+        
+        return entropy

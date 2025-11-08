@@ -38,7 +38,6 @@ env/
 
 # PyTorch
 *.pth
-*.pt
 
 # OS
 .DS_Store

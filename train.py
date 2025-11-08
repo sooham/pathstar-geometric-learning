@@ -81,14 +81,15 @@ assert effective_batch_size <= max_allowed_batch_size, (
 )
 ###################################################
 # model
-n_layer = 12 # the default is 12
+n_layer = 3 # the default is 12
 n_head = 8  # default is 8
-n_embd =  384   # defulat is 384
-dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
+n_embd =  96   # defulat is 384
+dropout = 0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
+label_smoothing = 0.10 # label smoothing epsilon (0.0 = no smoothing, 0.1 = 10% smoothing)
 # adamw optimizer
 learning_rate = 1e-3 # max learning rate
-epochs = 2000 # 20000
+epochs = 50000 # 20000
 TRAIN_DATASET_SIZE = total_edge_size + replicated_train_paths 
 VAL_DATASET_SIZE = num_holdout
 batch_per_dataset = int(np.ceil(TRAIN_DATASET_SIZE / (batch_size * gradient_accumulation_steps)))
@@ -98,7 +99,7 @@ weight_decay = 0.01 # weight decay for AdamW optimizer
 beta1 = 0.9  # AdamW optimizer beta1 parameter (exponential decay rate for first moment estimates)
 beta2 = 0.95  # AdamW optimizer beta2 parameter (exponential decay rate for second moment estimates)
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
-wandb_run_name = f"{dataset}_L{n_layer}H{n_head}E{n_embd}_lr{learning_rate}_bs{batch_size}_ga{gradient_accumulation_steps}_{time.time()}"
+wandb_run_name = f"{dataset}_L{n_layer}H{n_head}E{n_embd}_lr{learning_rate}_bs{batch_size}_ga{gradient_accumulation_steps}_drop{dropout}_ls{label_smoothing}_{time.time()}"
 
 # learning rate decay settings
 # Learning rate schedule with cosine decay and linear warmup:
@@ -583,7 +584,7 @@ def estimate_loss():
         for k in range(iters[split]):
             X, Y = get_batch(split)
             with ctx:
-                logits, loss = model(X, Y)
+                logits, loss = model(X, Y, label_smoothing=label_smoothing)
             losses[k] = loss.item()
             
             # Compute per-token losses based on split
@@ -854,7 +855,7 @@ while True:
     # and using the GradScaler if data type is float16
     for micro_step in range(gradient_accumulation_steps):
         with ctx:
-            logits, loss = model(X, Y)
+            logits, loss = model(X, Y, label_smoothing=label_smoothing)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
