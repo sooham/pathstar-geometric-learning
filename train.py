@@ -46,13 +46,14 @@ eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 # wandb logging
 wandb_log = True # disabled by default
-wandb_project = 'pathstar'
+wandb_project = 'pathstar_small'
 # data
 ###################################################
-dataset = 'inweights_pathstar_d500_l9_p3_undirected_dt'
+#dataset = 'inweights_pathstar_d500_l9_p3_undirected_dt'
+dataset = 'inweights_pathstar_d5_l5_p1_undirected_dt'
 
 meta, train_data, val_data = load_dataset(dataset)
-gradient_accumulation_steps = 5 # used to simulate larger batch sizes (effective batch = 512 * 8 = 4096)
+gradient_accumulation_steps = 1 # used to simulate larger batch sizes (effective batch = 512 * 8 = 4096)
 graph_length = meta['l']  # this can be determined by meta.pkl
 graph_spokes = meta['d'] # this can be determined by meta.pkl
 holdout_ratio = meta['holdout_percentage'] # this can be determined by meta.pkl
@@ -62,7 +63,7 @@ use_directional_tokens = meta['use_directional_tokens']
 total_edge_size = (2 if bidirectional else 1) * (graph_length - 1) * graph_spokes 
 num_holdout = round(graph_spokes * holdout_ratio)
 total_train_paths =  (graph_spokes - num_holdout)
-batch_size = 850  # 8250 # if gradient_accumulation_steps > 1, this is the micro-batch size
+batch_size = 43  #850 # 8250 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = graph_length + 2 + pause_length
 effective_batch_size = gradient_accumulation_steps * batch_size
 max_allowed_batch_size = total_edge_size + total_train_paths
@@ -79,8 +80,8 @@ n_embd =  384   # defulat is 384
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
-learning_rate = 1e-4 # max learning rate
-epochs = 10000
+learning_rate = 1e-3 # max learning rate
+epochs = 10000 # 20000
 TRAIN_DATASET_SIZE = total_edge_size + total_train_paths 
 VAL_DATASET_SIZE = num_holdout
 batch_per_dataset = int(np.ceil(TRAIN_DATASET_SIZE / (batch_size * gradient_accumulation_steps)))
@@ -98,8 +99,8 @@ wandb_run_name = f"{dataset}_L{n_layer}H{n_head}E{n_embd}_lr{learning_rate}_bs{b
 # 2. Cosine decay: LR decays following a cosine curve from learning_rate to min_lr over (lr_decay_iters - warmup_iters) steps
 # 3. Constant minimum: LR stays at min_lr for all iterations beyond lr_decay_iters
 # Example: learning_rate=1e-3, min_lr=6e-5 means LR goes 0 -> 1e-3 (warmup) -> 6e-5 (decay) -> 6e-5 (constant)
-decay_lr = False # whether to decay the learning rate (cosine decay with linear warmup)
-warmup_iters = int(max_iters * 0.25) # how many steps to warm up for (linear increase from 0 to learning_rate)
+decay_lr = True # whether to decay the learning rate (cosine decay with linear warmup)
+warmup_iters = int(max_iters * 0.10) # how many steps to warm up for (linear increase from 0 to learning_rate)
 lr_decay_iters = int(max_iters * 0.99) # total steps for warmup + decay phase; should be ~= max_iters per Chinchilla
 min_lr = 6e-5 # minimum learning rate after decay completes, should be ~= learning_rate/10 per Chinchilla
 # system
@@ -195,9 +196,9 @@ else:
 
 if pause_token_id is not None or pad_token_id is not None:
     print(f"Loaded special tokens: PAUSE={pause_token_id}, PAD={pad_token_id}")
-    print("Note: PAUSE and PAD tokens will be masked in loss calculation (ignore_index=-1)")
+    print("Note: PAD tokens will be masked in loss calculation (ignore_index=-1)")
 else:
-    print("Warning: No special tokens found in metadata. PAUSE/PAD masking will be disabled.")
+    print("Warning: No special tokens found in metadata. PAD masking will be disabled.")
 
 # Load stoi and itos for token visualization
 stoi = meta.get('stoi', {})
@@ -291,9 +292,8 @@ def get_batch(split):
     x = torch.from_numpy(sequences[:, :-1])  # All but last token
     y = torch.from_numpy(sequences[:, 1:])   # All but first token
     
-    # Mask special tokens in targets (ignored in loss)
-    if pause_token_id is not None:
-        y[y == pause_token_id] = -1
+    # Mask PAD tokens in targets (ignored in loss)
+    # Note: PAUSE tokens are NOT masked - the model should learn to predict them
     if pad_token_id is not None:
         y[y == pad_token_id] = -1
     
@@ -495,6 +495,64 @@ def compute_per_token_loss(logits, input,  targets, token_positions, debug=False
     return per_token_losses
 
 
+def compute_per_token_accuracy_autoregressive(val_data_batch, num_samples, device):
+    """
+    Compute per-token accuracy using autoregressive generation (no teacher forcing).
+    
+    Args:
+        val_data_batch: Validation data array of shape (val_size, seq_length)
+        num_samples: Number of validation samples to evaluate
+        device: Device to run computations on
+    
+    Returns:
+        Dictionary mapping token_pos -> accuracy for that position (1-indexed)
+    """
+    # Sample random validation indices
+    sample_indices = np.random.choice(len(val_data_batch), size=min(num_samples, len(val_data_batch)), replace=False)
+    
+    # Context for validation: <PATH> LEAF_NODE <PAUSE> <PAUSE> ... <PAUSE>
+    context_length = 2 + pause_length
+    
+    # Prepare batched contexts for parallel generation
+    contexts = []
+    ground_truths = []
+    
+    for val_idx in sample_indices:
+        full_sequence = val_data_batch[val_idx]
+        context = full_sequence[:context_length]
+        contexts.append(context)
+        ground_truth = full_sequence[context_length:context_length + graph_length]
+        ground_truths.append(ground_truth)
+    
+    # Stack contexts into a batch: [num_samples, context_length]
+    contexts_batch = torch.from_numpy(np.stack(contexts).astype(np.int64)).to(device)
+    
+    # Generate for all samples in parallel using greedy decoding
+    with torch.no_grad():
+        with ctx:
+            # Generate graph_length tokens using greedy decoding (temperature=1.0, top_k=1)
+            generated_sequences = model.generate(contexts_batch, max_new_tokens=graph_length, temperature=1.0, top_k=1)
+            # Extract only the newly generated tokens (exclude context): [num_samples, graph_length]
+            generated_tokens_batch = generated_sequences[:, context_length:].cpu().numpy()
+    
+    # Compute per-token accuracy
+    per_token_accuracies = {}
+    ground_truths_array = np.stack(ground_truths)  # [num_samples, graph_length]
+    
+    for token_pos in range(1, graph_length + 1):
+        # token_pos is 1-indexed, array index is 0-indexed
+        idx = token_pos - 1
+        if idx < generated_tokens_batch.shape[1] and idx < ground_truths_array.shape[1]:
+            # Compare predicted token at position i with ground truth at position i
+            matches = generated_tokens_batch[:, idx] == ground_truths_array[:, idx]
+            accuracy = np.mean(matches)
+            per_token_accuracies[token_pos] = accuracy
+        else:
+            per_token_accuracies[token_pos] = float('nan')
+    
+    return per_token_accuracies
+
+
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
 def estimate_loss():
@@ -552,6 +610,12 @@ def estimate_loss():
         }
     else:
         out['val_per_token'] = {token_pos: float('nan') for token_pos in range(1, graph_length + 1)}
+    
+    # Compute per-token accuracy using autoregressive generation (no teacher forcing)
+    # Use all validation samples for comprehensive evaluation
+    num_samples_for_accuracy = val_size
+    val_per_token_accuracy = compute_per_token_accuracy_autoregressive(val_data, num_samples_for_accuracy, device)
+    out['val_per_token_accuracy'] = val_per_token_accuracy
     
     model.train()
     return out
@@ -613,70 +677,120 @@ while True:
                                                 for i in range(10, graph_length + 1)])
                 print(f"    {per_token_str_rest}")
         
+        # Print per-token validation accuracies (autoregressive, no teacher forcing)
+        if 'val_per_token_accuracy' in losses:
+            print("  Val per-token accuracies (autoregressive):")
+            per_token_acc_str = ", ".join([f"tok{i}: {losses['val_per_token_accuracy'][i]*100:.1f}%" 
+                                          for i in range(1, min(graph_length + 1, 10))])
+            print(f"    {per_token_acc_str}")
+            if graph_length > 9:
+                per_token_acc_str_rest = ", ".join([f"tok{i}: {losses['val_per_token_accuracy'][i]*100:.1f}%" 
+                                                    for i in range(10, graph_length + 1)])
+                print(f"    {per_token_acc_str_rest}")
+        
         # Autoregressive generation on validation samples (parallelized)
         model.eval()
-        num_samples = min(5, val_size)  # In case val_size < 5
-        sample_indices = np.random.choice(val_size, size=num_samples, replace=False)
-        
-        # Helper function to convert token IDs to readable strings
-        def tokens_to_str(token_ids):
-            if itos:
-                return [itos.get(int(tid), f"<{tid}>") for tid in token_ids]
+        def evaluate_samples(data, data_size, split_name, num_samples=5):
+            """
+            Evaluate autoregressive generation on samples from a dataset.
+            
+            Args:
+                data: Dataset to sample from (train_data or val_data)
+                data_size: Size of the dataset
+                split_name: Name of the split for logging ('train' or 'val')
+                num_samples: Number of samples to evaluate
+            
+            Returns:
+                avg_accuracy: Average accuracy across all samples
+            """
+            num_samples = min(num_samples, data_size)
+            
+            # For train data, filter to only PATH tasks
+            if split_name == 'train':
+                # Find indices where first token is path_token
+                path_indices = []
+                for idx in range(data_size):
+                    if data[idx * block_size] == path_token:
+                        path_indices.append(idx)
+                
+                if len(path_indices) == 0:
+                    print(f"Warning: No PATH tasks found in {split_name} data")
+                    return 0.0
+                
+                # Sample from valid PATH indices without replacement
+                num_samples = min(num_samples, len(path_indices))
+                sample_indices = np.random.choice(path_indices, size=num_samples, replace=False)
             else:
-                return token_ids.tolist() if hasattr(token_ids, 'tolist') else list(token_ids)
-        
-        # Prepare batched contexts for parallel generation
-        context_length = 2 + pause_length
-        contexts = []
-        ground_truths = []
-        full_sequences = []
-        
-        for val_idx in sample_indices:
-            full_sequence = val_data[val_idx]
-            full_sequences.append(full_sequence)
-            context = full_sequence[:context_length]
-            contexts.append(context)
-            ground_truth = full_sequence[context_length:context_length + graph_length]
-            ground_truths.append(ground_truth)
-        
-        # Stack contexts into a batch: [num_samples, context_length]
-        contexts_batch = torch.from_numpy(np.stack(contexts).astype(np.int64)).to(device)
-        
-        # Generate for all samples in parallel using greedy decoding
-        with torch.no_grad():
-            with ctx:
-                # Generate graph_length tokens using greedy decoding (temperature=1.0, top_k=1)
-                generated_sequences = model.generate(contexts_batch, max_new_tokens=graph_length, temperature=1.0, top_k=1)
-                # Extract only the newly generated tokens (exclude context): [num_samples, graph_length]
-                generated_tokens_batch = generated_sequences[:, context_length:].cpu().numpy()
-        
-        # Calculate accuracies and prepare wandb data
-        print(f"\nAutoregressive generation on {num_samples} validation samples:")
-        accuracies = []
-        for sample_idx, (val_idx, full_sequence, ground_truth, generated_tokens) in enumerate(
-            zip(sample_indices, full_sequences, ground_truths, generated_tokens_batch)
-        ):
-            # Calculate accuracy
-            accuracy = np.mean(generated_tokens == ground_truth[:len(generated_tokens)])
-            accuracies.append(accuracy)
+                # For val data, sample randomly without replacement
+                sample_indices = np.random.choice(data_size, size=num_samples, replace=False)
             
-            # Prepare strings for display and logging
-            context_str = tokens_to_str(full_sequence[:context_length])
-            ground_truth_str = tokens_to_str(ground_truth)
-            generated_str = tokens_to_str(generated_tokens)
+            # Helper function to convert token IDs to readable strings
+            def tokens_to_str(token_ids):
+                if itos:
+                    return [itos.get(int(tid), f"<{tid}>") for tid in token_ids]
+                else:
+                    return token_ids.tolist() if hasattr(token_ids, 'tolist') else list(token_ids)
             
-            print(f"  Sample {sample_idx+1} (val_idx={val_idx}):")
-            print(f"    Context:      {context_str}")
-            print(f"    Ground truth: {ground_truth_str}")
-            print(f"    Generated:    {generated_str}")
-            print(f"    Accuracy: {accuracy*100:.1f}%")
+            # Prepare batched contexts for parallel generation
+            context_length = 2 + pause_length
+            contexts = []
+            ground_truths = []
+            full_sequences = []
+            
+            for idx in sample_indices:
+                full_sequence = data[idx]
+                full_sequences.append(full_sequence)
+                context = full_sequence[:context_length]
+                contexts.append(context)
+                ground_truth = full_sequence[context_length:context_length + graph_length]
+                ground_truths.append(ground_truth)
+            
+            # Stack contexts into a batch: [num_samples, context_length]
+            contexts_batch = torch.from_numpy(np.stack(contexts).astype(np.int64)).to(device)
+            
+            # Generate for all samples in parallel using greedy decoding
+            with torch.no_grad():
+                with ctx:
+                    # Generate graph_length tokens using greedy decoding (temperature=1.0, top_k=1)
+                    generated_sequences = model.generate(contexts_batch, max_new_tokens=graph_length, temperature=1.0, top_k=1)
+                    # Extract only the newly generated tokens (exclude context): [num_samples, graph_length]
+                    generated_tokens_batch = generated_sequences[:, context_length:].cpu().numpy()
+            
+            # Calculate accuracies and prepare wandb data
+            print(f"\nAutoregressive generation on {num_samples} {split_name} samples:")
+            accuracies = []
+            for sample_idx, (idx, full_sequence, ground_truth, generated_tokens) in enumerate(
+                zip(sample_indices, full_sequences, ground_truths, generated_tokens_batch)
+            ):
+                # Calculate accuracy
+                accuracy = np.mean(generated_tokens == ground_truth[:len(generated_tokens)])
+                accuracies.append(accuracy)
+                
+                # Prepare strings for display and logging
+                context_str = tokens_to_str(full_sequence[:context_length])
+                ground_truth_str = tokens_to_str(ground_truth)
+                generated_str = tokens_to_str(generated_tokens)
+                
+                print(f"  Sample {sample_idx+1} (idx={idx}):")
+                print(f"    Context:      {context_str}")
+                print(f"    Ground truth: {ground_truth_str}")
+                print(f"    Generated:    {generated_str}")
+                print(f"    Accuracy: {accuracy*100:.1f}%")
+            
+            # Calculate average accuracy
+            avg_accuracy = np.mean(accuracies)
+            print(f"  Average accuracy: {avg_accuracy*100:.1f}%")
+            print()  # Empty line for readability
+            
+            return avg_accuracy
         
-        # Calculate average accuracy
-        avg_accuracy = np.mean(accuracies)
-        print(f"  Average accuracy: {avg_accuracy*100:.1f}%")
-        print()  # Empty line for readability
+        # Evaluate on validation samples
+        val_avg_accuracy = evaluate_samples(val_data, val_size, 'val', num_samples=5)
+        
+        # Evaluate on training samples (PATH tasks only)
+        train_avg_accuracy = evaluate_samples(train_data, train_size, 'train', num_samples=5)
+        
         model.train()
-        
         if wandb_log:
             # Merge all generation data into a single dict
             log_dict = {
@@ -700,6 +814,15 @@ while True:
                         log_dict["val/loss/token_final"] = losses['val_per_token'][token_pos]
                     else:
                         log_dict[f"val/loss/token_{token_pos}"] = losses['val_per_token'][token_pos]
+            
+            # Add per-token validation accuracies (autoregressive) to wandb
+            if 'val_per_token_accuracy' in losses:
+                for token_pos in range(1, graph_length + 1):
+                    if token_pos == graph_length:
+                        # Use "token_final" for the last token position
+                        log_dict["val/accuracy/token_final"] = losses['val_per_token_accuracy'][token_pos]
+                    else:
+                        log_dict[f"val/accuracy/token_{token_pos}"] = losses['val_per_token_accuracy'][token_pos]
             
             wandb.log(log_dict)
         if losses['val'] < best_val_loss or always_save_checkpoint:
