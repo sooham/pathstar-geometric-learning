@@ -710,7 +710,7 @@ while True:
                 # Find indices where first token is path_token
                 path_indices = []
                 for idx in range(data_size):
-                    if data[idx * block_size] == path_token:
+                    if data[idx, 0] == path_token:
                         path_indices.append(idx)
                 
                 if len(path_indices) == 0:
