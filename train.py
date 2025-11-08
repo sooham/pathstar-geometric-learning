@@ -38,12 +38,12 @@ def load_dataset(dataset):
 # -----------------------------------------------------------------------------
 # default config values designed to train a customized small GPT
 # I/O
+init_from = 'scratch' # 'scratch' or 'resume'
 out_dir = 'out'
 eval_interval = 50
 log_interval = 10
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
-init_from = 'resume' # 'scratch' or 'resume'
 # wandb logging
 wandb_log = True # disabled by default
 wandb_project = 'pathstar'
@@ -173,7 +173,7 @@ iter_num = 0
 best_val_loss = 1e9
 
 meta_vocab_size = meta['vocab_size']
-print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
+print(f"found vocab_size = {meta_vocab_size}")
 
 # Load special token IDs for masking in loss calculation
 edge_token = None
