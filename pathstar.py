@@ -742,6 +742,8 @@ class InWeightsPathStar:
         elif obey_holdout:
             if len(self.train_leaves) == 0:
                 raise ValueError("Cannot generate training data with obey_holdout=True: no training paths available")
+            if len(self.train_leaves) < size:
+                raise ValueError("This should not happen you want to generate holdouts, the training set size should be the same as the holdout leaves")
             leaf_nodes = self.train_leaves
         else:
             # Use all leaf nodes
@@ -756,8 +758,8 @@ class InWeightsPathStar:
                 f"Graph has {len(self.train_leaves)} training paths and {len(self.holdout_leaves)} holdout paths."
             )
         
-        # Sample leaf nodes uniformly with replacement
-        sampled_leaves = random.choices(leaf_nodes, k=size)
+        # Sample leaf nodes uniformly without replacement (ensures unique paths)
+        sampled_leaves = random.sample(leaf_nodes, size)
         
         sequences = []
         for leaf in sampled_leaves:
