@@ -804,8 +804,14 @@ class InWeightsPathStar:
         # Calculate edge dataset size
         num_edge_samples = (2 if use_undirected else 1) * num_edges
         
-        # Training set: train paths + all edges
-        train_size = num_train_path_samples + num_edge_samples
+        # Calculate replication factor for path sequences to balance classes
+        replication_factor = num_edge_samples // num_train_path_samples if num_train_path_samples > 0 else 1
+        if replication_factor < 1:
+            replication_factor = 1
+        replicated_path_samples = num_train_path_samples * replication_factor
+        
+        # Training set: replicated train paths + all edges
+        train_size = replicated_path_samples + num_edge_samples
         
         # Validation set: only holdout paths (no edges)
         val_size = num_val_path_samples
@@ -825,10 +831,11 @@ class InWeightsPathStar:
         print(f"    Validation paths (holdout): {num_val_path_samples}")
         print(f"  Dataset composition:")
         print(f"    Edge samples: {num_edge_samples} ({'undirected' if use_undirected else 'directed'})")
-        print(f"    Training path samples: {num_train_path_samples}")
+        print(f"    Training path samples (original): {num_train_path_samples}")
+        print(f"    Training path samples (replicated): {replicated_path_samples} (factor: {replication_factor})")
         print(f"    Validation path samples: {num_val_path_samples}")
         print(f"  Final dataset sizes:")
-        print(f"    Training set: {train_size} ({num_train_path_samples} paths + {num_edge_samples} edges)")
+        print(f"    Training set: {train_size} ({replicated_path_samples} replicated paths + {num_edge_samples} edges)")
         print(f"    Validation set: {val_size} (holdout paths only, no edges)")
         print(f"    2d dimension of training set is : {self.l + num_pause_tokens + 2}")
         print(f"  Output directory: {full_output_dir}")
@@ -879,6 +886,16 @@ class InWeightsPathStar:
                 dtype=torch.long
             )
             edge_sequences = torch.cat([edge_sequences, padding], dim=1)
+        
+        # Replicate path sequences to account for class imbalance
+        # The imbalance factor is approximately (num_edge_samples / num_train_path_samples)
+        # which is roughly (l-1) for directed edges or 2*(l-1) for undirected
+        if num_train_path_samples > 0:
+            replication_factor = num_edge_samples // num_train_path_samples
+            if replication_factor > 1:
+                print(f"  Replicating path sequences by factor of {replication_factor} to balance classes")
+                train_path_sequences = train_path_sequences.repeat(replication_factor, 1)
+                print(f"  Path sequences after replication: {train_path_sequences.shape[0]}")
         
         # Concatenate and shuffle training sequences
         train_sequences = torch.cat([train_path_sequences, edge_sequences], dim=0)
