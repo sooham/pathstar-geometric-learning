@@ -394,7 +394,7 @@ class InWeightsPathStar:
         self.num_vertices = d * (l-1) + 1
         # Sample random tokens from vocabulary without replacement
         canonical_nodes = list(range(self.num_vertices))
-        vocab_tokens = random.sample(range(vocab_size), num_vertices)
+        vocab_tokens = random.sample(range(vocab_size), self.num_vertices)
         self.mapping = None
         if vocab_size:
             self.mapping = dict(zip(canonical_nodes, vocab_tokens))
