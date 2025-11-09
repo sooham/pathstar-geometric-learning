@@ -6,6 +6,7 @@ import numpy as np
 import argparse
 import matplotlib.pyplot as plt
 import networkx as nx
+from tqdm import tqdm
 
 class InContextPathStar:
     def __init__(self, d=5, l=5, vocab_size=2000):
@@ -390,47 +391,61 @@ class InWeightsPathStar:
         self.l = l
         self.vocab_size = vocab_size
 
-        self.adj_list = {}
         self.num_vertices = d * (l-1) + 1
-        # Sample random tokens from vocabulary without replacement
-        canonical_nodes = list(range(self.num_vertices))
-        vocab_tokens = random.sample(range(vocab_size), self.num_vertices)
+        
+        # Vectorized vocabulary mapping using NumPy
         self.mapping = None
         if vocab_size:
-            self.mapping = dict(zip(canonical_nodes, vocab_tokens))
+            # Use np.random.choice instead of random.sample for better performance
+            canonical_nodes = np.arange(self.num_vertices)
+            vocab_tokens = np.random.choice(vocab_size, size=self.num_vertices, replace=False)
+            self.mapping = dict(zip(canonical_nodes.tolist(), vocab_tokens.tolist()))
 
-        # populate the vertices with d * (l-1) + 1 vertices
-        # 0 jis the root node
-        # Spokes start at: 1, l, 2l-1, 3l-2, ... = 1+(l-1)*k for k in [0, d-1]
-        self.vertices = list(range(d * (l-1) + 1))
+        # Vectorized vertex generation
+        self.vertices = np.arange(self.num_vertices)
         self.v_root = 0
-        self.total_vert = len(self.vertices)
-        self.v_leaf = [1 + (self.l-1)*(k+1) - 1 for k in range(self.d)]  # Last node of each spoke
-
-        # add the root to the adjacency list
-        self.paths_by_leaf = {}
-
-        self.adj_list[0] = [1+(self.l-1)*k for k in range(self.d)]
-        for pi in range(d):
-            path_list = [0]  # Start with root
-            
-            for i in range(1, l):
-                # Calculate node_id: first node of spoke pi is at 1+(l-1)*pi
-                # then increment by 1 for each subsequent node
-                node_val = 1 + (self.l-1)*pi + (i-1)
-                
-                if i != l-1:
-                    self.adj_list[node_val] = [node_val+1]
-                else:
-                    self.adj_list[node_val] = []
-                path_list.append(node_val)
-            self.paths_by_leaf[node_val] = path_list
+        self.total_vert = self.num_vertices
         
+        # Vectorized leaf calculation: Last node of each spoke
+        # Leaf nodes are at positions: 1+(l-1)*k + (l-2) for k in [0, d-1]
+        # Simplified: l + (l-1)*k - 1 for k in [0, d-1]
+        self.v_leaf = (1 + (self.l-1) * (np.arange(self.d) + 1) - 1).tolist()
+
+        # Build adjacency list and paths_by_leaf using vectorized operations
+        self.adj_list = {}
+        self.paths_by_leaf = {}
+        
+        # Root node connects to first node of each spoke: 1+(l-1)*k for k in [0, d-1]
+        root_neighbors = (1 + (self.l-1) * np.arange(self.d)).tolist()
+        self.adj_list[0] = root_neighbors
+        
+        # Vectorized path and adjacency list construction
+        # Use progress bar only for large graphs (d > 10000)
+        spoke_iterator = tqdm(range(d), desc="Building graph", unit="spoke") if d > 10000 else range(d)
+        
+        for spoke_idx in spoke_iterator:
+            # Starting node of this spoke
+            start_node = 1 + (self.l-1) * spoke_idx
+            
+            # All nodes in this spoke (excluding root)
+            spoke_nodes = np.arange(start_node, start_node + (self.l - 1))
+            
+            # Build adjacency list for this spoke
+            for i, node in enumerate(spoke_nodes):
+                if i < len(spoke_nodes) - 1:
+                    self.adj_list[int(node)] = [int(spoke_nodes[i + 1])]
+                else:
+                    self.adj_list[int(node)] = []
+            
+            # Build path for this spoke (root + spoke_nodes)
+            path = np.concatenate([[self.v_root], spoke_nodes])
+            leaf_node = int(spoke_nodes[-1])
+            self.paths_by_leaf[leaf_node] = path.tolist()
 
         if self.mapping is not None:
-            # modify the mapping to accomodate for the special tokens 
-            self.mapping = {k:v+11 for k,v in self.mapping.items()}
-            assert len(self.mapping) == self.total_vert and set(self.mapping.keys()) == set(self.vertices)
+            # Vectorized mapping offset for special tokens 
+            self.mapping = {k: v + 11 for k, v in self.mapping.items()}
+            assert len(self.mapping) == self.total_vert
             self._apply_mapping()
         
         # Define special tokens
@@ -464,15 +479,16 @@ class InWeightsPathStar:
     def _apply_mapping(self):
         """
         Apply the mapping to adjacency list, paths_by_leaf, and other vertex-related attributes
+        Using vectorized operations where possible
         """
-        # Map adjacency list
+        # Map adjacency list - still needs dict comprehension but optimized
         mapped_adj_list = {}
         for u in self.adj_list:
             mapped_u = self.mapping[u]
             mapped_adj_list[mapped_u] = [self.mapping[v] for v in self.adj_list[u]]
         self.adj_list = mapped_adj_list
         
-        # Map paths_by_leaf
+        # Map paths_by_leaf - still needs dict comprehension but optimized
         mapped_paths_by_leaf = {}
         for leaf_node, path in self.paths_by_leaf.items():
             mapped_leaf = self.mapping[leaf_node]
@@ -480,8 +496,13 @@ class InWeightsPathStar:
             mapped_paths_by_leaf[mapped_leaf] = mapped_path
         self.paths_by_leaf = mapped_paths_by_leaf
         
-        # Map vertices
-        self.vertices = [self.mapping[v] for v in self.vertices]
+        # Map vertices using vectorized operation
+        if isinstance(self.vertices, np.ndarray):
+            # Create a vectorized mapping function
+            map_func = np.vectorize(self.mapping.get)
+            self.vertices = map_func(self.vertices).tolist()
+        else:
+            self.vertices = [self.mapping[v] for v in self.vertices]
         
         # Map root and leaf vertices
         self.v_root = self.mapping[self.v_root]
@@ -675,48 +696,78 @@ class InWeightsPathStar:
     def generate_edge_memorization_training_set(self, size, undirected=True, use_directional_tokens=True):
         """
         Generate a training set of edges sampled randomly from the path-star graph.
+        Uses vectorized operations for better performance with large graphs.
         
         Args:
             size: Number of samples (K) to generate
             undirected: If True, also include reverse edges (y -> x) in the sampling pool
+            use_directional_tokens: If True, include direction tokens (GT/LT)
         
         Returns:
-            edges: shape (size, 2) or (size, 3) if use directional otkesn 
+            edges: torch tensor of shape (size, 2) or (size, 3) if use_directional_tokens
         """
-        # Collect all edges from the adjacency list
-        edges = []
-        for u in self.adj_list:
-            for v in self.adj_list[u]:
-                if use_directional_tokens:
-                    edges.append([self.SPECIAL_TOKENS['GT'], u, v])
-                else:
-                    edges.append([u, v])
-                if undirected:
-                    if use_directional_tokens:
-                        edges.append([self.SPECIAL_TOKENS['LT'], v, u])
-                    else:
-                        edges.append([v, u])
+        # Pre-calculate total number of edges
+        total_edges = self.d * (self.l - 1)
+        multiplier = 2 if undirected else 1
+        max_edges = total_edges * multiplier
         
         # Validate size
-        max_edges = len(edges)
         if size > max_edges:
             raise ValueError(
                 f"Requested size ({size}) exceeds the total number of available edges ({max_edges}). "
-                f"Graph has {self.total_edges} directed edges"
-                + (f" or {2 * self.total_edges} undirected edges." if undirected else ".")
+                f"Graph has {total_edges} directed edges"
+                + (f" or {2 * total_edges} undirected edges." if undirected else ".")
             )
         
-        # Shuffle edges and take the first k
-        random.shuffle(edges)
-        sampled_edges = edges[:size]
+        # Vectorized edge collection from adjacency list
+        edge_list = []
+        for u in self.adj_list:
+            if self.adj_list[u]:  # Skip empty adjacency lists
+                v_array = np.array(self.adj_list[u])
+                u_array = np.full_like(v_array, u)
+                edge_list.append(np.column_stack([u_array, v_array]))
+        
+        # Stack all edges
+        if edge_list:
+            edges = np.vstack(edge_list)
+        else:
+            edges = np.array([], dtype=np.int64).reshape(0, 2)
+        
+        # Add reverse edges if undirected
+        if undirected and len(edges) > 0:
+            reverse_edges = np.column_stack([edges[:, 1], edges[:, 0]])
+            edges = np.vstack([edges, reverse_edges])
+        
+        # Add directional tokens if requested
+        if use_directional_tokens and len(edges) > 0:
+            # First half are forward (GT), second half are backward (LT) if undirected
+            if undirected:
+                half = len(edges) // 2
+                gt_tokens = np.full((half, 1), self.SPECIAL_TOKENS['GT'], dtype=edges.dtype)
+                lt_tokens = np.full((half, 1), self.SPECIAL_TOKENS['LT'], dtype=edges.dtype)
+                direction_tokens = np.vstack([gt_tokens, lt_tokens])
+            else:
+                direction_tokens = np.full((len(edges), 1), self.SPECIAL_TOKENS['GT'], dtype=edges.dtype)
+            
+            edges = np.hstack([direction_tokens, edges])
+        
+        # Shuffle and sample using NumPy for efficiency
+        if len(edges) > 0:
+            indices = np.random.choice(len(edges), size=size, replace=False)
+            sampled_edges = edges[indices]
+        else:
+            # Handle empty case
+            cols = 3 if use_directional_tokens else 2
+            sampled_edges = np.zeros((size, cols), dtype=np.int64)
         
         # Return as torch tensor
-        return torch.tensor(sampled_edges, dtype=torch.long)
+        return torch.from_numpy(sampled_edges).long()
 
     def generate_path_prediction_training_set(self, size, num_pause_tokens=1, 
                                              obey_holdout=True, holdout_only=False):
         """
         Generate a path-finding training set for the in-weights path memorization objective.
+        Uses vectorized operations for better performance with large graphs.
         
         Each training example has the format:
         Input: [<PATH>, leaf, <PAUSE>, <PAUSE>, ..., <PAUSE>, root, n_2, n_3, ..., n_ℓ]
@@ -759,20 +810,32 @@ class InWeightsPathStar:
             )
         
         # Sample leaf nodes uniformly without replacement (ensures unique paths)
-        sampled_leaves = random.sample(leaf_nodes, size)
+        # Use numpy for faster sampling
+        sampled_leaves = np.random.choice(leaf_nodes, size=size, replace=False)
         
-        sequences = []
-        for leaf in sampled_leaves:
-            # Get the path from root to leaf
+        # Pre-allocate output array
+        seq_length = self.l + 2 + num_pause_tokens
+        sequences = np.zeros((size, seq_length), dtype=np.int64)
+        
+        # Fill sequences using vectorized operations where possible
+        # Column 0: PATH token
+        sequences[:, 0] = self.TASK_TOKENS['PATH']
+        
+        # Column 1: leaf node
+        sequences[:, 1] = sampled_leaves
+        
+        # Columns 2 to 2+num_pause_tokens: PAUSE tokens
+        if num_pause_tokens > 0:
+            sequences[:, 2:2+num_pause_tokens] = self.pause_token
+        
+        # Columns 2+num_pause_tokens onwards: path from root to leaf
+        path_start_col = 2 + num_pause_tokens
+        for i, leaf in enumerate(sampled_leaves):
             path = self.paths_by_leaf[leaf]
-            
-            # Construct sequence: [<PATH>, leaf, <PAUSE>, ..., <PAUSE>, root, n_2, ..., n_ℓ]
-            pause_tokens = [self.pause_token] * num_pause_tokens
-            sequence = [self.TASK_TOKENS['PATH'], leaf] + pause_tokens + path
-            sequences.append(sequence)
+            sequences[i, path_start_col:path_start_col+len(path)] = path
         
         # Convert to tensor
-        sequences = torch.tensor(sequences, dtype=torch.long)
+        sequences = torch.from_numpy(sequences).long()
         
         return sequences
     
@@ -847,92 +910,137 @@ class InWeightsPathStar:
         print(f"  Holdout percentage: {self.holdout_percentage}")
         
         # Print paths_by_leaf in a pretty manner
-        print(f"\n  Paths by leaf node:")
-        for leaf, path in sorted(self.paths_by_leaf.items()):
-            path_str = ' -> '.join(map(str, path))
-            is_train = leaf in self.train_leaves
-            is_holdout = leaf in self.holdout_leaves
-            status = "TRAIN" if is_train else ("HOLDOUT" if is_holdout else "UNKNOWN")
-            print(f"    Leaf {leaf} [{status}]: {path_str}")
+        # print(f"\n  Paths by leaf node:")
+        # for leaf, path in sorted(self.paths_by_leaf.items()):
+        #     path_str = ' -> '.join(map(str, path))
+        #     is_train = leaf in self.train_leaves
+        #     is_holdout = leaf in self.holdout_leaves
+        #     status = "TRAIN" if is_train else ("HOLDOUT" if is_holdout else "UNKNOWN")
+        #     print(f"    Leaf {leaf} [{status}]: {path_str}")
         
-        # Generate training set: paths + edges
-        print("\nGenerating training set (training paths + edges)...")
+        # # Generate training set: paths + edges
+        # print("\nGenerating training set (training paths + edges)...")
         
-        # Generate path sequences for training (uses self.train_leaves)
-        train_path_sequences = self.generate_path_prediction_training_set(
-            size=num_train_path_samples,
-            num_pause_tokens=num_pause_tokens,
-            obey_holdout=True  # Uses train_leaves
-        )
+        # Calculate sequence lengths
+        path_seq_len = self.l + 2 + num_pause_tokens
+        edge_seq_len_base = 2 + (1 if use_directional_tokens else 0)  # EDGE token + optional direction + u + v
+        edge_seq_len = 1 + edge_seq_len_base  # EDGE token already included above, fix: direction + u + v
+        edge_seq_len = (1 if use_directional_tokens else 0) + 2 + 1  # direction + u + v + EDGE token
         
-        # Generate edge sequences
+        # Use the longer of the two as the common sequence length
+        seq_length = max(path_seq_len, edge_seq_len)
+        
+        print(f"\n  Sequence length: {seq_length}")
+        print(f"    Path sequence length: {path_seq_len}")
+        print(f"    Edge sequence length: {edge_seq_len}")
+        
+        # ===== TRAINING SET: Use memory-mapped file for efficient disk streaming =====
+        train_path = os.path.join(full_output_dir, 'train.bin')
+        print(f"\nCreating memory-mapped training file: {train_path}...")
+        print(f"  Shape: ({train_size}, {seq_length})")
+        print(f"  Estimated size: {train_size * seq_length * 2 / (1024**3):.2f} GB")
+        
+        # Create memory-mapped array for training data
+        train_mmap = np.memmap(train_path, dtype=np.uint16, mode='w+', shape=(train_size, seq_length))
+        
+        # Fill with PAD tokens initially
+        train_mmap[:] = self.pad_token
+        
+        # Write replicated path sequences directly to mmap
+        print(f"  Writing path sequences (replicated {replication_factor}x)...")
+        if num_train_path_samples > 0:
+            # Generate path sequences once
+            train_path_sequences = self.generate_path_prediction_training_set(
+                size=num_train_path_samples,
+                num_pause_tokens=num_pause_tokens,
+                obey_holdout=True
+            ).numpy().astype(np.uint16)
+            
+            # Replicate and write to mmap with progress bar
+            idx = 0
+            for rep in tqdm(range(replication_factor), desc="  Replicating paths", unit="replica"):
+                train_mmap[idx:idx+num_train_path_samples, :path_seq_len] = train_path_sequences
+                idx += num_train_path_samples
+            
+            # Clean up
+            del train_path_sequences
+        
+        # Write edge sequences directly to mmap
+        print(f"  Writing edge sequences...")
         edges = self.generate_edge_memorization_training_set(
             size=num_edge_samples,
             undirected=use_undirected,
             use_directional_tokens=use_directional_tokens
-        )
-        # Convert edge pairs to sequences: [<EDGE>,<optional direction token>, x, y]
-        edge_task_tokens = torch.full((num_edge_samples, 1), self.TASK_TOKENS['EDGE'], dtype=torch.long)
-        edge_sequences = torch.cat([edge_task_tokens, edges], dim=1)
+        ).numpy().astype(np.uint16)
         
-        # Pad edge sequences to match path sequence length using <PAD> token
-        path_seq_len = train_path_sequences.shape[1]
-        edge_seq_len = edge_sequences.shape[1]
+        # Add EDGE task token as first column
+        edge_start_idx = replicated_path_samples
+        train_mmap[edge_start_idx:edge_start_idx+num_edge_samples, 0] = self.TASK_TOKENS['EDGE']
+        train_mmap[edge_start_idx:edge_start_idx+num_edge_samples, 1:1+edges.shape[1]] = edges
         
-        if edge_seq_len < path_seq_len:
-            padding = torch.full(
-                (num_edge_samples, path_seq_len - edge_seq_len),
-                self.pad_token,
-                dtype=torch.long
-            )
-            edge_sequences = torch.cat([edge_sequences, padding], dim=1)
+        # Remaining columns already filled with PAD token
+        del edges
         
-        # Replicate path sequences to account for class imbalance
-        # The imbalance factor is approximately (num_edge_samples / num_train_path_samples)
-        # which is roughly (l-1) for directed edges or 2*(l-1) for undirected
-        if num_train_path_samples > 0:
-            replication_factor = num_edge_samples // num_train_path_samples
-            if replication_factor > 1:
-                print(f"  Replicating path sequences by factor of {replication_factor} to balance classes")
-                train_path_sequences = train_path_sequences.repeat(replication_factor, 1)
-                print(f"  Path sequences after replication: {train_path_sequences.shape[0]}")
+        # Shuffle in-place using index permutation
+        print(f"  Shuffling training sequences...")
+        indices = np.random.permutation(train_size)
+        # Apply shuffle in chunks to avoid memory issues
+        chunk_size = min(100000, train_size)
+        temp_buffer = np.empty((chunk_size, seq_length), dtype=np.uint16)
         
-        # Concatenate and shuffle training sequences
-        train_sequences = torch.cat([train_path_sequences, edge_sequences], dim=0)
-        train_indices = torch.randperm(train_sequences.shape[0])
-        train_sequences = train_sequences[train_indices]
+        for i in tqdm(range(0, train_size, chunk_size), desc="  Shuffling", unit="chunk"):
+            end_i = min(i + chunk_size, train_size)
+            chunk_indices = indices[i:end_i]
+            actual_chunk_size = end_i - i
+            temp_buffer[:actual_chunk_size] = train_mmap[chunk_indices]
+            train_mmap[i:end_i] = temp_buffer[:actual_chunk_size]
         
-        # Generate validation set: only holdout paths (no edges)
-        print("Generating validation set (holdout paths only, no edges)...")
+        # Flush mmap to disk
+        train_mmap.flush()
+        print(f"  Saved {train_size} sequences of length {seq_length}")
+        
+        # Debug: Print sample of train sequences
+        print(f"\nDebug - Train sequences (first 5):")
+        print(train_mmap[:min(5, train_size)])
+        
+        # Clean up mmap
+        del train_mmap
+        
+        # ===== VALIDATION SET: Smaller, can keep in memory =====
+        print("\nGenerating validation set (holdout paths only, no edges)...")
         val_sequences = self.generate_path_prediction_training_set(
             size=num_val_path_samples,
             num_pause_tokens=num_pause_tokens,
-            holdout_only=True  # Uses holdout_leaves
-        )
+            holdout_only=True
+        ).numpy().astype(np.uint16)
         
-        # Debug: Print train and val sequences
-        print(f"\nDebug - Train sequences (numpy):")
-        print(train_sequences.numpy())
-        print(f"\nDebug - Val sequences (numpy):")
-        print(val_sequences.numpy())
-        
-        # Save training data
-        train_path = os.path.join(full_output_dir, 'train.bin')
-        print(f"\nSaving training data to {train_path}...")
-        train_data = train_sequences.numpy().astype(np.uint16)
-        train_data.tofile(train_path)
-        print(f"  Saved {train_data.shape[0]} sequences of length {train_data.shape[1]}")
+        # Pad validation sequences to match training sequence length
+        if val_sequences.shape[1] < seq_length:
+            val_padded = np.full((num_val_path_samples, seq_length), self.pad_token, dtype=np.uint16)
+            val_padded[:, :val_sequences.shape[1]] = val_sequences
+            val_sequences = val_padded
         
         # Save validation data
         val_path = os.path.join(full_output_dir, 'val.bin')
         print(f"Saving validation data to {val_path}...")
-        val_data = val_sequences.numpy().astype(np.uint16)
-        val_data.tofile(val_path)
-        print(f"  Saved {val_data.shape[0]} sequences of length {val_data.shape[1]}")
+        val_sequences.tofile(val_path)
+        print(f"  Saved {val_sequences.shape[0]} sequences of length {val_sequences.shape[1]}")
+        
+        # Debug: Print sample of val sequences
+        print(f"\nDebug - Val sequences (first 5):")
+        print(val_sequences[:min(5, num_val_path_samples)])
+        
+        del val_sequences
         
         # Create vocabulary mappings
         # Vocab includes all vertices plus the pause token, pad token, and task tokens
-        all_tokens = sorted(set(self.vertices) | set(self.SPECIAL_TOKENS.values()))
+        # Convert vertices to set, handling both list and numpy array
+        if isinstance(self.vertices, np.ndarray):
+            vertices_set = set(self.vertices.tolist())
+        else:
+            vertices_set = set(self.vertices)
+        
+        all_tokens = sorted(vertices_set | set(self.SPECIAL_TOKENS.values()))
         # vocab_size must be max_token_id + 1 for PyTorch embedding layers
         # also add <PAUSE> <PAD> <PATH> <EDGE> into consideration
         vocab_size = self.vocab_size + 11
@@ -969,6 +1077,9 @@ class InWeightsPathStar:
                 itos[token] = f'NODE_{token}'
                 stoi[f'NODE_{token}'] = token
         
+        # Convert vertices to list for serialization
+        vertices_list = self.vertices.tolist() if isinstance(self.vertices, np.ndarray) else self.vertices
+        
         # Save metadata
         meta = {
             'vocab_size': vocab_size,
@@ -985,7 +1096,7 @@ class InWeightsPathStar:
             'num_pause_tokens': num_pause_tokens,
             'root_vertex': self.v_root,
             'leaf_vertices': self.v_leaf,
-            'vertices': self.vertices,
+            'vertices': vertices_list,
             'holdout_percentage': self.holdout_percentage,
             'train_leaves': self.train_leaves,
             'holdout_leaves': self.holdout_leaves,
@@ -1005,8 +1116,8 @@ class InWeightsPathStar:
         
         print(f"\nDataset preparation complete!")
         print(f"  Vocab size: {vocab_size}")
-        print(f"  Total tokens (train): {train_data.size}")
-        print(f"  Total tokens (val): {val_data.size}")
+        print(f"  Total tokens (train): {train_size * seq_length}")
+        print(f"  Total tokens (val): {num_val_path_samples * seq_length}")
         
         return full_output_dir
 

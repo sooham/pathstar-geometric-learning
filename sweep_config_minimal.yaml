@@ -9,7 +9,7 @@ metric:
 parameters:
   # Dataset parameters - small fixed values for quick iteration
   graph_d:
-    values: [5000, 1000000, 10000, 100000]
+    values: [5000, 100000, 10000, 1000000]
   graph_l:
     value: 5
   graph_vocab_size:
