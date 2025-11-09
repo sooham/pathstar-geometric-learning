@@ -13,7 +13,7 @@ parameters:
   graph_l:
     value: 5
   graph_vocab_size:
-    value: 50000
+    value: '2max'
   graph_holdout_percentage:
     value: 0.5
   num_pause_tokens:

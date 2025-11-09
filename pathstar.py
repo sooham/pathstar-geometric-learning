@@ -817,7 +817,7 @@ class InWeightsPathStar:
         val_size = num_val_path_samples
         
         # Create output directory with parameters in name
-        dir_name = f'inweights_pathstar_d{self.d}_l{self.l}_p{num_pause_tokens}_{"un" if use_undirected else ""}directed_{"dt" if use_directional_tokens else ""}'
+        dir_name = f'inweights_pathstar_v{self.vocab_size}_d{self.d}_l{self.l}_p{num_pause_tokens}_{"un" if use_undirected else ""}directed_{"dt" if use_directional_tokens else ""}'
         full_output_dir = os.path.join(output_dir, dir_name)
         os.makedirs(full_output_dir, exist_ok=True)
         

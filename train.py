@@ -24,11 +24,11 @@ from model import GPTConfig, GPT
 from pathstar import InWeightsPathStar
 
 
-def generate_dataset_name(d, l, num_pause_tokens, use_undirected, use_directional_tokens):
+def generate_dataset_name(v, d, l, num_pause_tokens, use_undirected, use_directional_tokens):
     """
     Generate dataset directory name matching the naming convention in pathstar.py
     """
-    dir_name = f'inweights_pathstar_d{d}_l{l}_p{num_pause_tokens}_{"un" if use_undirected else ""}directed_{"dt" if use_directional_tokens else ""}'
+    dir_name = f'inweights_pathstar_v{v}_d{d}_l{l}_p{num_pause_tokens}_{"un" if use_undirected else ""}directed_{"dt" if use_directional_tokens else ""}'
     return dir_name
 
 
@@ -94,7 +94,7 @@ def generate_dataset_if_needed(d, l, vocab_size, holdout_percentage, num_pause_t
         )
     
     # Generate dataset name
-    dataset_name = generate_dataset_name(d, l, num_pause_tokens, use_undirected, use_directional_tokens)
+    dataset_name = generate_dataset_name(vocab_size, d, l, num_pause_tokens, use_undirected, use_directional_tokens)
     
     # Check if dataset exists and parameters match
     if check_dataset_exists(dataset_name, d, l, num_pause_tokens, use_undirected, 
@@ -251,6 +251,10 @@ def train(config=None):
             default_config[k] = globals()[k]
     
     # Validate vocab_size
+    if default_config['graph_vocab_size'].endswith('max'):
+        factor = int(default_config['graph_vocab_size'][:-3])
+        default_config['graph_vocab_size'] = factor * ((default_config['graph_l'] - 1) * default_config['graph_d'] + 1)
+
     assert default_config['graph_vocab_size'] >= default_config['graph_d'] * (default_config['graph_l'] - 1) + 1, \
         f"graph_vocab_size must be >= graph_d * (graph_l - 1) + 1"
     
@@ -290,7 +294,7 @@ def train(config=None):
     print(f"Training dataset composition: {replicated_train_paths} replicated paths + {total_edge_size} edges = {replicated_train_paths + total_edge_size} total samples")
     
     max_allowed_batch_size = total_edge_size + replicated_train_paths
-    batch_size = max(min(max_allowed_batch_size, 2000), min(total_edge_size, 2000))
+    batch_size = max(min(max_allowed_batch_size, 1000), min(total_edge_size, 1000))
     effective_batch_size = default_config['gradient_accumulation_steps'] * batch_size
     block_size = graph_length + 2 + pause_length
     
@@ -591,7 +595,7 @@ def train(config=None):
         
         return per_token_accuracies
     
-    def evaluate_samples(data, data_size, split_name, num_samples=5):
+    def evaluate_samples(data, data_size, split_name, num_samples=5, eval_batch_size=256):
         """
         Evaluate autoregressive generation on samples from a dataset.
         
@@ -600,6 +604,7 @@ def train(config=None):
             data_size: Size of the dataset
             split_name: Name of the split for logging ('train' or 'val')
             num_samples: Number of samples to evaluate
+            eval_batch_size: Batch size for generation to avoid OOM (default: 256)
         
         Returns:
             avg_accuracy: Average accuracy across all samples
@@ -625,7 +630,7 @@ def train(config=None):
             # For val data, sample randomly without replacement
             sample_indices = np.random.choice(data_size, size=num_samples, replace=False)
         
-        # Prepare batched contexts for parallel generation
+        # Prepare contexts and ground truths
         context_length = 2 + pause_length
         contexts = []
         ground_truths = []
@@ -637,21 +642,33 @@ def train(config=None):
             ground_truth = full_sequence[context_length:context_length + graph_length]
             ground_truths.append(ground_truth)
         
-        # Stack contexts into a batch: [num_samples, context_length]
-        contexts_batch = torch.from_numpy(np.stack(contexts).astype(np.int64)).to(device)
+        # Generate in batches to avoid OOM
+        all_generated_tokens = []
+        num_batches = (num_samples + eval_batch_size - 1) // eval_batch_size
         
-        # Generate for all samples in parallel using greedy decoding
         with torch.no_grad():
             with ctx:
-                # Generate graph_length tokens using greedy decoding (temperature=1.0, top_k=1)
-                generated_sequences = model.generate(contexts_batch, max_new_tokens=graph_length, temperature=1.0, top_k=1)
-                # Extract only the newly generated tokens (exclude context): [num_samples, graph_length]
-                generated_tokens_batch = generated_sequences[:, context_length:].cpu().numpy()
+                for batch_idx in range(num_batches):
+                    start_idx = batch_idx * eval_batch_size
+                    end_idx = min(start_idx + eval_batch_size, num_samples)
+                    
+                    # Get batch of contexts
+                    batch_contexts = contexts[start_idx:end_idx]
+                    contexts_batch = torch.from_numpy(np.stack(batch_contexts).astype(np.int64)).to(device)
+                    
+                    # Generate for this batch
+                    generated_sequences = model.generate(contexts_batch, max_new_tokens=graph_length, temperature=1.0, top_k=1)
+                    generated_tokens_batch = generated_sequences[:, context_length:].cpu().numpy()
+                    
+                    all_generated_tokens.append(generated_tokens_batch)
+        
+        # Concatenate all batches
+        all_generated_tokens = np.concatenate(all_generated_tokens, axis=0)
         
         # Calculate accuracies
         print(f"\nAutoregressive generation on {num_samples} {split_name} samples:")
         accuracies = []
-        for ground_truth, generated_tokens in zip(ground_truths, generated_tokens_batch):
+        for ground_truth, generated_tokens in zip(ground_truths, all_generated_tokens):
             # Calculate accuracy
             accuracy = np.mean(generated_tokens == ground_truth[:len(generated_tokens)])
             accuracies.append(accuracy)
