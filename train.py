@@ -23,7 +23,7 @@ import torch.nn.functional as F
 from model import GPTConfig, GPT
 from pathstar import InWeightsPathStar
 
-MAX_BATCH_SIZE = 2000
+MAX_BATCH_SIZE = 4000
 
 def get_default_config():
     """
@@ -198,6 +198,7 @@ def evaluate_samples(device, ctx, model, meta, data, data_size, split_name, num_
         avg_accuracy: Average accuracy across all samples
     """
     num_samples = min(num_samples, data_size)
+    eval_batch_size = min(eval_batch_size, num_samples)
     
     # For train data, filter to only PATH tasks
     if split_name == 'train':
@@ -303,6 +304,7 @@ def train(config=None):
                 f"{default_config['graph_l']}_"
                 f"L{default_config['n_layer']}_"
                 f"E{default_config['n_embd']}_"
+                f"H{default_config['n_head']}_"
                 f"p{default_config['num_pause_tokens']}_"
                 f"{default_config['epochs']}"
             )
@@ -382,10 +384,17 @@ def train(config=None):
     TRAIN_DATASET_SIZE = total_edge_size + replicated_train_paths 
     assert TRAIN_DATASET_SIZE % effective_batch_size == 0
     VAL_DATASET_SIZE = num_holdout
-    assert VAL_DATASET_SIZE % effective_batch_size == 0
     batch_per_dataset = int(np.ceil(TRAIN_DATASET_SIZE / (batch_size * default_config['gradient_accumulation_steps'])))
     eval_iters = int(np.ceil(TRAIN_DATASET_SIZE / batch_size))
     max_iters = default_config['epochs'] * batch_per_dataset
+    
+    # Calculate theoretical baseline for train/loss/token_1
+    # This represents the expected loss for the first token prediction
+    root_edges_in_dataset = graph_spokes
+    theoretical_token_1_loss = -np.log(
+        (total_edge_size - root_edges_in_dataset + replicated_train_paths + 1) / TRAIN_DATASET_SIZE
+    )
+    print(f"Theoretical baseline for train/loss/token_1: {theoretical_token_1_loss:.4f}")
     
     # Calculate learning rate schedule parameters
     warmup_iters = int(max_iters * default_config['warmup_frac'])
@@ -422,6 +431,13 @@ def train(config=None):
     
     checkpoint_filename = f'ckpt_exp_{experiment_name}_pl{pause_length}_bi{bidirectional}_gpu_{gpu_id}.pt'
     print(f"Checkpoint will be saved as: {checkpoint_filename}")
+    try:
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    except Exception as e:
+        print(f"Warning: CUDA initialization issue: {e}")
+        print("Attempting to reset CUDA context...")
+        torch.cuda.init()
     
     torch.manual_seed(1337)
     torch.backends.cudnn.conv.fp32_precision = 'tf32'
@@ -440,6 +456,7 @@ def train(config=None):
     
     # Print device information
     if device == 'cuda':
+
         num_gpus = torch.cuda.device_count()
         current_device = torch.cuda.current_device()
         device_name = torch.cuda.get_device_name(current_device)
@@ -566,8 +583,9 @@ def train(config=None):
             sequences = sequences.astype(np.int64)
         
         # Create input (x) and target (y) by shifting
-        x = torch.from_numpy(sequences[:, :-1])
-        y = torch.from_numpy(sequences[:, 1:])
+        # Use .clone() to ensure x and y don't share memory, preventing corruption when masking y
+        x = torch.from_numpy(sequences[:, :-1]).clone()
+        y = torch.from_numpy(sequences[:, 1:]).clone()
         
         # Mask PAD tokens in targets
         if pad_token_id is not None:
@@ -770,6 +788,7 @@ def train(config=None):
                 
                 if 'train_per_token' in losses and 1 in losses['train_per_token']:
                     log_dict["train/loss/token_1"] = losses['train_per_token'][1]
+                    log_dict["train/loss/token_1_baseline"] = theoretical_token_1_loss
                 
                 if 'val_per_token' in losses:
                     for token_pos in range(1, graph_length + 1):
