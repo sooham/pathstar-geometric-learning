@@ -23,6 +23,7 @@ import torch.nn.functional as F
 from model import GPTConfig, GPT
 from pathstar import InWeightsPathStar
 
+MAX_BATCH_SIZE = 2000
 
 def get_default_config():
     """
@@ -295,9 +296,11 @@ def train(config=None):
         
         # Set custom run name for sweep runs
         if wandb.run is not None:
+            utc_time = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
             custom_name = (
-                f"d{default_config['graph_d']}_"
-                f"l{default_config['graph_l']}_"
+                f"{utc_time}_"
+                f"G{default_config['graph_d']},"
+                f"{default_config['graph_l']}_"
                 f"L{default_config['n_layer']}_"
                 f"E{default_config['n_embd']}_"
                 f"p{default_config['num_pause_tokens']}_"
@@ -365,7 +368,7 @@ def train(config=None):
     print(f"Training dataset composition: {replicated_train_paths} replicated paths + {total_edge_size} edges = {replicated_train_paths + total_edge_size} total samples")
     
     max_allowed_batch_size = total_edge_size + replicated_train_paths
-    batch_size = max(min(max_allowed_batch_size, 512), min(total_edge_size, 512))
+    batch_size = max(min(max_allowed_batch_size, MAX_BATCH_SIZE), min(total_edge_size, MAX_BATCH_SIZE))
     effective_batch_size = default_config['gradient_accumulation_steps'] * batch_size
     block_size = graph_length + 2 + pause_length
     
@@ -377,7 +380,9 @@ def train(config=None):
     
     # Calculate training iteration parameters
     TRAIN_DATASET_SIZE = total_edge_size + replicated_train_paths 
+    assert TRAIN_DATASET_SIZE % effective_batch_size == 0
     VAL_DATASET_SIZE = num_holdout
+    assert VAL_DATASET_SIZE % effective_batch_size == 0
     batch_per_dataset = int(np.ceil(TRAIN_DATASET_SIZE / (batch_size * default_config['gradient_accumulation_steps'])))
     eval_iters = int(np.ceil(TRAIN_DATASET_SIZE / batch_size))
     max_iters = default_config['epochs'] * batch_per_dataset
@@ -754,6 +759,7 @@ def train(config=None):
             if default_config['wandb_log']:
                 log_dict = {
                     "iter": iter_num,
+                    "epoch": round(iter_num / batch_per_dataset, 4),
                     "train/loss/overall": losses['train'],
                     "val/loss/overall": losses['val'],
                     "lr": lr,

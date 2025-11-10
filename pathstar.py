@@ -453,7 +453,7 @@ class InWeightsPathStar:
         val_size = num_val_path_samples
         
         # Create output directory with parameters in name
-        dir_name = f'inweights_pathstar_v{self.vocab_size}_d{self.d}_l{self.l}_p{num_pause_tokens}_{"un" if use_undirected else ""}directed_{"dt" if use_directional_tokens else ""}'
+        dir_name = self.generate_dataset_name(num_pause_tokens, use_undirected, use_directional_tokens)
         self.dir_name = dir_name
         self.num_pause_tokens = num_pause_tokens
         self.use_undirected = use_undirected
@@ -667,10 +667,14 @@ class InWeightsPathStar:
         
         return meta, train_data, val_data
 
-    def generate_dataset_name(self):
+    def generate_dataset_name(self, num_pause_tokens, use_undirected, use_directional_tokens):
         """
         Generate dataset directory name matching the naming convention in pathstar.py
         """
+        self.dir_name = f'inweights_pathstar_v{self.vocab_size}_d{self.d}_l{self.l}_p{num_pause_tokens}_{"un" if use_undirected else ""}directed_{"dt" if use_directional_tokens else ""}'
+        self.num_pause_tokens = num_pause_tokens
+        self.use_undirected = use_undirected
+        self.use_directional_tokens = use_directional_tokens    
         return self.dir_name
 
     def check_dataset_exists(self):
@@ -734,7 +738,7 @@ class InWeightsPathStar:
             )
         
         # Generate dataset name
-        dataset_name = self.dir_name
+        dataset_name = self.generate_dataset_name(num_pause_tokens, use_undirected, use_directional_tokens    )
         
         # Check if dataset exists and parameters match
         if self.check_dataset_exists():

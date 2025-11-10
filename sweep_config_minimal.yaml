@@ -9,7 +9,7 @@ metric:
 parameters:
   # Dataset parameters - small fixed values for quick iteration
   graph_d:
-    values: [5000]
+    values: [1000, 5000, 100]
   graph_l:
     value: 5
   graph_vocab_size:
@@ -61,7 +61,7 @@ parameters:
   
   # Fixed training parameters
   epochs:
-    value: 10000  # Shorter for quick testing
+    value: 2000  # Shorter for quick testing
   gradient_accumulation_steps:
     value: 1
   compile:
