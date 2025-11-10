@@ -3,14 +3,15 @@
 # Usage: ./run_multi_gpu_sweep.sh <sweep_config.yaml> <num_runs_per_gpu>
 
 if [ "$#" -lt 1 ]; then
-    echo "Usage: $0 <sweep_config.yaml> [num_runs_per_gpu] [project_name]"
-    echo "Example: $0 sweep_config_minimal.yaml 3 pathstar_sweep"
+    echo "Usage: $0 <sweep_config.yaml> [num_runs_per_gpu] [project_name] [entity_name]"
+    echo "Example: $0 sweep_config_minimal.yaml 3 pathstar_sweep my_entity"
     exit 1
 fi
 
 SWEEP_CONFIG=$1
 NUM_RUNS=${2:-10}  # Default 10 runs per GPU
 PROJECT=${3:-pathstar_sweep_dataset}  # Default project name
+ENTITY=${4:-}  # Optional entity name
 
 echo "========================================="
 echo "Multi-GPU Sweep Runner"
@@ -18,20 +19,41 @@ echo "========================================="
 echo "Sweep Config: $SWEEP_CONFIG"
 echo "Runs per GPU: $NUM_RUNS"
 echo "Project: $PROJECT"
+if [ -n "$ENTITY" ]; then
+    echo "Entity: $ENTITY"
+fi
 echo "========================================="
 echo ""
 
 # Create the sweep and get the sweep ID
 echo "Creating sweep..."
-SWEEP_OUTPUT=$(python3 run_sweep.py --sweep_config $SWEEP_CONFIG --project $PROJECT --create_only 2>&1)
+ENTITY_ARG=""
+if [ -n "$ENTITY" ]; then
+    ENTITY_ARG="--entity $ENTITY"
+fi
+SWEEP_OUTPUT=$(python3 run_sweep.py --sweep_config $SWEEP_CONFIG --project $PROJECT $ENTITY_ARG --create_only 2>&1)
 echo "$SWEEP_OUTPUT"
 
-# Extract sweep ID from output
-SWEEP_ID=$(echo "$SWEEP_OUTPUT" | grep -oP 'Sweep created! ID: \K\w+')
+# Extract sweep ID from output (compatible with both macOS and Linux)
+# First try to get the bare ID from "Sweep created! ID: xxx"
+SWEEP_ID=$(echo "$SWEEP_OUTPUT" | grep -o 'Sweep created! ID: [^ ]*' | awk '{print $NF}')
+
+# If that didn't work, try to extract from "Full sweep path: xxx"
+if [ -z "$SWEEP_ID" ]; then
+    SWEEP_ID=$(echo "$SWEEP_OUTPUT" | grep -o 'Full sweep path: [^ ]*' | awk '{print $NF}')
+fi
 
 if [ -z "$SWEEP_ID" ]; then
-    echo "Error: Failed to extract sweep ID"
+    echo "Error: Failed to extract sweep ID from output"
+    echo "This might indicate an error during sweep creation."
+    echo "Please check the output above for any error messages."
     exit 1
+fi
+
+# Validate sweep ID format (should be alphanumeric, possibly with slashes for full path)
+if ! echo "$SWEEP_ID" | grep -qE '^[a-zA-Z0-9/_-]+$'; then
+    echo "Warning: Extracted sweep ID has unexpected format: $SWEEP_ID"
+    echo "Proceeding anyway, but this might cause issues..."
 fi
 
 echo ""
@@ -47,7 +69,7 @@ echo ""
 
 if [ $NUM_GPUS -eq 0 ]; then
     echo "No GPUs detected! Running on CPU..."
-    python3 run_sweep.py --sweep_id $SWEEP_ID --project $PROJECT --count $NUM_RUNS
+    python3 run_sweep.py --sweep_id $SWEEP_ID --project $PROJECT $ENTITY_ARG --count $NUM_RUNS
     exit 0
 fi
 
@@ -57,6 +79,7 @@ for ((gpu=0; gpu<$NUM_GPUS; gpu++)); do
     CUDA_VISIBLE_DEVICES=$gpu python3 run_sweep.py \
         --sweep_id $SWEEP_ID \
         --project $PROJECT \
+        $ENTITY_ARG \
         --count $NUM_RUNS \
         > gpu_${gpu}_sweep.log 2>&1 &
     

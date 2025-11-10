@@ -30,6 +30,8 @@ def main():
                         help='Number of runs to execute (default: run until stopped)')
     parser.add_argument('--project', type=str, default='pathstar_sweep_dataset',
                         help='Wandb project name')
+    parser.add_argument('--entity', type=str, default=None,
+                        help='Wandb entity (username or team name)')
     parser.add_argument('--create_only', action='store_true',
                         help='Only create sweep and print ID, do not run agent')
     parser.add_argument('--gpu_id', type=str, default=None,
@@ -51,6 +53,11 @@ def main():
         sweep_id = args.sweep_id
         print(f"Joining existing sweep: {sweep_id}")
         print(f"Project: {args.project}")
+        
+        # If sweep_id doesn't contain '/', it's just the ID without entity/project
+        # We need to ensure we pass the project parameter to wandb.agent()
+        if '/' not in sweep_id:
+            print(f"Note: Sweep ID format is bare ID. Will use project parameter: {args.project}")
     else:
         # Create new sweep
         if args.sweep_config is None:
@@ -86,8 +93,12 @@ def main():
         
         sweep_id = wandb.sweep(sweep_config, project=args.project)
         
-        print(f"\nSweep created! ID: {sweep_id}")
-        print(f"View sweep at: https://wandb.ai/<your-entity>/{args.project}/sweeps/{sweep_id}")
+        # Extract bare sweep ID if it's in full format (entity/project/sweep_id)
+        bare_sweep_id = sweep_id.split('/')[-1] if '/' in sweep_id else sweep_id
+        
+        print(f"\nSweep created! ID: {bare_sweep_id}")
+        print(f"Full sweep path: {sweep_id}")
+        print(f"View sweep at: https://wandb.ai/{sweep_id.replace(bare_sweep_id, 'sweeps/' + bare_sweep_id) if '/' in sweep_id else f'<your-entity>/{args.project}/sweeps/{sweep_id}'}")
         print(f"\nTo run agents on multiple GPUs, use:")
         print(f"  GPU 0: CUDA_VISIBLE_DEVICES=0 python run_sweep.py --sweep_id {sweep_id} --project {args.project} --count <N>")
         print(f"  GPU 1: CUDA_VISIBLE_DEVICES=1 python run_sweep.py --sweep_id {sweep_id} --project {args.project} --count <N>")
@@ -97,12 +108,33 @@ def main():
             return
     
     # Run agent
+    # Note: If sweep_id is in full format (entity/project/sweep_id), entity/project parameters may be ignored
+    # If sweep_id is bare, we need to pass entity/project to help wandb locate the sweep
+    agent_kwargs = {
+        'sweep_id': sweep_id,
+        'function': sweep_train,
+        'project': args.project
+    }
+    
+    # Add entity if provided
+    if args.entity:
+        agent_kwargs['entity'] = args.entity
+    
     if args.count:
         print(f"\nStarting sweep agent (will run {args.count} experiments)...")
-        wandb.agent(sweep_id, function=sweep_train, count=args.count, project=args.project)
+        print(f"  Sweep ID: {sweep_id}")
+        print(f"  Project: {args.project}")
+        if args.entity:
+            print(f"  Entity: {args.entity}")
+        agent_kwargs['count'] = args.count
+        wandb.agent(**agent_kwargs)
     else:
         print(f"\nStarting sweep agent (will run until stopped)...")
-        wandb.agent(sweep_id, function=sweep_train, project=args.project)
+        print(f"  Sweep ID: {sweep_id}")
+        print(f"  Project: {args.project}")
+        if args.entity:
+            print(f"  Entity: {args.entity}")
+        wandb.agent(**agent_kwargs)
     
     print("\nAgent complete!")
 
