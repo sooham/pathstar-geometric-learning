@@ -294,7 +294,7 @@ def train(config=None):
     print(f"Training dataset composition: {replicated_train_paths} replicated paths + {total_edge_size} edges = {replicated_train_paths + total_edge_size} total samples")
     
     max_allowed_batch_size = total_edge_size + replicated_train_paths
-    batch_size = max(min(max_allowed_batch_size, 1000), min(total_edge_size, 1000))
+    batch_size = max(min(max_allowed_batch_size, 512), min(total_edge_size, 512))
     effective_batch_size = default_config['gradient_accumulation_steps'] * batch_size
     block_size = graph_length + 2 + pause_length
     

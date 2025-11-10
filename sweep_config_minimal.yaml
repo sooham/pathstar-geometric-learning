@@ -9,7 +9,7 @@ metric:
 parameters:
   # Dataset parameters - small fixed values for quick iteration
   graph_d:
-    values: [5000, 100000, 10000, 1000000]
+    values: [5000]
   graph_l:
     value: 5
   graph_vocab_size:
@@ -25,13 +25,13 @@ parameters:
   
   # Model architecture parameters - sweep these
   n_layer:
-    value: 3
+    values: [1,2,3]
   n_head:
-    value: 8
+    values: [8,6,4,2]
   n_embd:
-    value: 64
+    values: [64,32]
   dropout:
-    value: 0.01
+    value: 0
   bias:
     value: false
   
