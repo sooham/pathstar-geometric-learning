@@ -85,6 +85,198 @@ def get_default_config():
         'experiment_name': None,
     }
 
+def compute_per_token_loss(meta, logits, input, targets, token_positions, debug=False, split=''):
+    """
+    Compute per-token loss for specified token positions
+
+    Returns a dictionary that is 1-indexed with the values being the loss of the token at that position
+    with teacher forcing 
+    """
+
+    per_token_losses = {}
+    
+    # Compute context length per input based on task token
+    context_length_per_input = torch.where(
+        input[:, 0] == meta['task_tokens']['EDGE'],
+        torch.tensor(3 if meta['use_directional_tokens'] else 2, device=input.device),
+        torch.where(
+            input[:, 0] == meta['task_tokens']['PATH'],
+            torch.tensor(2 + meta['num_pause_tokens'], device=input.device),
+            torch.tensor(0, device=input.device)
+        )
+    ).unsqueeze(1)
+    
+    for token_pos in token_positions:
+        y_idx = context_length_per_input + token_pos - 2
+        y_idx = y_idx.squeeze(1)
+        
+        valid_idx_mask = y_idx < targets.size(1)
+        
+        if valid_idx_mask.any():
+            batch_size_local = logits.size(0)
+            logits_at_pos = torch.zeros(batch_size_local, logits.size(2), device=logits.device)
+            targets_at_pos = torch.zeros(batch_size_local, dtype=targets.dtype, device=targets.device)
+            
+            valid_batch_indices = []
+            
+            for b in range(batch_size_local):
+                if valid_idx_mask[b]:
+                    idx = y_idx[b].item()
+                    logits_at_pos[b] = logits[b, idx, :]
+                    targets_at_pos[b] = targets[b, idx]
+                    valid_batch_indices.append(b)
+                else:
+                    targets_at_pos[b] = -1
+            
+            valid_mask = targets_at_pos != -1
+            if valid_mask.any():
+                logits_valid = logits_at_pos[valid_mask]
+                targets_valid = targets_at_pos[valid_mask]
+                
+                token_loss = F.cross_entropy(logits_valid, targets_valid, reduction='mean')
+                per_token_losses[token_pos] = token_loss.item()
+            else:
+                per_token_losses[token_pos] = float('nan')
+        else:
+            per_token_losses[token_pos] = float('nan')
+    
+    return per_token_losses
+
+
+def compute_per_token_accuracy_autoregressive(ctx, model, meta, val_data_batch, num_samples, device_local):
+    """Compute per-token accuracy using autoregressive generation"""
+    sample_indices = np.random.choice(len(val_data_batch), size=min(num_samples, len(val_data_batch)), replace=False)
+    
+    context_length = 2 + meta['num_pause_tokens']
+    
+    contexts = []
+    ground_truths = []
+    
+    for val_idx in sample_indices:
+        full_sequence = val_data_batch[val_idx]
+        context = full_sequence[:context_length]
+        contexts.append(context)
+        ground_truth = full_sequence[context_length:context_length + meta['l']]
+        ground_truths.append(ground_truth)
+    
+    contexts_batch = torch.from_numpy(np.stack(contexts).astype(np.int64)).to(device_local)
+    
+    with torch.no_grad():
+        with ctx:
+            generated_sequences = model.generate(contexts_batch, max_new_tokens=meta['l'], temperature=1.0, top_k=1)
+            generated_tokens_batch = generated_sequences[:, context_length:].cpu().numpy()
+    
+    per_token_accuracies = {}
+    ground_truths_array = np.stack(ground_truths)
+    
+    for token_pos in range(1, meta['l'] + 1):
+        idx = token_pos - 1
+        if idx < generated_tokens_batch.shape[1] and idx < ground_truths_array.shape[1]:
+            matches = generated_tokens_batch[:, idx] == ground_truths_array[:, idx]
+            accuracy = np.mean(matches)
+            per_token_accuracies[token_pos] = accuracy
+        else:
+            per_token_accuracies[token_pos] = float('nan')
+    
+    return per_token_accuracies
+
+def evaluate_samples(device, ctx, model, meta, data, data_size, split_name, num_samples=5, eval_batch_size=128):
+    """
+    Evaluate autoregressive generation on samples from a dataset.
+    
+    Args:
+        ctx: context 
+        meta: the dictionary of graph parameters and dataset parameters
+        data: Dataset to sample from (train_data or val_data)
+        data_size: Size of the dataset
+        split_name: Name of the split for logging ('train' or 'val')
+        num_samples: Number of samples to evaluate
+        eval_batch_size: Batch size for generation to avoid OOM (default: 256)
+    
+    Returns:
+        avg_accuracy: Average accuracy across all samples
+    """
+    num_samples = min(num_samples, data_size)
+    
+    # For train data, filter to only PATH tasks
+    if split_name == 'train':
+        # Find indices where first token is path_token
+        path_indices = []
+        for idx in range(data_size):
+            if data[idx, 0] == meta['task_tokens']['PATH']:
+                path_indices.append(idx)
+        
+        if len(path_indices) == 0:
+            print(f"Warning: No PATH tasks found in {split_name} data")
+            return 0.0
+        
+        # Sample from valid PATH indices without replacement
+        num_samples = min(num_samples, len(path_indices))
+        sample_indices = np.random.choice(path_indices, size=num_samples, replace=False)
+    else:
+        # For val data, sample randomly without replacement
+        sample_indices = np.random.choice(data_size, size=num_samples, replace=False)
+    
+    # Prepare contexts and ground truths
+    context_length = 2 + meta['num_pause_tokens']
+    contexts = []
+    ground_truths = []
+    
+    for idx in sample_indices:
+        full_sequence = data[idx]
+        context = full_sequence[:context_length]
+        contexts.append(context)
+        ground_truth = full_sequence[context_length:context_length + meta['l']]
+        ground_truths.append(ground_truth)
+    
+    # Generate in batches to avoid OOM
+    all_generated_tokens = []
+    num_batches = (num_samples + eval_batch_size - 1) // eval_batch_size
+    
+    with torch.no_grad():
+        with ctx:
+            for batch_idx in range(num_batches):
+                start_idx = batch_idx * eval_batch_size
+                end_idx = min(start_idx + eval_batch_size, num_samples)
+                
+                # Get batch of contexts
+                batch_contexts = contexts[start_idx:end_idx]
+                contexts_batch = torch.from_numpy(np.stack(batch_contexts).astype(np.int64)).to(device)
+                
+                # Generate for this batch
+                generated_sequences = model.generate(contexts_batch, max_new_tokens=meta['l'], temperature=1.0, top_k=1)
+                generated_tokens_batch = generated_sequences[:, context_length:].cpu().numpy()
+                
+                all_generated_tokens.append(generated_tokens_batch)
+    
+    # Concatenate all batches
+    all_generated_tokens = np.concatenate(all_generated_tokens, axis=0)
+    
+    # Calculate accuracies
+    print(f"\nAutoregressive generation on {num_samples} {split_name} samples:")
+    accuracies = []
+    for ground_truth, generated_tokens in zip(ground_truths, all_generated_tokens):
+        # Calculate accuracy
+        accuracy = np.mean(generated_tokens == ground_truth[:len(generated_tokens)])
+        accuracies.append(accuracy)
+    
+    # Calculate average accuracy
+    avg_accuracy = np.mean(accuracies)
+    print(f"  Average accuracy: {avg_accuracy*100:.1f}%")
+    print()  # Empty line for readability
+    
+    return avg_accuracy
+
+def get_lr(it, warmup_iters, lr_decay_iters, default_config):
+    """Learning rate decay scheduler (cosine with warmup)"""
+    if it < warmup_iters:
+        return default_config['learning_rate'] * (it + 1) / (warmup_iters + 1)
+    if it > lr_decay_iters:
+        return default_config['min_lr']
+    decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return default_config['min_lr'] + coeff * (default_config['learning_rate'] - default_config['min_lr'])
 
 def train(config=None):
     """
@@ -273,7 +465,6 @@ def train(config=None):
     # Load special token IDs
     edge_token = None
     path_token = None
-    root_vertex = None
     
     if 'task_tokens' in meta:
         edge_token = meta['task_tokens']['EDGE']
@@ -387,178 +578,7 @@ def train(config=None):
         
         return x, y
     
-    def compute_per_token_loss(logits, input, targets, token_positions, debug=False, split=''):
-        """Compute per-token loss for specified token positions"""
-        per_token_losses = {}
-        
-        # Compute context length per input based on task token
-        context_length_per_input = torch.where(
-            input[:, 0] == edge_token,
-            torch.tensor(3 if use_directional_tokens_actual else 2, device=input.device),
-            torch.where(
-                input[:, 0] == path_token,
-                torch.tensor(2 + pause_length, device=input.device),
-                torch.tensor(0, device=input.device)
-            )
-        ).unsqueeze(1)
-        
-        for token_pos in token_positions:
-            y_idx = context_length_per_input + token_pos - 2
-            y_idx = y_idx.squeeze(1)
-            
-            valid_idx_mask = y_idx < targets.size(1)
-            
-            if valid_idx_mask.any():
-                batch_size_local = logits.size(0)
-                logits_at_pos = torch.zeros(batch_size_local, logits.size(2), device=logits.device)
-                targets_at_pos = torch.zeros(batch_size_local, dtype=targets.dtype, device=targets.device)
-                
-                valid_batch_indices = []
-                
-                for b in range(batch_size_local):
-                    if valid_idx_mask[b]:
-                        idx = y_idx[b].item()
-                        logits_at_pos[b] = logits[b, idx, :]
-                        targets_at_pos[b] = targets[b, idx]
-                        valid_batch_indices.append(b)
-                    else:
-                        targets_at_pos[b] = -1
-                
-                valid_mask = targets_at_pos != -1
-                if valid_mask.any():
-                    logits_valid = logits_at_pos[valid_mask]
-                    targets_valid = targets_at_pos[valid_mask]
-                    
-                    token_loss = F.cross_entropy(logits_valid, targets_valid, reduction='mean')
-                    per_token_losses[token_pos] = token_loss.item()
-                else:
-                    per_token_losses[token_pos] = float('nan')
-            else:
-                per_token_losses[token_pos] = float('nan')
-        
-        return per_token_losses
     
-    def compute_per_token_accuracy_autoregressive(val_data_batch, num_samples, device_local):
-        """Compute per-token accuracy using autoregressive generation"""
-        sample_indices = np.random.choice(len(val_data_batch), size=min(num_samples, len(val_data_batch)), replace=False)
-        
-        context_length = 2 + pause_length
-        
-        contexts = []
-        ground_truths = []
-        
-        for val_idx in sample_indices:
-            full_sequence = val_data_batch[val_idx]
-            context = full_sequence[:context_length]
-            contexts.append(context)
-            ground_truth = full_sequence[context_length:context_length + graph_length]
-            ground_truths.append(ground_truth)
-        
-        contexts_batch = torch.from_numpy(np.stack(contexts).astype(np.int64)).to(device_local)
-        
-        with torch.no_grad():
-            with ctx:
-                generated_sequences = model.generate(contexts_batch, max_new_tokens=graph_length, temperature=1.0, top_k=1)
-                generated_tokens_batch = generated_sequences[:, context_length:].cpu().numpy()
-        
-        per_token_accuracies = {}
-        ground_truths_array = np.stack(ground_truths)
-        
-        for token_pos in range(1, graph_length + 1):
-            idx = token_pos - 1
-            if idx < generated_tokens_batch.shape[1] and idx < ground_truths_array.shape[1]:
-                matches = generated_tokens_batch[:, idx] == ground_truths_array[:, idx]
-                accuracy = np.mean(matches)
-                per_token_accuracies[token_pos] = accuracy
-            else:
-                per_token_accuracies[token_pos] = float('nan')
-        
-        return per_token_accuracies
-    
-    def evaluate_samples(data, data_size, split_name, num_samples=5, eval_batch_size=128):
-        """
-        Evaluate autoregressive generation on samples from a dataset.
-        
-        Args:
-            data: Dataset to sample from (train_data or val_data)
-            data_size: Size of the dataset
-            split_name: Name of the split for logging ('train' or 'val')
-            num_samples: Number of samples to evaluate
-            eval_batch_size: Batch size for generation to avoid OOM (default: 256)
-        
-        Returns:
-            avg_accuracy: Average accuracy across all samples
-        """
-        num_samples = min(num_samples, data_size)
-        
-        # For train data, filter to only PATH tasks
-        if split_name == 'train':
-            # Find indices where first token is path_token
-            path_indices = []
-            for idx in range(data_size):
-                if data[idx, 0] == path_token:
-                    path_indices.append(idx)
-            
-            if len(path_indices) == 0:
-                print(f"Warning: No PATH tasks found in {split_name} data")
-                return 0.0
-            
-            # Sample from valid PATH indices without replacement
-            num_samples = min(num_samples, len(path_indices))
-            sample_indices = np.random.choice(path_indices, size=num_samples, replace=False)
-        else:
-            # For val data, sample randomly without replacement
-            sample_indices = np.random.choice(data_size, size=num_samples, replace=False)
-        
-        # Prepare contexts and ground truths
-        context_length = 2 + pause_length
-        contexts = []
-        ground_truths = []
-        
-        for idx in sample_indices:
-            full_sequence = data[idx]
-            context = full_sequence[:context_length]
-            contexts.append(context)
-            ground_truth = full_sequence[context_length:context_length + graph_length]
-            ground_truths.append(ground_truth)
-        
-        # Generate in batches to avoid OOM
-        all_generated_tokens = []
-        num_batches = (num_samples + eval_batch_size - 1) // eval_batch_size
-        
-        with torch.no_grad():
-            with ctx:
-                for batch_idx in range(num_batches):
-                    start_idx = batch_idx * eval_batch_size
-                    end_idx = min(start_idx + eval_batch_size, num_samples)
-                    
-                    # Get batch of contexts
-                    batch_contexts = contexts[start_idx:end_idx]
-                    contexts_batch = torch.from_numpy(np.stack(batch_contexts).astype(np.int64)).to(device)
-                    
-                    # Generate for this batch
-                    generated_sequences = model.generate(contexts_batch, max_new_tokens=graph_length, temperature=1.0, top_k=1)
-                    generated_tokens_batch = generated_sequences[:, context_length:].cpu().numpy()
-                    
-                    all_generated_tokens.append(generated_tokens_batch)
-        
-        # Concatenate all batches
-        all_generated_tokens = np.concatenate(all_generated_tokens, axis=0)
-        
-        # Calculate accuracies
-        print(f"\nAutoregressive generation on {num_samples} {split_name} samples:")
-        accuracies = []
-        for ground_truth, generated_tokens in zip(ground_truths, all_generated_tokens):
-            # Calculate accuracy
-            accuracy = np.mean(generated_tokens == ground_truth[:len(generated_tokens)])
-            accuracies.append(accuracy)
-        
-        # Calculate average accuracy
-        avg_accuracy = np.mean(accuracies)
-        print(f"  Average accuracy: {avg_accuracy*100:.1f}%")
-        print()  # Empty line for readability
-        
-        return avg_accuracy
     
     @torch.no_grad()
     def estimate_loss():
@@ -579,11 +599,11 @@ def train(config=None):
                 losses[k] = loss.item()
                 
                 if split == 'train':
-                    batch_per_token = compute_per_token_loss(logits, X, Y, [1], debug=False, split='train')
+                    batch_per_token = compute_per_token_loss(meta, logits, X, Y, [1], debug=False, split='train')
                     if 1 in batch_per_token:
                         train_token_losses[1].append(batch_per_token[1])
                 else:
-                    batch_per_token = compute_per_token_loss(logits, X, Y, range(1, graph_length + 1), debug=False, split='val')
+                    batch_per_token = compute_per_token_loss(meta, logits, X, Y, range(1, graph_length + 1), debug=False, split='val')
                     for token_pos, token_loss in batch_per_token.items():
                         if not math.isnan(token_loss):
                             val_token_losses[token_pos].append(token_loss)
@@ -605,22 +625,12 @@ def train(config=None):
         
         # Compute per-token accuracy
         num_samples_for_accuracy = val_size
-        val_per_token_accuracy = compute_per_token_accuracy_autoregressive(val_data, num_samples_for_accuracy, device)
+        val_per_token_accuracy = compute_per_token_accuracy_autoregressive(ctx, model, meta, val_data, num_samples_for_accuracy, device)
         out['val_per_token_accuracy'] = val_per_token_accuracy
         
         model.train()
         return out
     
-    def get_lr(it):
-        """Learning rate decay scheduler (cosine with warmup)"""
-        if it < warmup_iters:
-            return default_config['learning_rate'] * (it + 1) / (warmup_iters + 1)
-        if it > lr_decay_iters:
-            return default_config['min_lr']
-        decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
-        assert 0 <= decay_ratio <= 1
-        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-        return default_config['min_lr'] + coeff * (default_config['learning_rate'] - default_config['min_lr'])
     
     # Model initialization
     model_args = dict(
@@ -700,7 +710,8 @@ def train(config=None):
     
     while True:
         # Set learning rate
-        lr = get_lr(iter_num) if default_config['decay_lr'] else default_config['learning_rate']
+        lr = get_lr(iter_num, warmup_iters, lr_decay_iters, default_config) if default_config['decay_lr'] else default_config['learning_rate']
+
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
         
@@ -737,8 +748,8 @@ def train(config=None):
                     print(f"    {per_token_acc_str_rest}")
             
             # Evaluate autoregressive generation on validation and training samples
-            val_avg_accuracy = evaluate_samples(val_data, val_size, 'val', num_samples=val_size)
-            train_avg_accuracy = evaluate_samples(train_data, train_size, 'train', num_samples=replicated_train_paths)
+            val_avg_accuracy = evaluate_samples(device, ctx, model,  meta, val_data, val_size, 'val', num_samples=val_size)
+            train_avg_accuracy = evaluate_samples(device, ctx, model, meta, train_data, train_size, 'train', num_samples=replicated_train_paths)
             
             if default_config['wandb_log']:
                 log_dict = {
