@@ -454,6 +454,10 @@ class InWeightsPathStar:
         
         # Create output directory with parameters in name
         dir_name = f'inweights_pathstar_v{self.vocab_size}_d{self.d}_l{self.l}_p{num_pause_tokens}_{"un" if use_undirected else ""}directed_{"dt" if use_directional_tokens else ""}'
+        self.dir_name = dir_name
+        self.num_pause_tokens = num_pause_tokens
+        self.use_undirected = use_undirected
+        self.use_directional_tokens = use_directional_tokens
         full_output_dir = os.path.join(output_dir, dir_name)
         os.makedirs(full_output_dir, exist_ok=True)
         
@@ -645,6 +649,119 @@ class InWeightsPathStar:
         print(f"  Total tokens (val): {val_data.size}")
         
         return full_output_dir
+
+    def load_dataset(self):
+        dataset = self.dir_name
+        # Data loading setup
+        data_dir = os.path.join('data', dataset)
+        # Load data once as memory-mapped arrays
+        train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+        val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+        # Load metadata once at initialization
+        meta_path = os.path.join(data_dir, 'meta.pkl')
+        if not os.path.exists(meta_path):
+            raise ValueError(f"Metadata file not found at {meta_path}")
+
+        with open(meta_path, 'rb') as f:
+            meta = pickle.load(f)
+        
+        return meta, train_data, val_data
+
+    def generate_dataset_name(self):
+        """
+        Generate dataset directory name matching the naming convention in pathstar.py
+        """
+        return self.dir_name
+
+    def check_dataset_exists(self):
+        """
+        Check if dataset exists and validate that metadata matches requested parameters.
+        
+        Returns:
+            bool: True if dataset exists and parameters match, False otherwise
+        """
+        dataset_name = self.dir_name
+        data_dir = os.path.join('data', dataset_name)
+        meta_path = os.path.join(data_dir, 'meta.pkl')
+        train_path = os.path.join(data_dir, 'train.bin')
+        val_path = os.path.join(data_dir, 'val.bin')
+        
+        # Check if all required files exist
+        if not (os.path.exists(data_dir) and os.path.exists(meta_path) and 
+                os.path.exists(train_path) and os.path.exists(val_path)):
+            return False
+        
+        # Load metadata and validate parameters
+        try:
+            with open(meta_path, 'rb') as f:
+                meta = pickle.load(f)
+            
+            # Check if all key parameters match
+            params_match = (
+                meta.get('d') == self.d and
+                meta.get('l') == self.l and
+                meta.get('num_pause_tokens') == self.num_pause_tokens and
+                meta.get('use_undirected') == self.use_undirected and
+                meta.get('use_directional_tokens') == self.use_directional_tokens and
+                abs(meta.get('holdout_percentage', 0.0) - self.holdout_percentage) < 1e-6  # Float comparison
+            )
+            
+            if not params_match:
+                print(f"Dataset exists but parameters don't match:")
+                print(f"  Existing: d={meta.get('d')}, l={meta.get('l')}, pause={meta.get('num_pause_tokens')}, "
+                    f"undirected={meta.get('use_undirected')}, directional_tokens={meta.get('use_directional_tokens')}, "
+                    f"holdout={meta.get('holdout_percentage')}")
+                print(f"  Requested: d={self.d}, l={self.l}, pause={self.num_pause_tokens}, "
+                    f"undirected={self.use_undirected}, directional_tokens={self.use_directional_tokens}, "
+                    f"holdout={self.holdout_percentage}")
+                print(f"  Will regenerate dataset...")
+                return False
+            
+            return True
+        except Exception as e:
+            print(f"Error reading metadata: {e}")
+            return False
+
+
+    def generate_dataset_if_needed(self, num_pause_tokens, use_undirected, use_directional_tokens):
+        """
+        Generate the dataset using InWeightsPathStar if it doesn't exist or parameters don't match.
+        """
+        # Validate vocab_size
+        if self.vocab_size < self.num_vertices:
+            raise ValueError(
+                f"vocab_size ({self.vocab_size}) must be >= d * (l-1) + 1 = {self.num_vertices}"
+            )
+        
+        # Generate dataset name
+        dataset_name = self.dir_name
+        
+        # Check if dataset exists and parameters match
+        if self.check_dataset_exists():
+            print(f"Dataset '{dataset_name}' exists with matching parameters. Using existing dataset.")
+            return dataset_name
+        
+        # Dataset doesn't exist or needs regeneration
+        print(f"\n{'='*80}")
+        print(f"Generating dataset: {dataset_name}")
+        print(f"{'='*80}\n")
+        
+        # Create InWeightsPathStar generator
+        generator = self
+        
+        # Generate and save dataset
+        output_dir = generator.prepare(
+            num_pause_tokens=num_pause_tokens,
+            output_dir='./data',
+            use_undirected=use_undirected,
+            use_directional_tokens=use_directional_tokens
+        )
+        
+        print(f"\n{'='*80}")
+        print(f"Dataset generation complete: {output_dir}")
+        print(f"{'='*80}\n")
+        
+        return dataset_name
 
 
 if __name__ == '__main__':

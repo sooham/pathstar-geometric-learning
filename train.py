@@ -9,11 +9,11 @@ $ wandb sweep sweep_config.yaml
 $ wandb agent <sweep_id>
 """
 
+from datetime import datetime
 import wandb
 import os
 import time
 import math
-import pickle
 from contextlib import nullcontext
 
 import numpy as np
@@ -22,129 +22,6 @@ import torch.nn.functional as F
 
 from model import GPTConfig, GPT
 from pathstar import InWeightsPathStar
-
-
-def generate_dataset_name(v, d, l, num_pause_tokens, use_undirected, use_directional_tokens):
-    """
-    Generate dataset directory name matching the naming convention in pathstar.py
-    """
-    dir_name = f'inweights_pathstar_v{v}_d{d}_l{l}_p{num_pause_tokens}_{"un" if use_undirected else ""}directed_{"dt" if use_directional_tokens else ""}'
-    return dir_name
-
-
-def check_dataset_exists(dataset_name, d, l, num_pause_tokens, use_undirected, use_directional_tokens, holdout_percentage):
-    """
-    Check if dataset exists and validate that metadata matches requested parameters.
-    
-    Returns:
-        bool: True if dataset exists and parameters match, False otherwise
-    """
-    data_dir = os.path.join('data', dataset_name)
-    meta_path = os.path.join(data_dir, 'meta.pkl')
-    train_path = os.path.join(data_dir, 'train.bin')
-    val_path = os.path.join(data_dir, 'val.bin')
-    
-    # Check if all required files exist
-    if not (os.path.exists(data_dir) and os.path.exists(meta_path) and 
-            os.path.exists(train_path) and os.path.exists(val_path)):
-        return False
-    
-    # Load metadata and validate parameters
-    try:
-        with open(meta_path, 'rb') as f:
-            meta = pickle.load(f)
-        
-        # Check if all key parameters match
-        params_match = (
-            meta.get('d') == d and
-            meta.get('l') == l and
-            meta.get('num_pause_tokens') == num_pause_tokens and
-            meta.get('use_undirected') == use_undirected and
-            meta.get('use_directional_tokens') == use_directional_tokens and
-            abs(meta.get('holdout_percentage', 0.0) - holdout_percentage) < 1e-6  # Float comparison
-        )
-        
-        if not params_match:
-            print(f"Dataset exists but parameters don't match:")
-            print(f"  Existing: d={meta.get('d')}, l={meta.get('l')}, pause={meta.get('num_pause_tokens')}, "
-                  f"undirected={meta.get('use_undirected')}, directional_tokens={meta.get('use_directional_tokens')}, "
-                  f"holdout={meta.get('holdout_percentage')}")
-            print(f"  Requested: d={d}, l={l}, pause={num_pause_tokens}, "
-                  f"undirected={use_undirected}, directional_tokens={use_directional_tokens}, "
-                  f"holdout={holdout_percentage}")
-            print(f"  Will regenerate dataset...")
-            return False
-        
-        return True
-    except Exception as e:
-        print(f"Error reading metadata: {e}")
-        return False
-
-
-def generate_dataset_if_needed(d, l, vocab_size, holdout_percentage, num_pause_tokens, 
-                               use_undirected, use_directional_tokens):
-    """
-    Generate the dataset using InWeightsPathStar if it doesn't exist or parameters don't match.
-    """
-    # Validate vocab_size
-    num_vertices = d * (l - 1) + 1
-    if vocab_size < num_vertices:
-        raise ValueError(
-            f"vocab_size ({vocab_size}) must be >= d * (l-1) + 1 = {num_vertices}"
-        )
-    
-    # Generate dataset name
-    dataset_name = generate_dataset_name(vocab_size, d, l, num_pause_tokens, use_undirected, use_directional_tokens)
-    
-    # Check if dataset exists and parameters match
-    if check_dataset_exists(dataset_name, d, l, num_pause_tokens, use_undirected, 
-                           use_directional_tokens, holdout_percentage):
-        print(f"Dataset '{dataset_name}' exists with matching parameters. Using existing dataset.")
-        return dataset_name
-    
-    # Dataset doesn't exist or needs regeneration
-    print(f"\n{'='*80}")
-    print(f"Generating dataset: {dataset_name}")
-    print(f"{'='*80}\n")
-    
-    # Create InWeightsPathStar generator
-    generator = InWeightsPathStar(
-        d=d,
-        l=l,
-        vocab_size=vocab_size,
-        holdout_percentage=holdout_percentage
-    )
-    
-    # Generate and save dataset
-    output_dir = generator.prepare(
-        num_pause_tokens=num_pause_tokens,
-        output_dir='./data',
-        use_undirected=use_undirected,
-        use_directional_tokens=use_directional_tokens
-    )
-    
-    print(f"\n{'='*80}")
-    print(f"Dataset generation complete: {output_dir}")
-    print(f"{'='*80}\n")
-    
-    return dataset_name
-
-
-def load_dataset(dataset):
-    # Data loading setup
-    data_dir = os.path.join('data', dataset)
-    # Load data once as memory-mapped arrays
-    train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-    val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-    # Load metadata once at initialization
-    meta_path = os.path.join(data_dir, 'meta.pkl')
-    if not os.path.exists(meta_path):
-        raise ValueError(f"Metadata file not found at {meta_path}")
-
-    with open(meta_path, 'rb') as f:
-        meta = pickle.load(f)
-    
-    return meta, train_data, val_data
 
 
 def get_default_config():
@@ -259,17 +136,19 @@ def train(config=None):
         f"graph_vocab_size must be >= graph_d * (graph_l - 1) + 1"
     
     # Generate/load dataset
-    dataset = generate_dataset_if_needed(
+    gen = InWeightsPathStar(
         d=default_config['graph_d'],
         l=default_config['graph_l'],
         vocab_size=default_config['graph_vocab_size'],
         holdout_percentage=default_config['graph_holdout_percentage'],
+    )
+    dataset = gen.generate_dataset_if_needed(
         num_pause_tokens=default_config['num_pause_tokens'],
         use_undirected=default_config['use_undirected'],
         use_directional_tokens=default_config['use_directional_tokens']
     )
     
-    meta, train_data, val_data = load_dataset(dataset)
+    meta, train_data, val_data = gen.load_dataset()
     
     # Extract graph parameters from metadata
     graph_length = meta['l']
@@ -317,7 +196,10 @@ def train(config=None):
     
     # Generate wandb run name if not provided
     if default_config['wandb_run_name'] is None:
-        default_config['wandb_run_name'] = f"{dataset}_L{default_config['n_layer']}H{default_config['n_head']}E{default_config['n_embd']}_lr{default_config['learning_rate']}_bs{batch_size}_ga{default_config['gradient_accumulation_steps']}_drop{default_config['dropout']}_ls{default_config['label_smoothing']}_{time.time()}"
+        utc_time = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        dropout_str = f"_drop{default_config['dropout']}" if default_config['dropout'] > 0 else ""
+        label_smoothing_str = f"_ls{default_config['label_smoothing']}" if default_config['label_smoothing'] > 0 else ""
+        default_config['wandb_run_name'] = f"{utc_time}_{dataset}_L{default_config['n_layer']}H{default_config['n_head']}E{default_config['n_embd']}_lr{default_config['learning_rate']}_bs{batch_size}_ga{default_config['gradient_accumulation_steps']}{dropout_str}{label_smoothing_str}"
     
     # Print configuration
     tokens_per_iter = default_config['gradient_accumulation_steps'] * batch_size * block_size
@@ -410,9 +292,7 @@ def train(config=None):
     else:
         print("Warning: No special tokens found in metadata. PAD masking will be disabled.")
     
-    stoi = meta.get('stoi', {})
     itos = meta.get('itos', {})
-    root_vertex = meta.get('root_vertex')
     if itos:
         print(f"Loaded vocabulary mappings: {len(itos)} tokens")
     
@@ -595,7 +475,7 @@ def train(config=None):
         
         return per_token_accuracies
     
-    def evaluate_samples(data, data_size, split_name, num_samples=5, eval_batch_size=256):
+    def evaluate_samples(data, data_size, split_name, num_samples=5, eval_batch_size=128):
         """
         Evaluate autoregressive generation on samples from a dataset.
         
