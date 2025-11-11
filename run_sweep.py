@@ -17,7 +17,51 @@ import argparse
 import wandb
 import yaml
 import os
+import signal
+import sys
+import torch
 from train import sweep_train
+
+# Flag to track if we're shutting down
+_shutting_down = False
+
+def signal_handler(signum, frame):
+    """Handle interrupt signals gracefully"""
+    global _shutting_down
+    
+    if _shutting_down:
+        # Second interrupt - force exit
+        print("\n\nForce exit requested. Terminating immediately.")
+        sys.exit(1)
+    
+    _shutting_down = True
+    print("\n\n========================================")
+    print("Interrupt signal received - cleaning up...")
+    print("========================================")
+    
+    # Clean up GPU memory
+    if torch.cuda.is_available():
+        try:
+            print("Clearing GPU memory...")
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        except Exception as e:
+            print(f"Warning during GPU cleanup: {e}")
+    
+    # Finish wandb run if active
+    if wandb.run is not None:
+        try:
+            print("Finishing wandb run...")
+            wandb.finish(exit_code=130)
+        except Exception as e:
+            print(f"Warning during wandb cleanup: {e}")
+    
+    print("Cleanup complete. Exiting.")
+    sys.exit(130)
+
+# Register signal handlers
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
 
 
 def main():

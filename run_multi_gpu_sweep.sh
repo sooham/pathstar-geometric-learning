@@ -2,6 +2,46 @@
 # Convenience script to run wandb sweeps on multiple GPUs
 # Usage: ./run_multi_gpu_sweep.sh <sweep_config.yaml> <num_runs_per_gpu>
 
+# Array to store background PIDs for cleanup
+declare -a AGENT_PIDS
+
+# Cleanup function to kill all background agents
+cleanup() {
+    echo ""
+    echo "========================================="
+    echo "Received interrupt signal - cleaning up..."
+    echo "========================================="
+    
+    if [ ${#AGENT_PIDS[@]} -gt 0 ]; then
+        echo "Terminating ${#AGENT_PIDS[@]} sweep agent(s)..."
+        for pid in "${AGENT_PIDS[@]}"; do
+            if kill -0 "$pid" 2>/dev/null; then
+                echo "  Killing PID $pid..."
+                kill -TERM "$pid" 2>/dev/null
+            fi
+        done
+        
+        # Give processes time to exit gracefully
+        sleep 2
+        
+        # Force kill any remaining processes
+        for pid in "${AGENT_PIDS[@]}"; do
+            if kill -0 "$pid" 2>/dev/null; then
+                echo "  Force killing PID $pid..."
+                kill -9 "$pid" 2>/dev/null
+            fi
+        done
+        
+        echo "All agents terminated."
+    fi
+    
+    echo "Cleanup complete. Exiting."
+    exit 130
+}
+
+# Set up signal handlers for graceful shutdown
+trap cleanup SIGINT SIGTERM EXIT
+
 if [ "$#" -lt 1 ]; then
     echo "Usage: $0 <sweep_config.yaml> [num_runs_per_gpu] [project_name] [entity_name]"
     echo "Example: $0 sweep_config_minimal.yaml 3 pathstar_sweep my_entity"
@@ -83,8 +123,9 @@ for ((gpu=0; gpu<$NUM_GPUS; gpu++)); do
         --count $NUM_RUNS \
         > gpu_${gpu}_sweep.log 2>&1 &
     
-    # Store process ID
+    # Store process ID in array for cleanup
     PID=$!
+    AGENT_PIDS+=($PID)
     echo "  PID: $PID"
     echo "  Log: gpu_${gpu}_sweep.log"
     echo ""
@@ -103,11 +144,19 @@ echo "  - GPU 0 log: tail -f gpu_0_sweep.log"
 echo "  - GPU 1 log: tail -f gpu_1_sweep.log"
 echo ""
 echo "To stop all agents:"
-echo "  pkill -f 'run_sweep.py --sweep_id $SWEEP_ID'"
+echo "  Press Ctrl+C or run: pkill -f 'run_sweep.py --sweep_id $SWEEP_ID'"
 echo ""
 
 # Wait for all background processes
+# This will be interrupted if user sends SIGINT/SIGTERM
 wait
 
-echo "All agents completed!"
+# If we reach here, all agents completed successfully
+# Disable the EXIT trap to avoid cleanup on normal exit
+trap - EXIT
+
+echo "All agents completed successfully!"
+
+# Clear the PID array since processes finished normally
+AGENT_PIDS=()
 

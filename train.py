@@ -288,6 +288,18 @@ def train(config=None):
         config: Optional dict of configuration overrides. If None, uses defaults and command-line args.
     """
     
+    # Clear GPU memory at the start of training run
+    if torch.cuda.is_available():
+        print("Clearing GPU memory...")
+        torch.cuda.empty_cache()
+        try:
+            torch.cuda.synchronize()
+            # Reset memory stats for clean monitoring
+            torch.cuda.reset_peak_memory_stats()
+            torch.cuda.reset_accumulated_memory_stats()
+        except Exception as e:
+            print(f"Warning during GPU memory clearing: {e}")
+    
     # Get default config
     default_config = get_default_config()
     
@@ -432,14 +444,8 @@ def train(config=None):
     
     checkpoint_filename = f'ckpt_exp_{experiment_name}_pl{pause_length}_bi{bidirectional}_gpu_{gpu_id}.pt'
     print(f"Checkpoint will be saved as: {checkpoint_filename}")
-    try:
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-    except Exception as e:
-        print(f"Warning: CUDA initialization issue: {e}")
-        print("Attempting to reset CUDA context...")
-        torch.cuda.init()
     
+    # Set random seed and backend configurations
     torch.manual_seed(1337)
     torch.backends.cudnn.conv.fp32_precision = 'tf32'
     torch.backends.cuda.matmul.fp32_precision = 'tf32'
@@ -541,19 +547,52 @@ def train(config=None):
     train_data = train_data.reshape(train_size, train_seq_length)
     val_data = val_data.reshape(val_size, val_seq_length)
     
-    # Pre-load data as GPU tensors to eliminate NumPy conversions during training
-    # This significantly speeds up the data pipeline
-    print("Pre-loading datasets to GPU...")
+    # Determine if datasets can fit in GPU memory (policy: use at most 50% of available VRAM)
     train_data_tensor = torch.from_numpy(train_data.astype(np.int64))
     val_data_tensor = torch.from_numpy(val_data.astype(np.int64))
     
-    # Move to device
+    datasets_on_gpu = False
     if device_type == 'cuda':
-        train_data_tensor = train_data_tensor.pin_memory().to(device, non_blocking=True)
-        val_data_tensor = val_data_tensor.pin_memory().to(device, non_blocking=True)
+        # Calculate dataset memory requirements
+        train_data_bytes = train_data_tensor.numel() * train_data_tensor.element_size()
+        val_data_bytes = val_data_tensor.numel() * val_data_tensor.element_size()
+        total_dataset_bytes = train_data_bytes + val_data_bytes
+        
+        # Get available GPU memory
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        props = torch.cuda.get_device_properties(device)
+        total_vram = props.total_memory
+        allocated_vram = torch.cuda.memory_allocated(device)
+        available_vram = total_vram - allocated_vram
+        
+        # Policy: Only load to GPU if datasets use < 50% of available VRAM
+        vram_limit = available_vram * 0.5
+        
+        print(f"\n=== Dataset Memory Policy Check ===")
+        print(f"Train dataset size: {train_data_bytes / 1e9:.3f} GB ({train_data_tensor.shape})")
+        print(f"Val dataset size: {val_data_bytes / 1e9:.3f} GB ({val_data_tensor.shape})")
+        print(f"Total dataset size: {total_dataset_bytes / 1e9:.3f} GB")
+        print(f"Available VRAM: {available_vram / 1e9:.3f} GB")
+        print(f"VRAM limit (50%): {vram_limit / 1e9:.3f} GB")
+        
+        if total_dataset_bytes <= vram_limit:
+            print("✓ Datasets fit within memory limit - loading to GPU for faster training")
+            train_data_tensor = train_data_tensor.pin_memory().to(device, non_blocking=True)
+            val_data_tensor = val_data_tensor.pin_memory().to(device, non_blocking=True)
+            datasets_on_gpu = True
+        else:
+            print("✗ Datasets exceed memory limit - keeping on CPU (will transfer batches on-demand)")
+            datasets_on_gpu = False
+        print(f"===================================\n")
     else:
-        train_data_tensor = train_data_tensor.to(device)
-        val_data_tensor = val_data_tensor.to(device)
+        # For non-CUDA devices, always keep on CPU or move to device as appropriate
+        if device_type != 'cpu':
+            train_data_tensor = train_data_tensor.to(device)
+            val_data_tensor = val_data_tensor.to(device)
+            datasets_on_gpu = True
+        else:
+            datasets_on_gpu = False
     
     # Keep NumPy versions for evaluate_samples (will optimize separately)
     train_data_np = train_data
@@ -566,7 +605,7 @@ def train(config=None):
     val_batch_idx = 0
     
     def get_batch(split):
-        """Sample a batch from the dataset (optimized with pre-loaded GPU tensors)"""
+        """Sample a batch from the dataset (handles both GPU and CPU tensors)"""
         nonlocal train_batch_idx, val_batch_idx, train_epoch_indices, val_epoch_indices
         
         # Select dataset and indices
@@ -600,21 +639,27 @@ def train(config=None):
         else:
             val_batch_idx = (batch_idx + 1) if end_idx < dataset_size else 0
         
-        # Extract sequences from GPU tensor (much faster than NumPy)
-        sequences = data_tensor[batch_seq_indices]
+        # Extract sequences (from GPU if available, otherwise from CPU and transfer)
+        if datasets_on_gpu:
+            # Fast path: data already on GPU
+            sequences = data_tensor[batch_seq_indices]
+        else:
+            # Slower path: index CPU tensor and transfer to GPU
+            sequences = data_tensor[batch_seq_indices]
+            if device_type == 'cuda':
+                sequences = sequences.to(device, non_blocking=True)
         
         # Pad or truncate to block_size if needed
         if seq_length < block_size:
             pad_value = pad_token_id if pad_token_id is not None else 0
             padding = torch.full((actual_batch_size, block_size - seq_length), pad_value, 
-                                dtype=torch.long, device=device)
+                                dtype=torch.long, device=sequences.device)
             sequences = torch.cat([sequences, padding], dim=1)
         elif seq_length > block_size:
             print(f"WARNING: Sequence length ({seq_length}) exceeds block_size ({block_size}). Truncating sequences.")
             sequences = sequences[:, :block_size]
         
         # Create input (x) and target (y) by shifting
-        # Note: sequences are already on device, no need to transfer
         x = sequences[:, :-1].clone()
         y = sequences[:, 1:].clone()
         
@@ -1044,6 +1089,17 @@ def train(config=None):
         
         if iter_num > max_iters:
             break
+    
+    # Cleanup and finalization
+    print("Finalizing training run...")
+    
+    # Clear GPU memory before finishing
+    if device_type == 'cuda':
+        try:
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        except Exception as e:
+            print(f"Warning during GPU cleanup: {e}")
     
     # Only call wandb.finish() if we initialized wandb ourselves (not in sweep mode)
     # In sweep mode, the agent handles finishing the run
