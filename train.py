@@ -387,7 +387,9 @@ def initalize_model(device, meta, config, checkpoint_filename):
         vocab_size=None,
         dropout=config['dropout']
     )
-
+    checkpoint = None
+    iter_num = 0
+    best_val_loss = float('inf')
     if config['init_from'] == 'scratch':
         print("Initializing a new model from scratch")
         if meta['vocab_size'] is None:
