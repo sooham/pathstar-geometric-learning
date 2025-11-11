@@ -9,11 +9,11 @@ metric:
 parameters:
   # Dataset parameters - small fixed values for quick iteration
   graph_d:
-    values: [20000]
+    values: [5000]
   graph_l:
     value: 5
   graph_vocab_size:
-    value: '2max'
+    value: '1max'
   graph_holdout_percentage:
     value: 0.5
   num_pause_tokens:
@@ -29,7 +29,7 @@ parameters:
   n_head:
     values: [8]
   n_embd:
-    values: [64]
+    values: [384]
   dropout:
     values: [0.01]
   bias:
@@ -37,7 +37,7 @@ parameters:
   
   # Training hyperparameters - sweep learning rate
   learning_rate:
-    value: 1e-3
+    value: 1e-5
   label_smoothing:
     value: 0.1
   weight_decay:
@@ -57,7 +57,7 @@ parameters:
   lr_decay_frac:
     value: 0.80
   min_lr:
-    value: 6e-5
+    value: 1e-6
   
   # Fixed training parameters
   epochs:

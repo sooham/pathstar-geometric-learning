@@ -23,7 +23,6 @@ import torch.nn.functional as F
 from model import GPTConfig, GPT
 from pathstar import InWeightsPathStar
 
-MAX_BATCH_SIZE = 2000
 
 def get_default_config():
     """
@@ -35,7 +34,7 @@ def get_default_config():
         'init_from': 'scratch',  # 'scratch' or 'resume'
         'out_dir': 'out',
         'eval_interval': 100,
-        'log_interval': 10,
+        'log_interval': 50,
         'eval_only': False,
         'always_save_checkpoint': True,
         
@@ -45,16 +44,16 @@ def get_default_config():
         'wandb_run_name': None,  # Will be auto-generated
         
         # Dataset generation parameters
-        'graph_d': 250,
+        'graph_d': 1000,
         'graph_l': 5,
-        'graph_vocab_size': 2000,
+        'graph_vocab_size': '1max',
         'graph_holdout_percentage': 0.2,
         'num_pause_tokens': 1,
         'use_undirected': True,
         'use_directional_tokens': True,
         
         # Training parameters
-        'gradient_accumulation_steps': 1,
+        'gradient_accumulation_steps': 8,
         
         # Model architecture
         'n_layer': 3,
@@ -84,6 +83,9 @@ def get_default_config():
         'compile': True,
         'gpu_id': None,
         'experiment_name': None,
+
+        # seed
+        'seed': 1337
     }
 
 @torch.compile
@@ -280,15 +282,7 @@ def get_lr(it, warmup_iters, lr_decay_iters, default_config):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return default_config['min_lr'] + coeff * (default_config['learning_rate'] - default_config['min_lr'])
 
-def train(config=None):
-    """
-    Main training function that can be called standalone or by wandb sweep.
-    
-    Args:
-        config: Optional dict of configuration overrides. If None, uses defaults and command-line args.
-    """
-    
-    # Clear GPU memory at the start of training run
+def clear_gpu_memory():
     if torch.cuda.is_available():
         print("Clearing GPU memory...")
         torch.cuda.empty_cache()
@@ -299,6 +293,274 @@ def train(config=None):
             torch.cuda.reset_accumulated_memory_stats()
         except Exception as e:
             print(f"Warning during GPU memory clearing: {e}")
+
+def set_wandb_name(config):
+    if config is not None:
+        # Set custom run name for sweep runs
+        if wandb.run is not None:
+            utc_time = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+            custom_name = (
+                f"{utc_time}_"
+                f"G{config['graph_d']},"
+                f"{config['graph_l']}_"
+                f"L{config['n_layer']}_"
+                f"E{config['n_embd']}_"
+                f"H{config['n_head']}_"
+                f"D{config['dropout']}_"
+                f"p{config['num_pause_tokens']}_"
+                f"{config['epochs']}"
+            )
+            wandb.run.name = custom_name
+            print(f"Set sweep run name: {custom_name}")
+            return custom_name
+
+def detect_device(config):
+    if config['device'] == 'auto':
+        if torch.cuda.is_available():
+            device = 'cuda'
+        elif torch.backends.mps.is_available():
+            device = 'mps'
+        else:
+            device = 'cpu'
+    else:
+        device = config['device']
+    
+    # Print device information
+    if device == 'cuda':
+
+        num_gpus = torch.cuda.device_count()
+        current_device = torch.cuda.current_device()
+        device_name = torch.cuda.get_device_name(current_device)
+        print(f"Using device: {device} (GPU {current_device}/{num_gpus-1}: {device_name})")
+        if 'CUDA_VISIBLE_DEVICES' in os.environ:
+            print(f"  CUDA_VISIBLE_DEVICES: {os.environ['CUDA_VISIBLE_DEVICES']}")
+    else:
+        print(f"Using device: {device}")
+    # Determine GPU ID for checkpoint naming
+    gpu_id = config.get('gpu_id')
+    if gpu_id is None:
+        cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', None)
+        if cuda_visible is not None:
+            gpu_id = cuda_visible.split(',')[0]
+        elif torch.cuda.is_available():
+            gpu_id = torch.cuda.current_device()
+        else:
+            gpu_id = 'cpu'
+    
+    
+    device_type = 'cuda' if 'cuda' in device else 'cpu'
+    return device, device_type, gpu_id
+
+def set_dtype(config):
+    torch.backends.cudnn.conv.fp32_precision = 'tf32'
+    torch.backends.cuda.matmul.fp32_precision = 'tf32'
+    
+    # Auto-detect dtype with GPU-aware selection
+    if config['dtype'] == 'auto':
+        if torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(0).upper()
+            # RTX 30-series: use FP16 (optimized tensor cores, BF16 is ~50% slower)
+            # RTX 40-series, A100, H100: use BF16 (better numerical range)
+            if any(x in gpu_name for x in ['RTX 30', '3090', '3080', '3070', '3060']):
+                dtype = 'float16'
+                print(f"Using FP16 for optimal performance on {gpu_name}")
+            elif torch.cuda.is_bf16_supported():
+                dtype = 'bfloat16'
+                print(f"Using BF16 on {gpu_name}")
+            else:
+                dtype = 'float16'
+        else:
+            dtype = 'float16'
+    else:
+        dtype = config['dtype']
+    ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
+    return ptdtype, dtype
+
+def initalize_model(device, meta, config, checkpoint_filename):
+    # Model initialization
+    model_args = dict(
+        n_layer=config['n_layer'],
+        n_head=config['n_head'],
+        n_embd=config['n_embd'],
+        block_size=meta['block_size'],
+        bias=config['bias'],
+        vocab_size=None,
+        dropout=config['dropout']
+    )
+
+    if config['init_from'] == 'scratch':
+        print("Initializing a new model from scratch")
+        if meta['vocab_size'] is None:
+            print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
+        model_args['vocab_size'] = meta.get('vocab_size', 50304)
+        gptconf = GPTConfig(**model_args)
+        model = GPT(gptconf)
+    elif config['init_from'] == 'resume':
+        print(f"Resuming training from {config['out_dir']}")
+        ckpt_path = os.path.join(config['out_dir'], checkpoint_filename)
+        checkpoint = torch.load(ckpt_path, map_location=device)
+        checkpoint_model_args = checkpoint['model_args']
+        for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+            model_args[k] = checkpoint_model_args[k]
+        gptconf = GPTConfig(**model_args)
+        model = GPT(gptconf)
+        state_dict = checkpoint['model']
+        unwanted_prefix = '_orig_mod.'
+        for k, v in list(state_dict.items()):
+            if k.startswith(unwanted_prefix):
+                state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+        model.load_state_dict(state_dict)
+        iter_num = checkpoint['iter_num']
+        best_val_loss = checkpoint['best_val_loss']
+    
+    if meta['block_size'] < model.config.block_size:
+        model.crop_block_size(meta['block_size'])
+        model_args['block_size'] = meta['block_size']
+    
+    model.to(device)
+
+    return model, model_args, checkpoint,  iter_num, best_val_loss
+
+def get_theoretical_loss(meta):
+    # Calculate theoretical baseline for train/loss/token_1
+    # This represents the expected loss for the first token prediction
+    root_edges_in_dataset = meta['d']
+    theoretical_token_1_loss = -np.log(
+        (meta['total_edge_size'] - root_edges_in_dataset + meta['replicated_train_paths'] + 1) / meta['TRAIN_DATASET_SIZE']
+    )
+    print(f"Theoretical baseline for train/loss/token_1: {theoretical_token_1_loss:.4f}")
+    return theoretical_token_1_loss
+    
+def calculate_optimal_batch_size_for_training(model, block_size, vocab_size, device, dtype, 
+                                    gradient_accumulation_steps, safety_factor=0.90):
+    """
+    Calculate maximum safe batch size based on available GPU memory.
+    
+    Memory breakdown:
+    - Model parameters: N × bytes_per_param
+    - Optimizer (AdamW): N × 2 × 4 bytes (momentum + variance in FP32)
+    - Gradients: N × bytes_per_param
+    - Activations: batch_size × memory_per_sample
+    - Output logits: batch_size × seq_len × vocab_size (MAJOR memory consumer!)
+    
+    Args:
+        safety_factor: Use 70% of available memory (conservative for torch.compile)
+    
+    Returns:
+        max_batch_size: Maximum safe batch size
+    """
+    # Handle device as string or torch.device object
+    device_type = device if isinstance(device, str) else device.type
+    if device_type != 'cuda':
+        return 2000  # Default for non-CUDA
+    
+    # Get GPU memory info
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    props = torch.cuda.get_device_properties(device)
+    total_memory = props.total_memory
+    allocated_memory = torch.cuda.memory_allocated(device)
+    available_memory = (total_memory - allocated_memory) * safety_factor
+    
+    # Bytes per parameter based on dtype
+    bytes_per_param = 2 if dtype in ['float16', 'bfloat16'] else 4
+    
+    # Count model parameters
+    num_params = sum(p.numel() for p in model.parameters())
+    
+    # Memory components (all already allocated or will be)
+    model_memory = num_params * bytes_per_param
+    optimizer_memory = num_params * 2 * 4  # AdamW: 2 states in FP32
+    gradient_memory = num_params * bytes_per_param
+    
+    static_memory = model_memory + optimizer_memory + gradient_memory
+    
+    # Per-sample activation memory estimation
+    # Activations stored for backward pass in transformer:
+    # 1. Token embeddings: seq_len × hidden_dim
+    # 2. Per layer:
+    #    - Layer input: seq_len × hidden_dim
+    #    - Attention QKV: 3 × seq_len × hidden_dim
+    #    - Attention scores: n_heads × seq_len × seq_len
+    #    - Attention output: seq_len × hidden_dim
+    #    - MLP intermediate: seq_len × 4 × hidden_dim
+    # 3. Output logits: seq_len × vocab_size (CRITICAL with large vocab!)
+    # 4. Gradients of all above (stored during backward)
+    
+    cfg = model.config
+    seq_len = block_size
+    hidden_dim = cfg.n_embd
+    n_layers = cfg.n_layer
+    n_heads = cfg.n_head
+    
+    # Conservative activation estimate per sample
+    embeddings = seq_len * hidden_dim * bytes_per_param
+    
+    per_layer_activations = (
+        seq_len * hidden_dim * 3 +           # Layer input/output + residual
+        seq_len * hidden_dim * 3 +           # QKV projections
+        n_heads * seq_len * seq_len +        # Attention weights
+        seq_len * hidden_dim +               # Attention output
+        seq_len * hidden_dim * 4 * 2         # MLP (fc + proj)
+    ) * bytes_per_param
+    
+    total_layer_activations = per_layer_activations * n_layers
+    
+    # OUTPUT LOGITS - This is the MAJOR memory consumer with large vocab!
+    # We need logits for forward (batch × seq × vocab) and their gradients
+    output_logits_memory = seq_len * vocab_size * bytes_per_param * 2  # forward + backward
+    
+    # torch.compile overhead (empirically ~30% extra for intermediate buffers)
+    compile_overhead = 1.3
+    
+    # Total per-sample memory
+    activation_per_sample = (embeddings + total_layer_activations + output_logits_memory) * 2 * compile_overhead
+    
+    # With gradient accumulation: only 1 micro-batch in memory at a time
+    # So we calculate max micro-batch size
+    memory_for_batch = available_memory - static_memory
+    
+    if memory_for_batch <= 0:
+        print(f"WARNING: Static memory ({static_memory/1e9:.2f}GB) exceeds available")
+        return 500
+    
+    max_microbatch_size = int(memory_for_batch / activation_per_sample)
+    
+    # Apply reasonable bounds
+    max_batch_size = max(500, min(max_microbatch_size, 5000))
+    
+    # Diagnostic output
+    print(f"\n=== Memory-Based Batch Size Calculation ===")
+    print(f"GPU: {props.name}")
+    print(f"Total VRAM: {total_memory/1e9:.2f} GB")
+    print(f"Currently allocated: {allocated_memory/1e9:.2f} GB")
+    print(f"Available for batches: {memory_for_batch/1e9:.2f} GB")
+    print(f"Static memory breakdown:")
+    print(f"  - Model params: {model_memory/1e9:.2f} GB ({num_params:,} params)")
+    print(f"  - Optimizer states: {optimizer_memory/1e9:.2f} GB")
+    print(f"  - Gradients: {gradient_memory/1e9:.2f} GB")
+    print(f"  - Total static: {static_memory/1e9:.2f} GB")
+    print(f"Per-sample memory breakdown:")
+    print(f"  - Embeddings + layers: {(embeddings + total_layer_activations) * 2 / 1e6:.2f} MB")
+    print(f"  - Output logits (vocab={vocab_size}): {output_logits_memory / 1e6:.2f} MB")
+    print(f"  - Total per sample (with compile overhead): {activation_per_sample/1e6:.2f} MB")
+    print(f"Calculated max batch size: {max_batch_size}")
+    print(f"With grad_accum={gradient_accumulation_steps}, effective: {max_batch_size * gradient_accumulation_steps}")
+    print(f"===========================================\n")
+    
+    return max_batch_size
+
+
+def train(config=None):
+    """
+    Main training function that can be called standalone or by wandb sweep.
+    
+    Args:
+        config: Optional dict of configuration overrides. If None, uses defaults and command-line args.
+    """
+    
+    # Clear GPU memory at the start of training run
+    clear_gpu_memory()
     
     # Get default config
     default_config = get_default_config()
@@ -306,23 +568,6 @@ def train(config=None):
     # If config is provided (e.g., from wandb sweep), merge it with defaults
     if config is not None:
         default_config.update(config)
-        
-        # Set custom run name for sweep runs
-        if wandb.run is not None:
-            utc_time = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
-            custom_name = (
-                f"{utc_time}_"
-                f"G{default_config['graph_d']},"
-                f"{default_config['graph_l']}_"
-                f"L{default_config['n_layer']}_"
-                f"E{default_config['n_embd']}_"
-                f"H{default_config['n_head']}_"
-                f"D{default_config['dropout']}_"
-                f"p{default_config['num_pause_tokens']}_"
-                f"{default_config['epochs']}"
-            )
-            wandb.run.name = custom_name
-            print(f"Set sweep run name: {custom_name}")
     
     # Store config in globals for configurator.py compatibility
     for k, v in default_config.items():
@@ -337,6 +582,10 @@ def train(config=None):
         for k in config_keys:
             default_config[k] = globals()[k]
     
+    custom_name = set_wandb_name(default_config)
+    if default_config['wandb_run_name'] is None:
+        default_config['wandb_run_name'] = custom_name
+
     # Validate vocab_size
     if default_config['graph_vocab_size'].endswith('max'):
         factor = int(default_config['graph_vocab_size'][:-3])
@@ -366,10 +615,11 @@ def train(config=None):
     holdout_ratio = meta['holdout_percentage']
     bidirectional = meta['use_undirected']
     pause_length = meta['num_pause_tokens']
-    use_directional_tokens_actual = meta['use_directional_tokens']
     
     # Calculate dataset-dependent parameters
     total_edge_size = (2 if bidirectional else 1) * (graph_length - 1) * graph_spokes 
+    meta['total_edge_size'] = total_edge_size
+
     num_holdout = round(graph_spokes * holdout_ratio)
     total_train_paths = (graph_spokes - num_holdout)
     
@@ -378,124 +628,92 @@ def train(config=None):
     if replication_factor < 1:
         replication_factor = 1
     replicated_train_paths = total_train_paths * replication_factor
+    meta['replicated_train_paths']
     
     print(f"Class balancing: {total_train_paths} training paths replicated by factor {replication_factor} → {replicated_train_paths} replicated paths")
     print(f"Training dataset composition: {replicated_train_paths} replicated paths + {total_edge_size} edges = {replicated_train_paths + total_edge_size} total samples")
     
     max_allowed_batch_size = total_edge_size + replicated_train_paths
-    batch_size = max(min(max_allowed_batch_size, MAX_BATCH_SIZE), min(total_edge_size, MAX_BATCH_SIZE))
-    effective_batch_size = default_config['gradient_accumulation_steps'] * batch_size
     block_size = graph_length + 2 + pause_length
+    meta['block_size'] = block_size
+
+    # TODO: port model defintion here
+    # Auto-detect device
+    device, device_type, gpu_id = detect_device(default_config)
+
+    # Set random seed and backend configurations
+    torch.manual_seed(default_config['seed'])
+    ptdtype, dtype = set_dtype(default_config)
+
+    ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
     
-    assert effective_batch_size <= max_allowed_batch_size, (
-        f"Effective batch size ({effective_batch_size} = {default_config['gradient_accumulation_steps']} * {batch_size}) "
-        f"exceeds total training dataset size ({max_allowed_batch_size} = {total_edge_size} + {replicated_train_paths}). "
-        f"Reduce batch_size or gradient_accumulation_steps."
+    os.makedirs(default_config['out_dir'], exist_ok=True)
+    checkpoint_filename = f'ckpt_{custom_name}_{gpu_id}.pt' if custom_name else "ckpt.pt"
+    print(f"Checkpoint will be saved as: {checkpoint_filename}")
+
+    model, model_args, checkpoint, iter_num, best_val_loss = initalize_model(device, meta, default_config, checkpoint_filename)
+
+    train_batch_size = calculate_optimal_batch_size_for_training(
+        model, block_size, meta['vocab_size'], device, dtype,
+        default_config['gradient_accumulation_steps']
     )
     
     # Calculate training iteration parameters
     TRAIN_DATASET_SIZE = total_edge_size + replicated_train_paths 
-    assert TRAIN_DATASET_SIZE % effective_batch_size == 0
+    meta['TRAIN_DATASET_SIZE'] = TRAIN_DATASET_SIZE
     VAL_DATASET_SIZE = num_holdout
-    batch_per_dataset = int(np.ceil(TRAIN_DATASET_SIZE / (batch_size * default_config['gradient_accumulation_steps'])))
-    eval_iters = int(np.ceil(TRAIN_DATASET_SIZE / batch_size))
+    meta['VAL_DATASET_SIZE'] = VAL_DATASET_SIZE
+
+    val_batch_size = min(num_holdout, train_batch_size)
+    effective_batch_size = default_config['gradient_accumulation_steps'] * train_batch_size
+
+    batch_per_dataset = int(np.ceil(TRAIN_DATASET_SIZE / (train_batch_size * default_config['gradient_accumulation_steps'])))
+    eval_iters = int(np.ceil(VAL_DATASET_SIZE / val_batch_size))
     max_iters = default_config['epochs'] * batch_per_dataset
-    
-    # Calculate theoretical baseline for train/loss/token_1
-    # This represents the expected loss for the first token prediction
-    root_edges_in_dataset = graph_spokes
-    theoretical_token_1_loss = -np.log(
-        (total_edge_size - root_edges_in_dataset + replicated_train_paths + 1) / TRAIN_DATASET_SIZE
-    )
-    print(f"Theoretical baseline for train/loss/token_1: {theoretical_token_1_loss:.4f}")
-    
     # Calculate learning rate schedule parameters
     warmup_iters = int(max_iters * default_config['warmup_frac'])
     lr_decay_iters = int(max_iters * default_config['lr_decay_frac'])
     
+    theoretical_token_1_loss = get_theoretical_loss(meta)
+    
+    
+    # Calculate optimal batch size based on available GPU memory
+    # Calculate and apply optimal batch size
+    
+    # Initialize GradScaler
+    scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
+    
+    # Optimizer
+    optimizer = model.configure_optimizers(
+        default_config['weight_decay'],
+        default_config['learning_rate'],
+        (default_config['beta1'], default_config['beta2']),
+        device_type
+    )
+    if default_config['init_from'] == 'resume':
+        optimizer.load_state_dict(checkpoint['optimizer'])
+    checkpoint = None
+    
+    # Compile model
+    if default_config['compile']:
+        print("compiling the model... (takes a ~minute)")
+        model = torch.compile(model)
+    
+    # Initialize wandb (skip if already initialized by sweep agent)
+    if default_config['wandb_log'] and wandb.run is None:
+        wandb.init(
+            project=default_config['wandb_project'],
+            name=default_config['wandb_run_name'],
+            config=default_config
+        )
+    
     # Generate wandb run name if not provided
-    if default_config['wandb_run_name'] is None:
-        utc_time = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        dropout_str = f"_drop{default_config['dropout']}" if default_config['dropout'] > 0 else ""
-        label_smoothing_str = f"_ls{default_config['label_smoothing']}" if default_config['label_smoothing'] > 0 else ""
-        default_config['wandb_run_name'] = f"{utc_time}_{dataset}_L{default_config['n_layer']}H{default_config['n_head']}E{default_config['n_embd']}_lr{default_config['learning_rate']}_bs{batch_size}_ga{default_config['gradient_accumulation_steps']}{dropout_str}{label_smoothing_str}"
+    # if default_config['wandb_run_name'] is None:
+    #     utc_time = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    #     dropout_str = f"_drop{default_config['dropout']}" if default_config['dropout'] > 0 else ""
+    #     label_smoothing_str = f"_ls{default_config['label_smoothing']}" if default_config['label_smoothing'] > 0 else ""
+    #     default_config['wandb_run_name'] = f"{utc_time}_{dataset}_L{default_config['n_layer']}H{default_config['n_head']}E{default_config['n_embd']}_lr{default_config['learning_rate']}_bs{batch_size}_ga{default_config['gradient_accumulation_steps']}{dropout_str}{label_smoothing_str}"
     
-    # Print configuration
-    tokens_per_iter = default_config['gradient_accumulation_steps'] * batch_size * block_size
-    print(f"tokens per iteration will be: {tokens_per_iter:,}")
-    
-    os.makedirs(default_config['out_dir'], exist_ok=True)
-    
-    # Determine GPU ID for checkpoint naming
-    gpu_id = default_config['gpu_id']
-    if gpu_id is None:
-        cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', None)
-        if cuda_visible is not None:
-            gpu_id = cuda_visible.split(',')[0]
-        elif torch.cuda.is_available():
-            gpu_id = torch.cuda.current_device()
-        else:
-            gpu_id = 'cpu'
-    
-    # Determine experiment name for checkpoint naming
-    experiment_name = default_config['experiment_name']
-    if experiment_name is None:
-        experiment_name = default_config['wandb_run_name']
-    
-    checkpoint_filename = f'ckpt_exp_{experiment_name}_pl{pause_length}_bi{bidirectional}_gpu_{gpu_id}.pt'
-    print(f"Checkpoint will be saved as: {checkpoint_filename}")
-    
-    # Set random seed and backend configurations
-    torch.manual_seed(1337)
-    torch.backends.cudnn.conv.fp32_precision = 'tf32'
-    torch.backends.cuda.matmul.fp32_precision = 'tf32'
-    
-    # Auto-detect device
-    if default_config['device'] == 'auto':
-        if torch.cuda.is_available():
-            device = 'cuda'
-        elif torch.backends.mps.is_available():
-            device = 'mps'
-        else:
-            device = 'cpu'
-    else:
-        device = default_config['device']
-    
-    # Print device information
-    if device == 'cuda':
-
-        num_gpus = torch.cuda.device_count()
-        current_device = torch.cuda.current_device()
-        device_name = torch.cuda.get_device_name(current_device)
-        print(f"Using device: {device} (GPU {current_device}/{num_gpus-1}: {device_name})")
-        if 'CUDA_VISIBLE_DEVICES' in os.environ:
-            print(f"  CUDA_VISIBLE_DEVICES: {os.environ['CUDA_VISIBLE_DEVICES']}")
-    else:
-        print(f"Using device: {device}")
-    
-    device_type = 'cuda' if 'cuda' in device else 'cpu'
-    
-    # Auto-detect dtype with GPU-aware selection
-    if default_config['dtype'] == 'auto':
-        if torch.cuda.is_available():
-            gpu_name = torch.cuda.get_device_name(0).upper()
-            # RTX 30-series: use FP16 (optimized tensor cores, BF16 is ~50% slower)
-            # RTX 40-series, A100, H100: use BF16 (better numerical range)
-            if any(x in gpu_name for x in ['RTX 30', '3090', '3080', '3070', '3060']):
-                dtype = 'float16'
-                print(f"Using FP16 for optimal performance on {gpu_name}")
-            elif torch.cuda.is_bf16_supported():
-                dtype = 'bfloat16'
-                print(f"Using BF16 on {gpu_name}")
-            else:
-                dtype = 'float16'
-        else:
-            dtype = 'float16'
-    else:
-        dtype = default_config['dtype']
-    
-    ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
-    ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
     
     # Init tracking variables
     iter_num = 0
@@ -503,14 +721,6 @@ def train(config=None):
     
     meta_vocab_size = meta['vocab_size']
     print(f"found vocab_size = {meta_vocab_size}")
-    
-    # Load special token IDs
-    edge_token = None
-    path_token = None
-    
-    if 'task_tokens' in meta:
-        edge_token = meta['task_tokens']['EDGE']
-        path_token = meta['task_tokens']['PATH']
     
     if 'special_tokens' in meta:
         pause_token_id = meta['special_tokens'].get('PAUSE')
@@ -615,12 +825,14 @@ def train(config=None):
             epoch_indices = train_epoch_indices
             dataset_size = train_size
             seq_length = train_seq_length
+            batch_size = train_batch_size
         else:
             data_tensor = val_data_tensor
             batch_idx = val_batch_idx
             epoch_indices = val_epoch_indices
             dataset_size = val_size
             seq_length = val_seq_length
+            batch_size = val_batch_size
         
         # Check if we need to shuffle for new epoch
         if batch_idx == 0:
@@ -670,13 +882,12 @@ def train(config=None):
         return x, y
     
     
-    
     @torch.no_grad()
     def estimate_loss():
         """Estimate loss on train/val splits"""
         out = {}
         model.eval()
-        iters_dict = {'train': eval_iters, 'val': int(np.ceil(num_holdout / batch_size))}
+        iters_dict = {'train': eval_iters, 'val': int(np.ceil(num_holdout / val_batch_size))}
         
         train_token_losses = {1: []}
         val_token_losses = {i: [] for i in range(1, graph_length + 1)}
@@ -722,221 +933,6 @@ def train(config=None):
         model.train()
         return out
     
-    
-    # Model initialization
-    model_args = dict(
-        n_layer=default_config['n_layer'],
-        n_head=default_config['n_head'],
-        n_embd=default_config['n_embd'],
-        block_size=block_size,
-        bias=default_config['bias'],
-        vocab_size=None,
-        dropout=default_config['dropout']
-    )
-    
-    if default_config['init_from'] == 'scratch':
-        print("Initializing a new model from scratch")
-        if meta_vocab_size is None:
-            print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
-        model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
-        gptconf = GPTConfig(**model_args)
-        model = GPT(gptconf)
-    elif default_config['init_from'] == 'resume':
-        print(f"Resuming training from {default_config['out_dir']}")
-        ckpt_path = os.path.join(default_config['out_dir'], checkpoint_filename)
-        checkpoint = torch.load(ckpt_path, map_location=device)
-        checkpoint_model_args = checkpoint['model_args']
-        for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-            model_args[k] = checkpoint_model_args[k]
-        gptconf = GPTConfig(**model_args)
-        model = GPT(gptconf)
-        state_dict = checkpoint['model']
-        unwanted_prefix = '_orig_mod.'
-        for k, v in list(state_dict.items()):
-            if k.startswith(unwanted_prefix):
-                state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-        model.load_state_dict(state_dict)
-        iter_num = checkpoint['iter_num']
-        best_val_loss = checkpoint['best_val_loss']
-    
-    if block_size < model.config.block_size:
-        model.crop_block_size(block_size)
-        model_args['block_size'] = block_size
-    
-    model.to(device)
-    
-    # Calculate optimal batch size based on available GPU memory
-    def calculate_optimal_batch_size(model, block_size, vocab_size, device, dtype, 
-                                     gradient_accumulation_steps, safety_factor=0.70):
-        """
-        Calculate maximum safe batch size based on available GPU memory.
-        
-        Memory breakdown:
-        - Model parameters: N × bytes_per_param
-        - Optimizer (AdamW): N × 2 × 4 bytes (momentum + variance in FP32)
-        - Gradients: N × bytes_per_param
-        - Activations: batch_size × memory_per_sample
-        - Output logits: batch_size × seq_len × vocab_size (MAJOR memory consumer!)
-        
-        Args:
-            safety_factor: Use 70% of available memory (conservative for torch.compile)
-        
-        Returns:
-            max_batch_size: Maximum safe batch size
-        """
-        # Handle device as string or torch.device object
-        device_type = device if isinstance(device, str) else device.type
-        if device_type != 'cuda':
-            return 2000  # Default for non-CUDA
-        
-        # Get GPU memory info
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-        props = torch.cuda.get_device_properties(device)
-        total_memory = props.total_memory
-        allocated_memory = torch.cuda.memory_allocated(device)
-        available_memory = (total_memory - allocated_memory) * safety_factor
-        
-        # Bytes per parameter based on dtype
-        bytes_per_param = 2 if dtype in ['float16', 'bfloat16'] else 4
-        
-        # Count model parameters
-        num_params = sum(p.numel() for p in model.parameters())
-        
-        # Memory components (all already allocated or will be)
-        model_memory = num_params * bytes_per_param
-        optimizer_memory = num_params * 2 * 4  # AdamW: 2 states in FP32
-        gradient_memory = num_params * bytes_per_param
-        
-        static_memory = model_memory + optimizer_memory + gradient_memory
-        
-        # Per-sample activation memory estimation
-        # Activations stored for backward pass in transformer:
-        # 1. Token embeddings: seq_len × hidden_dim
-        # 2. Per layer:
-        #    - Layer input: seq_len × hidden_dim
-        #    - Attention QKV: 3 × seq_len × hidden_dim
-        #    - Attention scores: n_heads × seq_len × seq_len
-        #    - Attention output: seq_len × hidden_dim
-        #    - MLP intermediate: seq_len × 4 × hidden_dim
-        # 3. Output logits: seq_len × vocab_size (CRITICAL with large vocab!)
-        # 4. Gradients of all above (stored during backward)
-        
-        cfg = model.config
-        seq_len = block_size
-        hidden_dim = cfg.n_embd
-        n_layers = cfg.n_layer
-        n_heads = cfg.n_head
-        
-        # Conservative activation estimate per sample
-        embeddings = seq_len * hidden_dim * bytes_per_param
-        
-        per_layer_activations = (
-            seq_len * hidden_dim * 3 +           # Layer input/output + residual
-            seq_len * hidden_dim * 3 +           # QKV projections
-            n_heads * seq_len * seq_len +        # Attention weights
-            seq_len * hidden_dim +               # Attention output
-            seq_len * hidden_dim * 4 * 2         # MLP (fc + proj)
-        ) * bytes_per_param
-        
-        total_layer_activations = per_layer_activations * n_layers
-        
-        # OUTPUT LOGITS - This is the MAJOR memory consumer with large vocab!
-        # We need logits for forward (batch × seq × vocab) and their gradients
-        output_logits_memory = seq_len * vocab_size * bytes_per_param * 2  # forward + backward
-        
-        # torch.compile overhead (empirically ~30% extra for intermediate buffers)
-        compile_overhead = 1.3
-        
-        # Total per-sample memory
-        activation_per_sample = (embeddings + total_layer_activations + output_logits_memory) * 2 * compile_overhead
-        
-        # With gradient accumulation: only 1 micro-batch in memory at a time
-        # So we calculate max micro-batch size
-        memory_for_batch = available_memory - static_memory
-        
-        if memory_for_batch <= 0:
-            print(f"WARNING: Static memory ({static_memory/1e9:.2f}GB) exceeds available")
-            return 500
-        
-        max_microbatch_size = int(memory_for_batch / activation_per_sample)
-        
-        # Apply reasonable bounds
-        max_batch_size = max(500, min(max_microbatch_size, 5000))
-        
-        # Diagnostic output
-        print(f"\n=== Memory-Based Batch Size Calculation ===")
-        print(f"GPU: {props.name}")
-        print(f"Total VRAM: {total_memory/1e9:.2f} GB")
-        print(f"Currently allocated: {allocated_memory/1e9:.2f} GB")
-        print(f"Available for batches: {memory_for_batch/1e9:.2f} GB")
-        print(f"Static memory breakdown:")
-        print(f"  - Model params: {model_memory/1e9:.2f} GB ({num_params:,} params)")
-        print(f"  - Optimizer states: {optimizer_memory/1e9:.2f} GB")
-        print(f"  - Gradients: {gradient_memory/1e9:.2f} GB")
-        print(f"  - Total static: {static_memory/1e9:.2f} GB")
-        print(f"Per-sample memory breakdown:")
-        print(f"  - Embeddings + layers: {(embeddings + total_layer_activations) * 2 / 1e6:.2f} MB")
-        print(f"  - Output logits (vocab={vocab_size}): {output_logits_memory / 1e6:.2f} MB")
-        print(f"  - Total per sample (with compile overhead): {activation_per_sample/1e6:.2f} MB")
-        print(f"Calculated max batch size: {max_batch_size}")
-        print(f"With grad_accum={gradient_accumulation_steps}, effective: {max_batch_size * gradient_accumulation_steps}")
-        print(f"===========================================\n")
-        
-        return max_batch_size
-    
-    # Calculate and apply optimal batch size
-    calculated_max_batch = calculate_optimal_batch_size(
-        model, block_size, meta_vocab_size, device, dtype,
-        default_config['gradient_accumulation_steps']
-    )
-    
-    # Update if we can safely increase
-    if calculated_max_batch > batch_size:
-        old_batch_size = batch_size
-        max_allowed_batch_size = total_edge_size + replicated_train_paths
-        batch_size = min(calculated_max_batch, max_allowed_batch_size, MAX_BATCH_SIZE * 2)
-        effective_batch_size = default_config['gradient_accumulation_steps'] * batch_size
-        
-        # Ensure it doesn't exceed dataset size
-        if effective_batch_size <= max_allowed_batch_size:
-            print(f"Increasing batch_size: {old_batch_size} → {batch_size}")
-            print(f"Effective batch_size: {effective_batch_size}")
-            # Update tokens per iteration
-            tokens_per_iter = effective_batch_size * block_size
-            print(f"Updated tokens per iteration: {tokens_per_iter:,}")
-        else:
-            batch_size = old_batch_size
-            print(f"Keeping batch_size at {batch_size} (effective exceeds dataset size)")
-    
-    # Initialize GradScaler
-    scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
-    
-    # Optimizer
-    optimizer = model.configure_optimizers(
-        default_config['weight_decay'],
-        default_config['learning_rate'],
-        (default_config['beta1'], default_config['beta2']),
-        device_type
-    )
-    if default_config['init_from'] == 'resume':
-        optimizer.load_state_dict(checkpoint['optimizer'])
-    checkpoint = None
-    
-    # Compile model
-    if default_config['compile']:
-        print("compiling the model... (takes a ~minute)")
-        unoptimized_model = model
-        model = torch.compile(model)
-    
-    # Initialize wandb (skip if already initialized by sweep agent)
-    if default_config['wandb_log'] and wandb.run is None:
-        wandb.init(
-            project=default_config['wandb_project'],
-            name=default_config['wandb_run_name'],
-            config=default_config
-        )
-    
     # Training loop
     X, Y = get_batch('train')
     t0 = time.time()
@@ -954,7 +950,7 @@ def train(config=None):
         if iter_num % default_config['eval_interval'] == 0:
             losses = estimate_loss()
             
-            samples_processed = iter_num * batch_size * default_config['gradient_accumulation_steps']
+            samples_processed = iter_num * train_batch_size * default_config['gradient_accumulation_steps']
             current_epoch = samples_processed / TRAIN_DATASET_SIZE
             
             print(f"step {iter_num}: epoch {current_epoch:.2f}, train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
@@ -1080,7 +1076,7 @@ def train(config=None):
         if iter_num % default_config['log_interval'] == 0:
             lossf = loss.item() * default_config['gradient_accumulation_steps']
             if local_iter_num >= 5:
-                mfu = model.estimate_mfu(batch_size * default_config['gradient_accumulation_steps'], dt)
+                mfu = model.estimate_mfu(train_batch_size * default_config['gradient_accumulation_steps'], dt)
                 running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
             print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
         
