@@ -63,11 +63,11 @@ parameters:
   epochs:
     value: 5000  # Shorter for quick testing
   gradient_accumulation_steps:
-    value: 4
+    value: 2  # Reduced from 4 for fewer optimizer steps, better GPU utilization
   compile:
     value: true
   eval_interval:
-    value: 50
+    value: 100  # Increased from 50 to reduce evaluation overhead
   log_interval:
-    value: 10
+    value: 50  # Increased from 10 to reduce print overhead
 

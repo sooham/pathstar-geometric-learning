@@ -86,6 +86,7 @@ def get_default_config():
         'experiment_name': None,
     }
 
+@torch.compile
 def compute_per_token_loss(meta, logits, input, targets, token_positions, debug=False, split=''):
     """
     Compute per-token loss for specified token positions
@@ -468,9 +469,22 @@ def train(config=None):
     
     device_type = 'cuda' if 'cuda' in device else 'cpu'
     
-    # Auto-detect dtype
+    # Auto-detect dtype with GPU-aware selection
     if default_config['dtype'] == 'auto':
-        dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
+        if torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(0).upper()
+            # RTX 30-series: use FP16 (optimized tensor cores, BF16 is ~50% slower)
+            # RTX 40-series, A100, H100: use BF16 (better numerical range)
+            if any(x in gpu_name for x in ['RTX 30', '3090', '3080', '3070', '3060']):
+                dtype = 'float16'
+                print(f"Using FP16 for optimal performance on {gpu_name}")
+            elif torch.cuda.is_bf16_supported():
+                dtype = 'bfloat16'
+                print(f"Using BF16 on {gpu_name}")
+            else:
+                dtype = 'float16'
+        else:
+            dtype = 'float16'
     else:
         dtype = default_config['dtype']
     
@@ -705,6 +719,137 @@ def train(config=None):
         model_args['block_size'] = block_size
     
     model.to(device)
+    
+    # Calculate optimal batch size based on available GPU memory
+    def calculate_optimal_batch_size(model, block_size, vocab_size, device, dtype, 
+                                     gradient_accumulation_steps, safety_factor=0.85):
+        """
+        Calculate maximum safe batch size based on available GPU memory.
+        
+        Memory breakdown:
+        - Model parameters: N × bytes_per_param
+        - Optimizer (AdamW): N × 2 × 4 bytes (momentum + variance in FP32)
+        - Gradients: N × bytes_per_param
+        - Activations: batch_size × memory_per_sample
+        
+        Args:
+            safety_factor: Use 85% of available memory (default)
+        
+        Returns:
+            max_batch_size: Maximum safe batch size
+        """
+        # Handle device as string or torch.device object
+        device_type = device if isinstance(device, str) else device.type
+        if device_type != 'cuda':
+            return 2000  # Default for non-CUDA
+        
+        # Get GPU memory info
+        torch.cuda.empty_cache()
+        props = torch.cuda.get_device_properties(device)
+        total_memory = props.total_memory
+        allocated_memory = torch.cuda.memory_allocated(device)
+        available_memory = (total_memory - allocated_memory) * safety_factor
+        
+        # Bytes per parameter based on dtype
+        bytes_per_param = 2 if dtype in ['float16', 'bfloat16'] else 4
+        
+        # Count model parameters
+        num_params = sum(p.numel() for p in model.parameters())
+        
+        # Memory components (all already allocated or will be)
+        model_memory = num_params * bytes_per_param
+        optimizer_memory = num_params * 2 * 4  # AdamW: 2 states in FP32
+        gradient_memory = num_params * bytes_per_param
+        
+        static_memory = model_memory + optimizer_memory + gradient_memory
+        
+        # Per-sample activation memory estimation
+        # Activations stored for backward pass in transformer:
+        # 1. Token embeddings: seq_len × hidden_dim
+        # 2. Per layer:
+        #    - Layer input: seq_len × hidden_dim
+        #    - Attention QKV: 3 × seq_len × hidden_dim
+        #    - Attention scores: n_heads × seq_len × seq_len
+        #    - Attention output: seq_len × hidden_dim
+        #    - MLP intermediate: seq_len × 4 × hidden_dim
+        # 3. Gradients of all above (stored during backward)
+        
+        cfg = model.config
+        seq_len = block_size
+        hidden_dim = cfg.n_embd
+        n_layers = cfg.n_layer
+        n_heads = cfg.n_head
+        
+        # Conservative activation estimate per sample
+        embeddings = seq_len * hidden_dim * bytes_per_param
+        
+        per_layer_activations = (
+            seq_len * hidden_dim * 3 +           # Layer input/output + residual
+            seq_len * hidden_dim * 3 +           # QKV projections
+            n_heads * seq_len * seq_len +        # Attention weights
+            seq_len * hidden_dim +               # Attention output
+            seq_len * hidden_dim * 4 * 2         # MLP (fc + proj)
+        ) * bytes_per_param
+        
+        total_layer_activations = per_layer_activations * n_layers
+        
+        # Forward + backward (gradients of activations)
+        activation_per_sample = (embeddings + total_layer_activations) * 2
+        
+        # With gradient accumulation: only 1 micro-batch in memory at a time
+        # So we calculate max micro-batch size
+        memory_for_batch = available_memory - static_memory
+        
+        if memory_for_batch <= 0:
+            print(f"WARNING: Static memory ({static_memory/1e9:.2f}GB) exceeds available")
+            return 1000
+        
+        max_microbatch_size = int(memory_for_batch / activation_per_sample)
+        
+        # Apply reasonable bounds
+        max_batch_size = max(1000, min(max_microbatch_size, 10000))
+        
+        # Diagnostic output
+        print(f"\n=== Memory-Based Batch Size Calculation ===")
+        print(f"GPU: {props.name}")
+        print(f"Total VRAM: {total_memory/1e9:.2f} GB")
+        print(f"Currently allocated: {allocated_memory/1e9:.2f} GB")
+        print(f"Available for batches: {memory_for_batch/1e9:.2f} GB")
+        print(f"Static memory breakdown:")
+        print(f"  - Model params: {model_memory/1e9:.2f} GB ({num_params:,} params)")
+        print(f"  - Optimizer states: {optimizer_memory/1e9:.2f} GB")
+        print(f"  - Gradients: {gradient_memory/1e9:.2f} GB")
+        print(f"  - Total static: {static_memory/1e9:.2f} GB")
+        print(f"Per-sample activation: {activation_per_sample/1e6:.2f} MB")
+        print(f"Calculated max batch size: {max_batch_size}")
+        print(f"With grad_accum={gradient_accumulation_steps}, effective: {max_batch_size * gradient_accumulation_steps}")
+        print(f"===========================================\n")
+        
+        return max_batch_size
+    
+    # Calculate and apply optimal batch size
+    calculated_max_batch = calculate_optimal_batch_size(
+        model, block_size, meta_vocab_size, device, dtype,
+        default_config['gradient_accumulation_steps']
+    )
+    
+    # Update if we can safely increase
+    if calculated_max_batch > batch_size:
+        old_batch_size = batch_size
+        max_allowed_batch_size = total_edge_size + replicated_train_paths
+        batch_size = min(calculated_max_batch, max_allowed_batch_size, MAX_BATCH_SIZE * 2)
+        effective_batch_size = default_config['gradient_accumulation_steps'] * batch_size
+        
+        # Ensure it doesn't exceed dataset size
+        if effective_batch_size <= max_allowed_batch_size:
+            print(f"Increasing batch_size: {old_batch_size} → {batch_size}")
+            print(f"Effective batch_size: {effective_batch_size}")
+            # Update tokens per iteration
+            tokens_per_iter = effective_batch_size * block_size
+            print(f"Updated tokens per iteration: {tokens_per_iter:,}")
+        else:
+            batch_size = old_batch_size
+            print(f"Keeping batch_size at {batch_size} (effective exceeds dataset size)")
     
     # Initialize GradScaler
     scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
