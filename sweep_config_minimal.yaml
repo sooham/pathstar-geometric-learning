@@ -9,7 +9,7 @@ metric:
 parameters:
   # Dataset parameters - small fixed values for quick iteration
   graph_d:
-    values: [5000, 10000, 1000]
+    values: [20000]
   graph_l:
     value: 5
   graph_vocab_size:
@@ -31,7 +31,7 @@ parameters:
   n_embd:
     values: [64]
   dropout:
-    values: [0,0.01,0.05,0.1,0.2]
+    values: [0.01]
   bias:
     value: false
   
@@ -63,7 +63,7 @@ parameters:
   epochs:
     value: 5000  # Shorter for quick testing
   gradient_accumulation_steps:
-    value: 2  # Reduced from 4 for fewer optimizer steps, better GPU utilization
+    value: 8  # Reduced from 4 for fewer optimizer steps, better GPU utilization
   compile:
     value: true
   eval_interval:
