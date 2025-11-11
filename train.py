@@ -23,7 +23,7 @@ import torch.nn.functional as F
 from model import GPTConfig, GPT
 from pathstar import InWeightsPathStar
 
-MAX_BATCH_SIZE = 4000
+MAX_BATCH_SIZE = 2000
 
 def get_default_config():
     """
@@ -305,6 +305,7 @@ def train(config=None):
                 f"L{default_config['n_layer']}_"
                 f"E{default_config['n_embd']}_"
                 f"H{default_config['n_head']}_"
+                f"D{default_config['dropout']}_"
                 f"p{default_config['num_pause_tokens']}_"
                 f"{default_config['epochs']}"
             )
@@ -647,7 +648,7 @@ def train(config=None):
             out['val_per_token'] = {token_pos: float('nan') for token_pos in range(1, graph_length + 1)}
         
         # Compute per-token accuracy
-        num_samples_for_accuracy = val_size
+        num_samples_for_accuracy = min(100, val_size)
         val_per_token_accuracy = compute_per_token_accuracy_autoregressive(ctx, model, meta, val_data, num_samples_for_accuracy, device)
         out['val_per_token_accuracy'] = val_per_token_accuracy
         
@@ -771,8 +772,8 @@ def train(config=None):
                     print(f"    {per_token_acc_str_rest}")
             
             # Evaluate autoregressive generation on validation and training samples
-            val_avg_accuracy = evaluate_samples(device, ctx, model,  meta, val_data, val_size, 'val', num_samples=val_size)
-            train_avg_accuracy = evaluate_samples(device, ctx, model, meta, train_data, train_size, 'train', num_samples=replicated_train_paths)
+            val_avg_accuracy = evaluate_samples(device, ctx, model,  meta, val_data, val_size, 'val', num_samples=min(val_size, 100))
+            train_avg_accuracy = evaluate_samples(device, ctx, model, meta, train_data, train_size, 'train', num_samples=min(replicated_train_paths, 100))
             
             if default_config['wandb_log']:
                 log_dict = {

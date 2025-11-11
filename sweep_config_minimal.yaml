@@ -17,7 +17,7 @@ parameters:
   graph_holdout_percentage:
     value: 0.5
   num_pause_tokens:
-    value: [1,2,4]
+    values: [4]
   use_undirected:
     value: true
   use_directional_tokens:
@@ -31,7 +31,7 @@ parameters:
   n_embd:
     values: [64]
   dropout:
-    value: 0
+    values: [0,0.01,0.05,0.1,0.2]
   bias:
     value: false
   
@@ -63,11 +63,11 @@ parameters:
   epochs:
     value: 5000  # Shorter for quick testing
   gradient_accumulation_steps:
-    value: 1
+    value: 4
   compile:
-    value: false
+    value: true
   eval_interval:
-    value: 100
+    value: 50
   log_interval:
     value: 10
 
