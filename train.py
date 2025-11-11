@@ -115,19 +115,18 @@ def compute_per_token_loss(meta, logits, input, targets, token_positions, debug=
         
         if valid_idx_mask.any():
             batch_size_local = logits.size(0)
-            logits_at_pos = torch.zeros(batch_size_local, logits.size(2), device=logits.device)
-            targets_at_pos = torch.zeros(batch_size_local, dtype=targets.dtype, device=targets.device)
+            # Match dtype of logits to avoid dtype mismatch with mixed precision training
+            logits_at_pos = torch.zeros(batch_size_local, logits.size(2), device=logits.device, dtype=logits.dtype)
+            targets_at_pos = torch.full((batch_size_local,), -1, dtype=targets.dtype, device=targets.device)
             
-            valid_batch_indices = []
+            # Vectorized indexing instead of Python loop
+            batch_indices = torch.arange(batch_size_local, device=logits.device)
+            valid_batch_indices = batch_indices[valid_idx_mask]
+            valid_y_idx = y_idx[valid_idx_mask]
             
-            for b in range(batch_size_local):
-                if valid_idx_mask[b]:
-                    idx = y_idx[b].item()
-                    logits_at_pos[b] = logits[b, idx, :]
-                    targets_at_pos[b] = targets[b, idx]
-                    valid_batch_indices.append(b)
-                else:
-                    targets_at_pos[b] = -1
+            # Use advanced indexing to gather logits and targets
+            logits_at_pos[valid_idx_mask] = logits[valid_batch_indices, valid_y_idx, :]
+            targets_at_pos[valid_idx_mask] = targets[valid_batch_indices, valid_y_idx]
             
             valid_mask = targets_at_pos != -1
             if valid_mask.any():
@@ -181,7 +180,7 @@ def compute_per_token_accuracy_autoregressive(ctx, model, meta, val_data_batch, 
     
     return per_token_accuracies
 
-def evaluate_samples(device, ctx, model, meta, data, data_size, split_name, num_samples=5, eval_batch_size=128):
+def evaluate_samples(device, ctx, model, meta, data, data_size, split_name, num_samples=5, eval_batch_size=512):
     """
     Evaluate autoregressive generation on samples from a dataset.
     
@@ -192,7 +191,7 @@ def evaluate_samples(device, ctx, model, meta, data, data_size, split_name, num_
         data_size: Size of the dataset
         split_name: Name of the split for logging ('train' or 'val')
         num_samples: Number of samples to evaluate
-        eval_batch_size: Batch size for generation to avoid OOM (default: 256)
+        eval_batch_size: Batch size for generation to avoid OOM (default: 512, optimized for RTX 3090)
     
     Returns:
         avg_accuracy: Average accuracy across all samples
@@ -528,6 +527,24 @@ def train(config=None):
     train_data = train_data.reshape(train_size, train_seq_length)
     val_data = val_data.reshape(val_size, val_seq_length)
     
+    # Pre-load data as GPU tensors to eliminate NumPy conversions during training
+    # This significantly speeds up the data pipeline
+    print("Pre-loading datasets to GPU...")
+    train_data_tensor = torch.from_numpy(train_data.astype(np.int64))
+    val_data_tensor = torch.from_numpy(val_data.astype(np.int64))
+    
+    # Move to device
+    if device_type == 'cuda':
+        train_data_tensor = train_data_tensor.pin_memory().to(device, non_blocking=True)
+        val_data_tensor = val_data_tensor.pin_memory().to(device, non_blocking=True)
+    else:
+        train_data_tensor = train_data_tensor.to(device)
+        val_data_tensor = val_data_tensor.to(device)
+    
+    # Keep NumPy versions for evaluate_samples (will optimize separately)
+    train_data_np = train_data
+    val_data_np = val_data
+    
     # Initialize epoch indices for sampling without replacement
     train_epoch_indices = np.arange(train_size)
     val_epoch_indices = np.arange(val_size)
@@ -535,18 +552,18 @@ def train(config=None):
     val_batch_idx = 0
     
     def get_batch(split):
-        """Sample a batch from the dataset"""
+        """Sample a batch from the dataset (optimized with pre-loaded GPU tensors)"""
         nonlocal train_batch_idx, val_batch_idx, train_epoch_indices, val_epoch_indices
         
         # Select dataset and indices
         if split == 'train':
-            data = train_data
+            data_tensor = train_data_tensor
             batch_idx = train_batch_idx
             epoch_indices = train_epoch_indices
             dataset_size = train_size
             seq_length = train_seq_length
         else:
-            data = val_data
+            data_tensor = val_data_tensor
             batch_idx = val_batch_idx
             epoch_indices = val_epoch_indices
             dataset_size = val_size
@@ -569,36 +586,27 @@ def train(config=None):
         else:
             val_batch_idx = (batch_idx + 1) if end_idx < dataset_size else 0
         
-        # Extract sequences
-        sequences = data[batch_seq_indices]
+        # Extract sequences from GPU tensor (much faster than NumPy)
+        sequences = data_tensor[batch_seq_indices]
         
         # Pad or truncate to block_size if needed
         if seq_length < block_size:
             pad_value = pad_token_id if pad_token_id is not None else 0
-            padding = np.full((actual_batch_size, block_size - seq_length), pad_value, dtype=np.int64)
-            sequences = np.concatenate([sequences.astype(np.int64), padding], axis=1)
+            padding = torch.full((actual_batch_size, block_size - seq_length), pad_value, 
+                                dtype=torch.long, device=device)
+            sequences = torch.cat([sequences, padding], dim=1)
         elif seq_length > block_size:
             print(f"WARNING: Sequence length ({seq_length}) exceeds block_size ({block_size}). Truncating sequences.")
-            sequences = sequences[:, :block_size].astype(np.int64)
-        else:
-            sequences = sequences.astype(np.int64)
+            sequences = sequences[:, :block_size]
         
         # Create input (x) and target (y) by shifting
-        # Use .clone() to ensure x and y don't share memory, preventing corruption when masking y
-        x = torch.from_numpy(sequences[:, :-1]).clone()
-        y = torch.from_numpy(sequences[:, 1:]).clone()
+        # Note: sequences are already on device, no need to transfer
+        x = sequences[:, :-1].clone()
+        y = sequences[:, 1:].clone()
         
         # Mask PAD tokens in targets
         if pad_token_id is not None:
             y[y == pad_token_id] = -1
-        
-        # Move to device
-        if device_type == 'cuda':
-            x = x.pin_memory().to(device, non_blocking=True)
-            y = y.pin_memory().to(device, non_blocking=True)
-        else:
-            x = x.to(device)
-            y = y.to(device)
         
         return x, y
     
@@ -772,8 +780,11 @@ def train(config=None):
                     print(f"    {per_token_acc_str_rest}")
             
             # Evaluate autoregressive generation on validation and training samples
-            val_avg_accuracy = evaluate_samples(device, ctx, model,  meta, val_data, val_size, 'val', num_samples=min(val_size, 100))
-            train_avg_accuracy = evaluate_samples(device, ctx, model, meta, train_data, train_size, 'train', num_samples=min(replicated_train_paths, 100))
+            # Use fewer samples during sweeps for faster evaluation
+            is_sweep_mode = wandb.run is not None and hasattr(wandb.run, 'sweep_id') and wandb.run.sweep_id is not None
+            eval_samples = 20 if is_sweep_mode else 100
+            val_avg_accuracy = evaluate_samples(device, ctx, model,  meta, val_data_np, val_size, 'val', num_samples=min(val_size, eval_samples))
+            train_avg_accuracy = evaluate_samples(device, ctx, model, meta, train_data_np, train_size, 'train', num_samples=min(replicated_train_paths, eval_samples))
             
             if default_config['wandb_log']:
                 log_dict = {
@@ -807,30 +818,48 @@ def train(config=None):
                 
                 wandb.log(log_dict)
             
-            if losses['val'] < best_val_loss or default_config['always_save_checkpoint']:
+            # During sweeps, only save best checkpoint to reduce I/O overhead
+            # In standalone mode, save based on always_save_checkpoint config
+            save_checkpoint = False
+            if losses['val'] < best_val_loss:
                 best_val_loss = losses['val']
-                if iter_num > 0:
-                    checkpoint_data = {
-                        'model': model.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        'model_args': model_args,
-                        'iter_num': iter_num,
-                        'best_val_loss': best_val_loss,
-                        'config': default_config,
-                    }
-                    print(f"saving checkpoint to {default_config['out_dir']}/{checkpoint_filename}")
-                    torch.save(checkpoint_data, os.path.join(default_config['out_dir'], checkpoint_filename))
+                save_checkpoint = True
+            elif not is_sweep_mode and default_config['always_save_checkpoint']:
+                save_checkpoint = True
+            
+            if save_checkpoint and iter_num > 0:
+                checkpoint_data = {
+                    'model': model.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'model_args': model_args,
+                    'iter_num': iter_num,
+                    'best_val_loss': best_val_loss,
+                    'config': default_config,
+                }
+                print(f"saving checkpoint to {default_config['out_dir']}/{checkpoint_filename}")
+                torch.save(checkpoint_data, os.path.join(default_config['out_dir'], checkpoint_filename))
         
         if iter_num == 0 and default_config['eval_only']:
             break
         
-        # Forward backward update
+        # Forward backward update with batch prefetching for better GPU utilization
         for micro_step in range(default_config['gradient_accumulation_steps']):
             with ctx:
                 logits, loss = model(X, Y, label_smoothing=default_config['label_smoothing'])
                 loss = loss / default_config['gradient_accumulation_steps']
-            X, Y = get_batch('train')
+            
+            # Prefetch next batch while backward pass runs (overlap I/O with compute)
+            if micro_step < default_config['gradient_accumulation_steps'] - 1:
+                X_next, Y_next = get_batch('train')
+            
             scaler.scale(loss).backward()
+            
+            # Move prefetched batch to current (if not last step)
+            if micro_step < default_config['gradient_accumulation_steps'] - 1:
+                X, Y = X_next, Y_next
+        
+        # Get batch for next iteration
+        X, Y = get_batch('train')
         
         # Clip gradients
         if default_config['grad_clip'] != 0.0:

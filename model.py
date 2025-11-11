@@ -284,32 +284,34 @@ class GPT(nn.Module):
             try:
                 gpu_name = torch.cuda.get_device_name(device.index or 0).upper()
                 
-                # Common GPU peak FLOPS (bfloat16/float16)
+                # Common GPU peak FLOPS (FP32 CUDA cores for realistic MFU on small models)
+                # Note: Using FP32 instead of FP16 tensor cores since small models
+                # don't fully utilize tensor cores due to overhead
                 if 'A100' in gpu_name:
-                    return 312e12  # 312 TFLOPS for A100
+                    return 19.5e12  # 19.5 TFLOPS FP32 for A100 (was 312 TFLOPS FP16 tensor)
                 elif 'H100' in gpu_name:
-                    return 989e12  # 989 TFLOPS for H100
+                    return 67e12  # 67 TFLOPS FP32 for H100
                 elif 'V100' in gpu_name:
                     return 125e12  # 125 TFLOPS for V100
                 elif 'A6000' in gpu_name or 'RTX A6000' in gpu_name:
-                    return 155e12  # 155 TFLOPS for RTX A6000
+                    return 38.7e12  # 38.7 TFLOPS FP32 for RTX A6000
                 elif 'RTX 4090' in gpu_name or '4090' in gpu_name:
-                    return 330e12  # 330 TFLOPS for RTX 4090
+                    return 82.58e12  # 82.58 TFLOPS FP32 for RTX 4090 (was 330 TFLOPS FP16 tensor)
                 elif 'RTX 3090' in gpu_name or '3090' in gpu_name:
-                    return 142e12  # 142 TFLOPS for RTX 3090
+                    return 35.58e12  # 35.58 TFLOPS FP32 for RTX 3090 (was 142 TFLOPS FP16 tensor)
                 elif 'RTX 5060 TI' in gpu_name or '5060 TI' in gpu_name:
-                    return 300e12  # 300 TFLOPS for RTX 5060 Ti (estimated)
+                    return 70e12  # 70 TFLOPS FP32 for RTX 5060 Ti (estimated)
                 elif 'A10' in gpu_name:
-                    return 125e12  # 125 TFLOPS for A10
+                    return 31.2e12  # 31.2 TFLOPS FP32 for A10
                 elif 'T4' in gpu_name:
-                    return 65e12   # 65 TFLOPS for T4
+                    return 8.1e12   # 8.1 TFLOPS FP32 for T4
                 else:
                     # Default to A100 if unknown CUDA GPU
-                    print(f"Unknown GPU: {gpu_name}, defaulting to A100 peak FLOPS")
-                    return 312e12
+                    print(f"Unknown GPU: {gpu_name}, defaulting to A100 FP32 peak FLOPS")
+                    return 19.5e12
             except:
                 # If we can't get GPU name, default to A100
-                return 312e12
+                return 19.5e12
                 
         elif device_type == 'mps':
             # Apple Silicon MPS
