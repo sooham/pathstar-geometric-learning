@@ -722,7 +722,7 @@ def train(config=None):
     
     # Calculate optimal batch size based on available GPU memory
     def calculate_optimal_batch_size(model, block_size, vocab_size, device, dtype, 
-                                     gradient_accumulation_steps, safety_factor=0.85):
+                                     gradient_accumulation_steps, safety_factor=0.70):
         """
         Calculate maximum safe batch size based on available GPU memory.
         
@@ -731,9 +731,10 @@ def train(config=None):
         - Optimizer (AdamW): N × 2 × 4 bytes (momentum + variance in FP32)
         - Gradients: N × bytes_per_param
         - Activations: batch_size × memory_per_sample
+        - Output logits: batch_size × seq_len × vocab_size (MAJOR memory consumer!)
         
         Args:
-            safety_factor: Use 85% of available memory (default)
+            safety_factor: Use 70% of available memory (conservative for torch.compile)
         
         Returns:
             max_batch_size: Maximum safe batch size
@@ -745,6 +746,7 @@ def train(config=None):
         
         # Get GPU memory info
         torch.cuda.empty_cache()
+        torch.cuda.synchronize()
         props = torch.cuda.get_device_properties(device)
         total_memory = props.total_memory
         allocated_memory = torch.cuda.memory_allocated(device)
@@ -772,7 +774,8 @@ def train(config=None):
         #    - Attention scores: n_heads × seq_len × seq_len
         #    - Attention output: seq_len × hidden_dim
         #    - MLP intermediate: seq_len × 4 × hidden_dim
-        # 3. Gradients of all above (stored during backward)
+        # 3. Output logits: seq_len × vocab_size (CRITICAL with large vocab!)
+        # 4. Gradients of all above (stored during backward)
         
         cfg = model.config
         seq_len = block_size
@@ -793,8 +796,15 @@ def train(config=None):
         
         total_layer_activations = per_layer_activations * n_layers
         
-        # Forward + backward (gradients of activations)
-        activation_per_sample = (embeddings + total_layer_activations) * 2
+        # OUTPUT LOGITS - This is the MAJOR memory consumer with large vocab!
+        # We need logits for forward (batch × seq × vocab) and their gradients
+        output_logits_memory = seq_len * vocab_size * bytes_per_param * 2  # forward + backward
+        
+        # torch.compile overhead (empirically ~30% extra for intermediate buffers)
+        compile_overhead = 1.3
+        
+        # Total per-sample memory
+        activation_per_sample = (embeddings + total_layer_activations + output_logits_memory) * 2 * compile_overhead
         
         # With gradient accumulation: only 1 micro-batch in memory at a time
         # So we calculate max micro-batch size
@@ -802,12 +812,12 @@ def train(config=None):
         
         if memory_for_batch <= 0:
             print(f"WARNING: Static memory ({static_memory/1e9:.2f}GB) exceeds available")
-            return 1000
+            return 500
         
         max_microbatch_size = int(memory_for_batch / activation_per_sample)
         
         # Apply reasonable bounds
-        max_batch_size = max(1000, min(max_microbatch_size, 10000))
+        max_batch_size = max(500, min(max_microbatch_size, 5000))
         
         # Diagnostic output
         print(f"\n=== Memory-Based Batch Size Calculation ===")
@@ -820,7 +830,10 @@ def train(config=None):
         print(f"  - Optimizer states: {optimizer_memory/1e9:.2f} GB")
         print(f"  - Gradients: {gradient_memory/1e9:.2f} GB")
         print(f"  - Total static: {static_memory/1e9:.2f} GB")
-        print(f"Per-sample activation: {activation_per_sample/1e6:.2f} MB")
+        print(f"Per-sample memory breakdown:")
+        print(f"  - Embeddings + layers: {(embeddings + total_layer_activations) * 2 / 1e6:.2f} MB")
+        print(f"  - Output logits (vocab={vocab_size}): {output_logits_memory / 1e6:.2f} MB")
+        print(f"  - Total per sample (with compile overhead): {activation_per_sample/1e6:.2f} MB")
         print(f"Calculated max batch size: {max_batch_size}")
         print(f"With grad_accum={gradient_accumulation_steps}, effective: {max_batch_size * gradient_accumulation_steps}")
         print(f"===========================================\n")
