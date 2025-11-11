@@ -628,7 +628,7 @@ def train(config=None):
     if replication_factor < 1:
         replication_factor = 1
     replicated_train_paths = total_train_paths * replication_factor
-    meta['replicated_train_paths']
+    meta['replicated_train_paths'] = replicated_train_paths
     
     print(f"Class balancing: {total_train_paths} training paths replicated by factor {replication_factor} → {replicated_train_paths} replicated paths")
     print(f"Training dataset composition: {replicated_train_paths} replicated paths + {total_edge_size} edges = {replicated_train_paths + total_edge_size} total samples")
