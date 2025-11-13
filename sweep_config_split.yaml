@@ -73,3 +73,6 @@ parameters:
   log_interval:
     value: 10  # Increased from 10 to reduce print overhead
 
+  wandb_project:
+    value: pathstar_interleave
+
