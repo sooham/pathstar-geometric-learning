@@ -21,7 +21,9 @@ parameters:
   use_undirected:
     value: true
   use_directional_tokens:
-    value: true
+    value: false
+  use_task_tokens:
+    value: false
   
   # Model architecture parameters - sweep these
   n_layer:
@@ -62,16 +64,18 @@ parameters:
   # Fixed training parameters
   epochs:
     value: 5000  # Shorter for quick testing
-  edge_iterations_per_epoch: 1  # 10k edges total 
-  path_iterations_per_epoch: 12  # 200 paths in validation, 800 paths in training 
+  edge_iterations_per_epoch: 
+    value: 1  # 10k edges total 
+  path_iterations_per_epoch: 
+    value: 12  # 200 paths in validation, 800 paths in training 
   gradient_accumulation_steps:
     value: 2  # Reduced from 4 for fewer optimizer steps, better GPU utilization
   compile:
     value: true
   eval_interval:
-    value: 100  # Increased from 50 to reduce evaluation overhead
+    value: 10  # Increased from 50 to reduce evaluation overhead
   log_interval:
-    value: 10  # Increased from 10 to reduce print overhead
+    value: 1  # Increased from 10 to reduce print overhead
 
   wandb_project:
     value: pathstar_interleave

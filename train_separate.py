@@ -1175,7 +1175,9 @@ def train(config=None):
             if local_iter_num >= 5:
                 mfu = model.estimate_mfu(train_batch_size * default_config['gradient_accumulation_steps'], dt)
                 running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-            print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+            phase_label = "[EDGE]" if current_phase == 'edge' else "[PATH]"
+            print(f"iter {iter_num}: {phase_label} loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+
         
         iter_num += 1
         local_iter_num += 1
