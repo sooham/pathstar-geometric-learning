@@ -195,119 +195,6 @@ class InWeightsPathStar:
         """
         return dict(self.paths_by_leaf)
     
-    def visualize(self, output_path=None, figsize=(12, 10), show_labels=True):
-        """
-        Visualize the path-star graph structure.
-        
-        Args:
-            output_path: If provided, save the figure to this path. Otherwise, display it.
-            figsize: Figure size as (width, height) tuple
-            show_labels: If True, show node labels
-        """
-        # Create a directed graph
-        G = nx.DiGraph()
-        
-        # Add all edges from adjacency list
-        for u in self.adj_list:
-            for v in self.adj_list[u]:
-                G.add_edge(u, v)
-        
-        # Create figure
-        fig, ax = plt.subplots(figsize=figsize)
-        
-        # Calculate layout - use a radial layout for path-star structure
-        # Root at center, spokes radiating outward
-        pos = {}
-        
-        # Position root at center
-        pos[self.v_root] = (0, 0)
-        
-        # Position each spoke
-        angle_step = 2 * np.pi / self.d
-        for spoke_idx in range(self.d):
-            angle = spoke_idx * angle_step
-            
-            # Get the path for this spoke
-            leaf = self.v_leaf[spoke_idx]
-            path = self.paths_by_leaf[leaf]
-            
-            # Position nodes along the spoke
-            for i, node in enumerate(path[1:], 1):  # Skip root
-                radius = i  # Distance from center
-                x = radius * np.cos(angle)
-                y = radius * np.sin(angle)
-                pos[node] = (x, y)
-        
-        # Determine node colors based on type and holdout status
-        node_colors = []
-        for node in G.nodes():
-            if node == self.v_root:
-                node_colors.append('#FF6B6B')  # Red for root
-            elif node in self.holdout_leaves:
-                node_colors.append('#FFD93D')  # Yellow for holdout leaves
-            elif node in self.train_leaves:
-                node_colors.append('#6BCB77')  # Green for training leaves
-            elif node in self.v_leaf:
-                node_colors.append('#4D96FF')  # Blue for other leaves
-            else:
-                node_colors.append('#95E1D3')  # Light teal for intermediate nodes
-        
-        # Draw the graph
-        nx.draw_networkx_nodes(G, pos, node_color=node_colors, 
-                              node_size=500, alpha=0.9, ax=ax)
-        nx.draw_networkx_edges(G, pos, edge_color='gray', 
-                              arrows=True, arrowsize=20, 
-                              arrowstyle='->', width=2, alpha=0.6, ax=ax)
-        
-        if show_labels:
-            nx.draw_networkx_labels(G, pos, font_size=8, 
-                                   font_weight='bold', ax=ax)
-        
-        # Add title and legend
-        title = f"PathStar Graph: d={self.d}, l={self.l}"
-        if self.holdout_percentage > 0:
-            title += f", holdout={self.holdout_percentage:.0%}"
-        ax.set_title(title, fontsize=16, fontweight='bold', pad=20)
-        
-        # Create legend
-        from matplotlib.patches import Patch
-        legend_elements = [
-            Patch(facecolor='#FF6B6B', label=f'Root (node {self.v_root})'),
-            Patch(facecolor='#6BCB77', label=f'Training Leaves ({len(self.train_leaves)})'),
-        ]
-        if len(self.holdout_leaves) > 0:
-            legend_elements.append(
-                Patch(facecolor='#FFD93D', label=f'Holdout Leaves ({len(self.holdout_leaves)})')
-            )
-        legend_elements.append(
-            Patch(facecolor='#95E1D3', label='Intermediate Nodes')
-        )
-        
-        ax.legend(handles=legend_elements, loc='upper right', fontsize=10)
-        
-        # Add statistics text
-        stats_text = (
-            f"Vertices: {self.total_vert}\n"
-            f"Edges: {self.d * (self.l - 1)}\n"
-            f"Paths: {self.d}\n"
-            f"Train: {len(self.train_leaves)}\n"
-            f"Holdout: {len(self.holdout_leaves)}"
-        )
-        ax.text(0.02, 0.98, stats_text, transform=ax.transAxes,
-               fontsize=10, verticalalignment='top',
-               bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-        
-        ax.axis('off')
-        ax.set_aspect('equal')
-        plt.tight_layout()
-        
-        if output_path:
-            plt.savefig(output_path, dpi=300, bbox_inches='tight')
-            print(f"Graph visualization saved to: {output_path}")
-            plt.close()
-        else:
-            plt.show()
-    
     def generate_edge_memorization_training_set(self, size, undirected=True, use_directional_tokens=True):
         """
         Generate a training set of edges sampled randomly from the path-star graph.
@@ -350,7 +237,7 @@ class InWeightsPathStar:
         return torch.tensor(sampled_edges, dtype=torch.long)
 
     def generate_path_prediction_training_set(self, size, num_pause_tokens=1, 
-                                             obey_holdout=True, holdout_only=False):
+                                             obey_holdout=True, holdout_only=False, use_task_tokens=True):
         """
         Generate a path-finding training set for the in-weights path memorization objective.
         
@@ -365,10 +252,12 @@ class InWeightsPathStar:
             num_pause_tokens: Number of <PAUSE> tokens to insert between leaf and path (default: 1)
             obey_holdout: If True, only sample from training leaves (default: True)
             holdout_only: If True, only sample from holdout leaves (default: False)
+            use_task_tokens: If True, include <PATH> task prefix token (default: True)
         
         Returns:
             sequences: torch tensor of shape [size, l+2+num_pause_tokens] containing full sequences
-                      (<PATH>, leaf, pause_1, ..., pause_n, root, n_2, ..., n_ℓ)
+                      (<PATH>, leaf, pause_1, ..., pause_n, root, n_2, ..., n_ℓ) if use_task_tokens=True
+                      or (leaf, pause_1, ..., pause_n, root, n_2, ..., n_ℓ) if use_task_tokens=False
         """
         # Determine which leaf nodes to sample from
         if holdout_only:
@@ -402,9 +291,14 @@ class InWeightsPathStar:
             # Get the path from root to leaf
             path = self.paths_by_leaf[leaf]
             
-            # Construct sequence: [<PATH>, leaf, <PAUSE>, ..., <PAUSE>, root, n_2, ..., n_ℓ]
+            # Construct sequence with or without task prefix token
             pause_tokens = [self.pause_token] * num_pause_tokens
-            sequence = [self.TASK_TOKENS['PATH'], leaf] + pause_tokens + path
+            if use_task_tokens:
+                # With task token: [<PATH>, leaf, <PAUSE>, ..., <PAUSE>, root, n_2, ..., n_ℓ]
+                sequence = [self.TASK_TOKENS['PATH'], leaf] + pause_tokens + path
+            else:
+                # Without task token: [leaf, <PAUSE>, ..., <PAUSE>, root, n_2, ..., n_ℓ]
+                sequence = [leaf] + pause_tokens + path
             sequences.append(sequence)
         
         # Convert to tensor
@@ -413,7 +307,7 @@ class InWeightsPathStar:
         return sequences
     
     def prepare(self, num_pause_tokens=1, output_dir='./data', 
-                use_undirected=True, use_directional_tokens=True):
+                use_undirected=True, use_directional_tokens=True, use_task_tokens=True, combine=True):
         """
         Prepare and save training and validation datasets to disk for in-weights path-star.
         
@@ -431,6 +325,8 @@ class InWeightsPathStar:
             output_dir: Base directory for output (default: './data')
             use_undirected: If True, use undirected edges (both x->y and y->x) (default: True)
             use_directional_tokens: If True, use special tokens to demarcate edge directions in the edge training set
+            use_task_tokens: If True, include PATH and EDGE task prefix tokens in sequences (default: True)
+            combine: If True, combine paths and edges into train.bin with class balancing. If False, save separately to paths.bin and edges.bin (default: True)
         """
         # Calculate dataset sizes based on graph structure
         num_edges = self.d * (self.l - 1)
@@ -453,11 +349,12 @@ class InWeightsPathStar:
         val_size = num_val_path_samples
         
         # Create output directory with parameters in name
-        dir_name = self.generate_dataset_name(num_pause_tokens, use_undirected, use_directional_tokens)
+        dir_name = self.generate_dataset_name(num_pause_tokens, use_undirected, use_directional_tokens, use_task_tokens, combine)
         self.dir_name = dir_name
         self.num_pause_tokens = num_pause_tokens
         self.use_undirected = use_undirected
         self.use_directional_tokens = use_directional_tokens
+        self.use_task_tokens = use_task_tokens
         full_output_dir = os.path.join(output_dir, dir_name)
         os.makedirs(full_output_dir, exist_ok=True)
         
@@ -475,7 +372,11 @@ class InWeightsPathStar:
         print(f"    Training path samples (replicated): {replicated_path_samples} (factor: {replication_factor})")
         print(f"    Validation path samples: {num_val_path_samples}")
         print(f"  Final dataset sizes:")
-        print(f"    Training set: {train_size} ({replicated_path_samples} replicated paths + {num_edge_samples} edges)")
+        if combine:
+            print(f"    Training set: {train_size} ({replicated_path_samples} replicated paths + {num_edge_samples} edges)")
+        else:
+            print(f"    Path dataset: {num_train_path_samples} (no replication)")
+            print(f"    Edge dataset: {num_edge_samples}")
         print(f"    Validation set: {val_size} (holdout paths only, no edges)")
         print(f"    2d dimension of training set is : {self.l + num_pause_tokens + 2}")
         print(f"  Output directory: {full_output_dir}")
@@ -502,7 +403,8 @@ class InWeightsPathStar:
         train_path_sequences = self.generate_path_prediction_training_set(
             size=num_train_path_samples,
             num_pause_tokens=num_pause_tokens,
-            obey_holdout=True  # Uses train_leaves
+            obey_holdout=True,  # Uses train_leaves
+            use_task_tokens=use_task_tokens
         )
         
         # Generate edge sequences
@@ -511,9 +413,12 @@ class InWeightsPathStar:
             undirected=use_undirected,
             use_directional_tokens=use_directional_tokens
         )
-        # Convert edge pairs to sequences: [<EDGE>,<optional direction token>, x, y]
-        edge_task_tokens = torch.full((num_edge_samples, 1), self.TASK_TOKENS['EDGE'], dtype=torch.long)
-        edge_sequences = torch.cat([edge_task_tokens, edges], dim=1)
+        # Convert edge pairs to sequences: [<EDGE>,<optional direction token>, x, y] or [<optional direction token>, x, y]
+        if use_task_tokens:
+            edge_task_tokens = torch.full((num_edge_samples, 1), self.TASK_TOKENS['EDGE'], dtype=torch.long)
+            edge_sequences = torch.cat([edge_task_tokens, edges], dim=1)
+        else:
+            edge_sequences = edges
         
         # Pad edge sequences to match path sequence length using <PAD> token
         path_seq_len = train_path_sequences.shape[1]
@@ -527,41 +432,66 @@ class InWeightsPathStar:
             )
             edge_sequences = torch.cat([edge_sequences, padding], dim=1)
         
-        # Replicate path sequences to account for class imbalance
-        # The imbalance factor is approximately (num_edge_samples / num_train_path_samples)
-        # which is roughly (l-1) for directed edges or 2*(l-1) for undirected
-        if num_train_path_samples > 0:
-            replication_factor = num_edge_samples // num_train_path_samples
-            if replication_factor > 1:
-                print(f"  Replicating path sequences by factor of {replication_factor} to balance classes")
-                train_path_sequences = train_path_sequences.repeat(replication_factor, 1)
-                print(f"  Path sequences after replication: {train_path_sequences.shape[0]}")
-        
-        # Concatenate and shuffle training sequences
-        train_sequences = torch.cat([train_path_sequences, edge_sequences], dim=0)
-        train_indices = torch.randperm(train_sequences.shape[0])
-        train_sequences = train_sequences[train_indices]
+        if combine:
+            # Replicate path sequences to account for class imbalance
+            # The imbalance factor is approximately (num_edge_samples / num_train_path_samples)
+            # which is roughly (l-1) for directed edges or 2*(l-1) for undirected
+            if num_train_path_samples > 0:
+                replication_factor = num_edge_samples // num_train_path_samples
+                if replication_factor > 1:
+                    print(f"  Replicating path sequences by factor of {replication_factor} to balance classes")
+                    train_path_sequences = train_path_sequences.repeat(replication_factor, 1)
+                    print(f"  Path sequences after replication: {train_path_sequences.shape[0]}")
+            
+            # Concatenate and shuffle training sequences
+            train_sequences = torch.cat([train_path_sequences, edge_sequences], dim=0)
+            train_indices = torch.randperm(train_sequences.shape[0])
+            train_sequences = train_sequences[train_indices]
+        else:
+            # No replication when not combining
+            replication_factor = 1
         
         # Generate validation set: only holdout paths (no edges)
         print("Generating validation set (holdout paths only, no edges)...")
         val_sequences = self.generate_path_prediction_training_set(
             size=num_val_path_samples,
             num_pause_tokens=num_pause_tokens,
-            holdout_only=True  # Uses holdout_leaves
+            holdout_only=True,  # Uses holdout_leaves
+            use_task_tokens=use_task_tokens
         )
         
         # Debug: Print train and val sequences
-        print(f"\nDebug - Train sequences (numpy):")
-        print(train_sequences.numpy())
+        if combine:
+            print(f"\nDebug - Train sequences (numpy):")
+            print(train_sequences.numpy())
+        else:
+            print(f"\nDebug - Path sequences (numpy):")
+            print(train_path_sequences.numpy())
+            print(f"\nDebug - Edge sequences (numpy):")
+            print(edge_sequences.numpy())
         print(f"\nDebug - Val sequences (numpy):")
         print(val_sequences.numpy())
         
         # Save training data
-        train_path = os.path.join(full_output_dir, 'train.bin')
-        print(f"\nSaving training data to {train_path}...")
-        train_data = train_sequences.numpy().astype(np.uint16)
-        train_data.tofile(train_path)
-        print(f"  Saved {train_data.shape[0]} sequences of length {train_data.shape[1]}")
+        if combine:
+            train_path = os.path.join(full_output_dir, 'train.bin')
+            print(f"\nSaving training data to {train_path}...")
+            train_data = train_sequences.numpy().astype(np.uint16)
+            train_data.tofile(train_path)
+            print(f"  Saved {train_data.shape[0]} sequences of length {train_data.shape[1]}")
+        else:
+            # Save paths and edges separately
+            paths_path = os.path.join(full_output_dir, 'paths.bin')
+            print(f"\nSaving path data to {paths_path}...")
+            paths_data = train_path_sequences.numpy().astype(np.uint16)
+            paths_data.tofile(paths_path)
+            print(f"  Saved {paths_data.shape[0]} sequences of length {paths_data.shape[1]}")
+            
+            edges_path = os.path.join(full_output_dir, 'edges.bin')
+            print(f"Saving edge data to {edges_path}...")
+            edges_data = edge_sequences.numpy().astype(np.uint16)
+            edges_data.tofile(edges_path)
+            print(f"  Saved {edges_data.shape[0]} sequences of length {edges_data.shape[1]}")
         
         # Save validation data
         val_path = os.path.join(full_output_dir, 'val.bin')
@@ -609,6 +539,16 @@ class InWeightsPathStar:
                 itos[token] = f'NODE_{token}'
                 stoi[f'NODE_{token}'] = token
         
+        # Calculate context lengths
+        # edge_context_length = EDGE prefix (conditional) + directional token (conditional) + 1
+        edge_context_length = (1 if use_task_tokens else 0) + (1 if use_directional_tokens else 0) + 1
+        # path_context_length = PATH prefix (conditional) + leaf + pause tokens
+        path_context_length = (1 if use_task_tokens else 0) + 1 + num_pause_tokens
+        
+        # Note: path_seq_len was already calculated above (line 424) after padding
+        # It represents the full sequence length: path_context_length + l (context + path tokens)
+        # Edge sequences are padded to match this length
+        
         # Save metadata
         meta = {
             'vocab_size': vocab_size,
@@ -631,12 +571,27 @@ class InWeightsPathStar:
             'holdout_leaves': self.holdout_leaves,
             'use_undirected': use_undirected,
             'use_directional_tokens': use_directional_tokens,
-            'train_size': train_size,
-            'val_size': val_size,
+            'use_task_tokens': use_task_tokens,
+            'edge_context_length': edge_context_length,
+            'path_context_length': path_context_length,
+            'block_size': path_seq_len,  # Use actual sequence length (path_context_length + l), not just context length
+            'combine': combine,
             'num_train_path_samples': num_train_path_samples,
             'num_val_path_samples': num_val_path_samples,
-            'num_edge_samples': num_edge_samples,
+            'total_edge_size': num_edge_samples,
+            'replication_factor': replication_factor,
         }
+        
+        if combine:
+            meta['train_size'] = train_size
+            meta['replicated_train_paths'] = train_path_sequences.shape[0]
+            meta['TRAIN_DATASET_SIZE'] = train_data.shape[0]
+        else:
+            meta['PATHS_DATASET_SIZE'] = paths_data.shape[0]
+            meta['EDGES_DATASET_SIZE'] = edges_data.shape[0]
+        
+        meta['val_size'] = val_size
+        meta['VAL_DATASET_SIZE'] = val_data.shape[0]
         
         meta_path = os.path.join(full_output_dir, 'meta.pkl')
         print(f"\nSaving metadata to {meta_path}...")
@@ -645,7 +600,11 @@ class InWeightsPathStar:
         
         print(f"\nDataset preparation complete!")
         print(f"  Vocab size: {vocab_size}")
-        print(f"  Total tokens (train): {train_data.size}")
+        if combine:
+            print(f"  Total tokens (train): {train_data.size}")
+        else:
+            print(f"  Total tokens (paths): {paths_data.size}")
+            print(f"  Total tokens (edges): {edges_data.size}")
         print(f"  Total tokens (val): {val_data.size}")
         
         return full_output_dir
@@ -654,10 +613,7 @@ class InWeightsPathStar:
         dataset = self.dir_name
         # Data loading setup
         data_dir = os.path.join('data', dataset)
-        # Load data once as memory-mapped arrays
-        train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-        val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-        # Load metadata once at initialization
+        # Load metadata first to determine combine mode
         meta_path = os.path.join(data_dir, 'meta.pkl')
         if not os.path.exists(meta_path):
             raise ValueError(f"Metadata file not found at {meta_path}")
@@ -665,16 +621,31 @@ class InWeightsPathStar:
         with open(meta_path, 'rb') as f:
             meta = pickle.load(f)
         
-        return meta, train_data, val_data
+        # Load data based on combine mode
+        combine_mode = meta.get('combine', True)  # Default to True for backward compatibility
+        val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+        
+        if combine_mode:
+            # Load combined train.bin
+            train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+            return meta, train_data, val_data
+        else:
+            # Load separate paths.bin and edges.bin
+            paths_data = np.memmap(os.path.join(data_dir, 'paths.bin'), dtype=np.uint16, mode='r')
+            edges_data = np.memmap(os.path.join(data_dir, 'edges.bin'), dtype=np.uint16, mode='r')
+            return meta, paths_data, edges_data, val_data
 
-    def generate_dataset_name(self, num_pause_tokens, use_undirected, use_directional_tokens):
+    def generate_dataset_name(self, num_pause_tokens, use_undirected, use_directional_tokens, use_task_tokens=True, combine=True):
         """
         Generate dataset directory name matching the naming convention in pathstar.py
         """
-        self.dir_name = f'inweights_pathstar_v{self.vocab_size}_d{self.d}_l{self.l}_p{num_pause_tokens}_{"un" if use_undirected else ""}directed_{"dt" if use_directional_tokens else ""}'
+        task_token_suffix = "_tt" if use_task_tokens else "_nott"
+        combine_suffix = "_combined" if combine else "_separate"
+        self.dir_name = f'inweights_pathstar_v{self.vocab_size}_d{self.d}_l{self.l}_p{num_pause_tokens}_{"un" if use_undirected else ""}directed_{"dt" if use_directional_tokens else ""}{task_token_suffix}{combine_suffix}'
         self.num_pause_tokens = num_pause_tokens
         self.use_undirected = use_undirected
-        self.use_directional_tokens = use_directional_tokens    
+        self.use_directional_tokens = use_directional_tokens
+        self.use_task_tokens = use_task_tokens
         return self.dir_name
 
     def check_dataset_exists(self):
@@ -687,47 +658,59 @@ class InWeightsPathStar:
         dataset_name = self.dir_name
         data_dir = os.path.join('data', dataset_name)
         meta_path = os.path.join(data_dir, 'meta.pkl')
-        train_path = os.path.join(data_dir, 'train.bin')
         val_path = os.path.join(data_dir, 'val.bin')
         
-        # Check if all required files exist
-        if not (os.path.exists(data_dir) and os.path.exists(meta_path) and 
-                os.path.exists(train_path) and os.path.exists(val_path)):
+        # Check if metadata and val files exist
+        if not (os.path.exists(data_dir) and os.path.exists(meta_path) and os.path.exists(val_path)):
             return False
         
-        # Load metadata and validate parameters
+        # Load metadata to check combine mode
         try:
             with open(meta_path, 'rb') as f:
                 meta = pickle.load(f)
-            
-            # Check if all key parameters match
-            params_match = (
-                meta.get('d') == self.d and
-                meta.get('l') == self.l and
-                meta.get('num_pause_tokens') == self.num_pause_tokens and
-                meta.get('use_undirected') == self.use_undirected and
-                meta.get('use_directional_tokens') == self.use_directional_tokens and
-                abs(meta.get('holdout_percentage', 0.0) - self.holdout_percentage) < 1e-6  # Float comparison
-            )
-            
-            if not params_match:
-                print(f"Dataset exists but parameters don't match:")
-                print(f"  Existing: d={meta.get('d')}, l={meta.get('l')}, pause={meta.get('num_pause_tokens')}, "
-                    f"undirected={meta.get('use_undirected')}, directional_tokens={meta.get('use_directional_tokens')}, "
-                    f"holdout={meta.get('holdout_percentage')}")
-                print(f"  Requested: d={self.d}, l={self.l}, pause={self.num_pause_tokens}, "
-                    f"undirected={self.use_undirected}, directional_tokens={self.use_directional_tokens}, "
-                    f"holdout={self.holdout_percentage}")
-                print(f"  Will regenerate dataset...")
-                return False
-            
-            return True
         except Exception as e:
             print(f"Error reading metadata: {e}")
             return False
+        
+        # Check for appropriate files based on combine mode
+        combine_mode = meta.get('combine', True)  # Default to True for backward compatibility
+        if combine_mode:
+            train_path = os.path.join(data_dir, 'train.bin')
+            if not os.path.exists(train_path):
+                return False
+        else:
+            paths_path = os.path.join(data_dir, 'paths.bin')
+            edges_path = os.path.join(data_dir, 'edges.bin')
+            if not (os.path.exists(paths_path) and os.path.exists(edges_path)):
+                return False
+        
+        # Check if all key parameters match
+        params_match = (
+            meta.get('d') == self.d and
+            meta.get('l') == self.l and
+            meta.get('num_pause_tokens') == self.num_pause_tokens and
+            meta.get('use_undirected') == self.use_undirected and
+            meta.get('use_directional_tokens') == self.use_directional_tokens and
+            meta.get('use_task_tokens', True) == self.use_task_tokens and  # Default to True for backward compatibility
+            meta.get('combine', True) == getattr(self, 'combine', True) and  # Check combine parameter
+            abs(meta.get('holdout_percentage', 0.0) - self.holdout_percentage) < 1e-6  # Float comparison
+        )
+        
+        if not params_match:
+            print(f"Dataset exists but parameters don't match:")
+            print(f"  Existing: d={meta.get('d')}, l={meta.get('l')}, pause={meta.get('num_pause_tokens')}, "
+                f"undirected={meta.get('use_undirected')}, directional_tokens={meta.get('use_directional_tokens')}, "
+                f"task_tokens={meta.get('use_task_tokens', True)}, combine={meta.get('combine', True)}, holdout={meta.get('holdout_percentage')}")
+            print(f"  Requested: d={self.d}, l={self.l}, pause={self.num_pause_tokens}, "
+                f"undirected={self.use_undirected}, directional_tokens={self.use_directional_tokens}, "
+                f"task_tokens={self.use_task_tokens}, combine={getattr(self, 'combine', True)}, holdout={self.holdout_percentage}")
+            print(f"  Will regenerate dataset...")
+            return False
+        
+        return True
 
 
-    def generate_dataset_if_needed(self, num_pause_tokens, use_undirected, use_directional_tokens):
+    def generate_dataset_if_needed(self, num_pause_tokens, use_undirected, use_directional_tokens, use_task_tokens=True, combine=True):
         """
         Generate the dataset using InWeightsPathStar if it doesn't exist or parameters don't match.
         """
@@ -737,8 +720,11 @@ class InWeightsPathStar:
                 f"vocab_size ({self.vocab_size}) must be >= d * (l-1) + 1 = {self.num_vertices}"
             )
         
+        # Store combine parameter for check_dataset_exists
+        self.combine = combine
+        
         # Generate dataset name
-        dataset_name = self.generate_dataset_name(num_pause_tokens, use_undirected, use_directional_tokens    )
+        dataset_name = self.generate_dataset_name(num_pause_tokens, use_undirected, use_directional_tokens, use_task_tokens, combine)
         
         # Check if dataset exists and parameters match
         if self.check_dataset_exists():
@@ -758,7 +744,9 @@ class InWeightsPathStar:
             num_pause_tokens=num_pause_tokens,
             output_dir='./data',
             use_undirected=use_undirected,
-            use_directional_tokens=use_directional_tokens
+            use_directional_tokens=use_directional_tokens,
+            use_task_tokens=use_task_tokens,
+            combine=combine
         )
         
         print(f"\n{'='*80}")
@@ -790,23 +778,26 @@ if __name__ == '__main__':
                         help='Use directed edges for inweights mode (default: undirected)')
     parser.add_argument('--train_val_split', type=float, default=0.9,
                         help='Train/validation split ratio for inweights mode (default: 0.9)')
-    parser.add_argument('--viz', action='store_true',
-                        help='Visualize the graph structure before generating dataset')
     parser.add_argument('--output_dir', type=str, default='./data',
                         help='Output directory for datasets (default: ./data)')
+    parser.add_argument('--use_task_tokens', action='store_true',
+                        help='Use task prefix tokens (PATH and EDGE) in sequences (default: False)')
+    parser.add_argument('--combine', action='store_true', default=False,
+                        help='Combine paths and edges into train.bin with class balancing (default: False, saves separately)')
     
     args = parser.parse_args()
     
     if args.mode == 'incontext':
         print(f"Generating InContextPathStar dataset...")
-        generator = InContextPathStar(d=args.d, l=args.l, vocab_size=args.vocab_size)
-        generator.prepare(
-            train_size=args.train_size,
-            val_size=args.val_size,
-            use_directional_tokens=args.use_directional_tokens,
-            num_pause_tokens=args.num_pause_tokens,
-            output_dir=args.output_dir
-        )
+        raise ValueError("This is not supported yet")
+        # generator = InContextPathStar(d=args.d, l=args.l, vocab_size=args.vocab_size)
+        # generator.prepare(
+        #     train_size=args.train_size,
+        #     val_size=args.val_size,
+        #     use_directional_tokens=args.use_directional_tokens,
+        #     num_pause_tokens=args.num_pause_tokens,
+        #     output_dir=args.output_dir
+        # )
     elif args.mode == 'inweights':
         print(f"Generating InWeightsPathStar dataset...")
         
@@ -831,16 +822,11 @@ if __name__ == '__main__':
             vocab_size=args.vocab_size
         )
         
-        # Visualize the graph if requested
-        if args.viz:
-            print("\nVisualizing graph structure...")
-            viz_output = os.path.join(args.output_dir, f'pathstar_d{args.d}_l{args.l}_viz.png')
-            os.makedirs(args.output_dir, exist_ok=True)
-            generator.visualize(output_path=viz_output)
-        
         generator.prepare(
             num_pause_tokens=args.num_pause_tokens,
             output_dir=args.output_dir,
             use_undirected=not args.use_directed,
-            use_directional_tokens=args.use_directional_tokens
+            use_directional_tokens=args.use_directional_tokens,
+            use_task_tokens=args.use_task_tokens,
+            combine=args.combine
         )

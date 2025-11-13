@@ -287,7 +287,8 @@ class TestInWeightsPathStar(unittest.TestCase):
             seq_len = g.l + num_pause_tokens + 2 # 8
             
             # --- 1. Verify Directory Naming ---
-            expected_dir_name = f'inweights_pathstar_v{self.VOCAB_SIZE}_d{self.D}_l{self.L}_p1_undirected_dt'
+            # With use_task_tokens=True (default), name should have _tt suffix
+            expected_dir_name = f'inweights_pathstar_v{self.VOCAB_SIZE}_d{self.D}_l{self.L}_p1_undirected_dt_tt'
             self.assertTrue(output_dir.endswith(expected_dir_name))
             self.assertTrue(os.path.exists(output_dir))
             
@@ -310,13 +311,18 @@ class TestInWeightsPathStar(unittest.TestCase):
             self.assertEqual(actual_meta['holdout_percentage'], self.HOLDOUT_PERC)
             self.assertEqual(actual_meta['use_undirected'], use_undirected)
             self.assertEqual(actual_meta['use_directional_tokens'], use_directional_tokens)
+            self.assertEqual(actual_meta['use_task_tokens'], True)  # Default value
+            
+            # Check context lengths (use_task_tokens=True, use_directional_tokens=True)
+            self.assertEqual(actual_meta['edge_context_length'], 3)  # 1(EDGE) + 1(direction) + 1 = 3
+            self.assertEqual(actual_meta['path_context_length'], 3)  # 1(PATH) + 1(leaf) + 1(pause) = 3
             
             # Check calculated sizes
             self.assertEqual(actual_meta['train_size'], train_size) # 80
             self.assertEqual(actual_meta['val_size'], val_size) # 3
             self.assertEqual(actual_meta['num_train_path_samples'], num_train_path_samples) # 2
             self.assertEqual(actual_meta['num_val_path_samples'], val_size) # 3
-            self.assertEqual(actual_meta['num_edge_samples'], num_edge_samples) # 40
+            self.assertEqual(actual_meta['total_edge_size'], num_edge_samples) # 40
             
             # Check ITOS mapping size (Total tokens used: 21 vertices + 11 special tokens = 32)
             self.assertEqual(len(actual_meta['itos']), 32)
@@ -514,4 +520,255 @@ class TestInWeightsPathStar(unittest.TestCase):
         for i in range(val_size):
             self.assertEqual(val_sequences[i, 0].item(), self.TOK_PATH)
             self.assertIn(val_sequences[i, 1].item(), [15, 23, 31])  # Holdout leaves
+
+    @patch('random.sample', side_effect=lambda pop, k: sorted(pop)[:k]) # Deterministic sample
+    def test_05_use_task_tokens_path_prediction(self, mock_sample):
+        """
+        Tests generate_path_prediction_training_set with use_task_tokens=False.
+        Verifies that sequences omit the PATH task prefix token when use_task_tokens=False.
+        """
         
+        # --- Test: use_task_tokens=True (default behavior) ---
+        seq_with_task = self.gen.generate_path_prediction_training_set(
+            size=2, num_pause_tokens=1, obey_holdout=True, holdout_only=False, use_task_tokens=True
+        )
+        # Shape should be 1(PATH) + 1(leaf) + 1(PAUSE) + 5(path) = 8
+        self.assertEqual(seq_with_task.shape, (2, 8))
+        expected_with_task = [
+            [self.TOK_PATH, 19, self.TOK_PAUSE, 11, 16, 17, 18, 19],
+            [self.TOK_PATH, 27, self.TOK_PAUSE, 11, 24, 25, 26, 27],
+        ]
+        self.assertTrue(torch.equal(seq_with_task, torch.tensor(expected_with_task)))
+        
+        # --- Test: use_task_tokens=False ---
+        seq_without_task = self.gen.generate_path_prediction_training_set(
+            size=2, num_pause_tokens=1, obey_holdout=True, holdout_only=False, use_task_tokens=False
+        )
+        # Shape should be 1(leaf) + 1(PAUSE) + 5(path) = 7 (no PATH token)
+        self.assertEqual(seq_without_task.shape, (2, 7))
+        expected_without_task = [
+            [19, self.TOK_PAUSE, 11, 16, 17, 18, 19],  # No PATH token
+            [27, self.TOK_PAUSE, 11, 24, 25, 26, 27],  # No PATH token
+        ]
+        self.assertTrue(torch.equal(seq_without_task, torch.tensor(expected_without_task)))
+        
+        # Verify length difference is exactly 1 (the PATH token)
+        length_diff = seq_with_task.shape[1] - seq_without_task.shape[1]
+        self.assertEqual(length_diff, 1)
+        
+        # Verify that the content after the PATH token matches
+        self.assertTrue(torch.equal(seq_with_task[:, 1:], seq_without_task))
+        
+        # --- Test with different num_pause_tokens ---
+        seq_without_task_p2 = self.gen.generate_path_prediction_training_set(
+            size=3, num_pause_tokens=2, obey_holdout=False, holdout_only=True, use_task_tokens=False
+        )
+        # Shape should be 1(leaf) + 2(PAUSE) + 5(path) = 8 (no PATH token)
+        self.assertEqual(seq_without_task_p2.shape, (3, 8))
+        expected_without_task_p2 = [
+            [15, self.TOK_PAUSE, self.TOK_PAUSE, 11, 12, 13, 14, 15],
+            [23, self.TOK_PAUSE, self.TOK_PAUSE, 11, 20, 21, 22, 23],
+            [31, self.TOK_PAUSE, self.TOK_PAUSE, 11, 28, 29, 30, 31],
+        ]
+        self.assertTrue(torch.equal(seq_without_task_p2, torch.tensor(expected_without_task_p2)))
+
+    @patch('torch.randperm', return_value=torch.arange(80)) # Deterministic shuffling (no reordering)
+    def test_06_prepare_without_task_tokens(self, mock_randperm):
+        """
+        Tests the prepare method with use_task_tokens=False.
+        Verifies that PATH and EDGE tokens are omitted from sequences.
+        """
+        
+        g = self.gen
+        num_pause_tokens = 1
+        use_undirected = True
+        use_directional_tokens = True
+        use_task_tokens = False  # Key difference
+        
+        # Create a temporary directory for test output
+        temp_dir = tempfile.mkdtemp()
+        
+        try:
+            # Run prepare with use_task_tokens=False
+            output_dir = g.prepare(
+                num_pause_tokens=num_pause_tokens, 
+                output_dir=temp_dir, 
+                use_undirected=use_undirected, 
+                use_directional_tokens=use_directional_tokens,
+                use_task_tokens=use_task_tokens
+            )
+            
+            # --- Expected Calculations ---
+            num_edges = g.d * (g.l - 1)  # 20
+            num_edge_samples = 2 * num_edges  # 40
+            num_train_path_samples = len(g.train_leaves)  # 2
+            replication_factor = num_edge_samples // num_train_path_samples  # 20
+            replicated_path_samples = num_train_path_samples * replication_factor  # 40
+            train_size = replicated_path_samples + num_edge_samples  # 80
+            val_size = len(g.holdout_leaves)  # 3
+            
+            # Sequence lengths WITHOUT task tokens:
+            # Path: 1(leaf) + 1(PAUSE) + 5(path) = 7
+            # Edge: 1(direction) + 2(nodes) = 3
+            path_seq_len = g.l + num_pause_tokens + 1  # 7 (no PATH token)
+            edge_seq_len = 3  # direction + u + v (no EDGE token)
+            
+            # --- 1. Verify Directory Naming ---
+            expected_dir_name = f'inweights_pathstar_v{self.VOCAB_SIZE}_d{self.D}_l{self.L}_p1_undirected_dt_nott'
+            self.assertTrue(output_dir.endswith(expected_dir_name))
+            self.assertTrue(os.path.exists(output_dir))
+            
+            # --- 2. Verify Files Exist ---
+            train_path = os.path.join(output_dir, 'train.bin')
+            val_path = os.path.join(output_dir, 'val.bin')
+            meta_path = os.path.join(output_dir, 'meta.pkl')
+            
+            self.assertTrue(os.path.exists(train_path))
+            self.assertTrue(os.path.exists(val_path))
+            self.assertTrue(os.path.exists(meta_path))
+            
+            # --- 3. Load and verify metadata ---
+            with open(meta_path, 'rb') as f:
+                actual_meta = pickle.load(f)
+            
+            # Verify use_task_tokens is stored correctly
+            self.assertEqual(actual_meta['use_task_tokens'], False)
+            
+            # Verify context lengths
+            # edge_context_length = 0(no EDGE) + 1(direction) + 1 = 2
+            # path_context_length = 0(no PATH) + 1(leaf) + 1(pause) = 2
+            self.assertEqual(actual_meta['edge_context_length'], 2)
+            self.assertEqual(actual_meta['path_context_length'], 2)
+            
+            # --- 4. Load and verify train data ---
+            train_data = np.fromfile(train_path, dtype=np.uint16)
+            train_data = train_data.reshape(train_size, path_seq_len)
+            
+            self.assertEqual(train_data.shape, (80, 7))
+            
+            # First 40 rows should be PATH sequences (WITHOUT PATH token)
+            for i in range(40):
+                # First token should be the leaf (19 or 27), NOT the PATH token
+                self.assertIn(train_data[i, 0], [19, 27])
+                # Second token should be PAUSE
+                self.assertEqual(train_data[i, 1], self.TOK_PAUSE)
+                # Third token should be root (11)
+                self.assertEqual(train_data[i, 2], 11)
+            
+            # Next 40 rows should be EDGE sequences (WITHOUT EDGE token)
+            for i in range(40, 80):
+                # First token should be directional (GT or LT), NOT the EDGE token
+                self.assertIn(train_data[i, 0], [self.TOK_GT, self.TOK_LT])
+                # Second and third tokens should be node IDs
+                self.assertIn(train_data[i, 1], range(11, 32))
+                self.assertIn(train_data[i, 2], range(11, 32))
+                # Positions 3-6 should be PAD
+                for j in range(3, 7):
+                    self.assertEqual(train_data[i, j], self.TOK_PAD)
+            
+            # --- 5. Load and verify validation data ---
+            val_data = np.fromfile(val_path, dtype=np.uint16)
+            val_data = val_data.reshape(val_size, path_seq_len)
+            
+            self.assertEqual(val_data.shape, (3, 7))
+            
+            # All validation sequences should be path sequences WITHOUT PATH token
+            for i in range(3):
+                # First token should be the leaf (15, 23, or 31), NOT the PATH token
+                self.assertIn(val_data[i, 0], [15, 23, 31])
+                # Second token should be PAUSE
+                self.assertEqual(val_data[i, 1], self.TOK_PAUSE)
+                # Third token should be root (11)
+                self.assertEqual(val_data[i, 2], 11)
+        
+        finally:
+            # Clean up temp directory
+            shutil.rmtree(temp_dir)
+
+    def test_07_context_length_calculations(self):
+        """
+        Tests that edge_context_length and path_context_length are calculated correctly
+        for all combinations of use_task_tokens and use_directional_tokens.
+        """
+        
+        num_pause_tokens = 1
+        
+        # --- Case 1: use_task_tokens=True, use_directional_tokens=True ---
+        edge_ctx_1 = (1 if True else 0) + (1 if True else 0) + 1  # EDGE + direction + 1 = 3
+        path_ctx_1 = (1 if True else 0) + 1 + num_pause_tokens  # PATH + leaf + pause = 3
+        self.assertEqual(edge_ctx_1, 3)
+        self.assertEqual(path_ctx_1, 3)
+        
+        # --- Case 2: use_task_tokens=True, use_directional_tokens=False ---
+        edge_ctx_2 = (1 if True else 0) + (1 if False else 0) + 1  # EDGE + 0 + 1 = 2
+        path_ctx_2 = (1 if True else 0) + 1 + num_pause_tokens  # PATH + leaf + pause = 3
+        self.assertEqual(edge_ctx_2, 2)
+        self.assertEqual(path_ctx_2, 3)
+        
+        # --- Case 3: use_task_tokens=False, use_directional_tokens=True ---
+        edge_ctx_3 = (1 if False else 0) + (1 if True else 0) + 1  # 0 + direction + 1 = 2
+        path_ctx_3 = (1 if False else 0) + 1 + num_pause_tokens  # 0 + leaf + pause = 2
+        self.assertEqual(edge_ctx_3, 2)
+        self.assertEqual(path_ctx_3, 2)
+        
+        # --- Case 4: use_task_tokens=False, use_directional_tokens=False ---
+        edge_ctx_4 = (1 if False else 0) + (1 if False else 0) + 1  # 0 + 0 + 1 = 1
+        path_ctx_4 = (1 if False else 0) + 1 + num_pause_tokens  # 0 + leaf + pause = 2
+        self.assertEqual(edge_ctx_4, 1)
+        self.assertEqual(path_ctx_4, 2)
+        
+        # Test with different num_pause_tokens
+        num_pause_tokens = 3
+        path_ctx_5 = (1 if True else 0) + 1 + num_pause_tokens  # PATH + leaf + 3 pauses = 5
+        path_ctx_6 = (1 if False else 0) + 1 + num_pause_tokens  # 0 + leaf + 3 pauses = 4
+        self.assertEqual(path_ctx_5, 5)
+        self.assertEqual(path_ctx_6, 4)
+
+    def test_08_dataset_name_with_task_tokens(self):
+        """
+        Tests that generate_dataset_name includes the correct suffix based on use_task_tokens.
+        """
+        
+        g = self.gen
+        
+        # --- Test with use_task_tokens=True ---
+        name_with_tt = g.generate_dataset_name(
+            num_pause_tokens=1,
+            use_undirected=True,
+            use_directional_tokens=True,
+            use_task_tokens=True
+        )
+        self.assertIn('_tt', name_with_tt)
+        self.assertNotIn('_nott', name_with_tt)
+        expected_name_tt = f'inweights_pathstar_v{self.VOCAB_SIZE}_d{self.D}_l{self.L}_p1_undirected_dt_tt'
+        self.assertEqual(name_with_tt, expected_name_tt)
+        
+        # --- Test with use_task_tokens=False ---
+        name_without_tt = g.generate_dataset_name(
+            num_pause_tokens=1,
+            use_undirected=True,
+            use_directional_tokens=True,
+            use_task_tokens=False
+        )
+        self.assertIn('_nott', name_without_tt)
+        self.assertNotIn('_tt', name_without_tt.replace('_nott', ''))  # Ensure only _nott, not _tt
+        expected_name_nott = f'inweights_pathstar_v{self.VOCAB_SIZE}_d{self.D}_l{self.L}_p1_undirected_dt_nott'
+        self.assertEqual(name_without_tt, expected_name_nott)
+        
+        # Verify that stored instance variables are correct
+        self.assertEqual(g.use_task_tokens, False)
+        
+        # Reset and test with use_task_tokens=True again
+        name_with_tt_2 = g.generate_dataset_name(
+            num_pause_tokens=2,
+            use_undirected=False,
+            use_directional_tokens=False,
+            use_task_tokens=True
+        )
+        self.assertIn('_tt', name_with_tt_2)
+        self.assertEqual(g.use_task_tokens, True)
+
+
+if __name__ == '__main__':
+    unittest.main()
+

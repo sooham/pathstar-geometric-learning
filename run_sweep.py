@@ -20,7 +20,7 @@ import os
 import signal
 import sys
 import torch
-from train import sweep_train
+from train_separate import sweep_train
 
 # Flag to track if we're shutting down
 _shutting_down = False

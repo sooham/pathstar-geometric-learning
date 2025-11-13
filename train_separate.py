@@ -1,8 +1,9 @@
 """
 This training script runs on a single GPU and supports wandb sweeps.
+This version handles separate edge and path datasets with interleaved training.
 
 To run standalone:
-$ python train.py --batch_size=32 --compile=False
+$ python train_separate.py --batch_size=32 --compile=False
 
 To run with wandb sweep:
 $ wandb sweep sweep_config.yaml
@@ -40,7 +41,7 @@ def get_default_config():
         
         # wandb logging
         'wandb_log': True,
-        'wandb_project': 'pathstar_small',
+        'wandb_project': 'pathstar_interleave',
         'wandb_run_name': None,  # Will be auto-generated
         
         # Dataset generation parameters
@@ -48,12 +49,15 @@ def get_default_config():
         'graph_l': 5,
         'graph_vocab_size': '1max',
         'graph_holdout_percentage': 0.2,
-        'num_pause_tokens': 1,
+        'num_pause_tokens': 5,
         'use_undirected': True,
-        'use_directional_tokens': True,
+        'use_directional_tokens': False,
+        'use_task_tokens': False,
         
         # Training parameters
-        'gradient_accumulation_steps': 8,
+        'gradient_accumulation_steps': 1,
+        'edge_iterations_per_epoch': 10,  # Number of iterations on edges per epoch
+        'path_iterations_per_epoch': 10,  # Number of iterations on paths per epoch
         
         # Model architecture
         'n_layer': 3,
@@ -65,7 +69,7 @@ def get_default_config():
         # Optimization
         'learning_rate': 1e-3,
         'label_smoothing': 0.10,
-        'epochs': 50000,
+        'epochs': 1000,
         'weight_decay': 0.01,
         'beta1': 0.9,
         'beta2': 0.95,
@@ -89,27 +93,43 @@ def get_default_config():
     }
 
 @torch.compile
-def compute_per_token_loss_with_teacher_forcing(meta, logits, input, targets, token_positions, debug=False, split=''):
+def compute_per_token_loss_with_teacher_forcing(meta, logits, input, targets, token_positions, task_type='path', debug=False, split=''):
     """
     Compute per-token loss for specified token positions
     Assumes Teacher Forcing
 
+    Args:
+        task_type: 'edge' or 'path' to indicate which task type
     Returns a dictionary that is 1-indexed with the values being the loss of the token at that position
     with teacher forcing 
     """
 
     per_token_losses = {}
     
-    # Compute context length per input based on task token
-    context_length_per_input = torch.where(
-        input[:, 0] == meta['task_tokens']['EDGE'],
-        torch.tensor(3 if meta['use_directional_tokens'] else 2, device=input.device),
-        torch.where(
-            input[:, 0] == meta['task_tokens']['PATH'],
-            torch.tensor(2 + meta['num_pause_tokens'], device=input.device),
-            torch.tensor(0, device=input.device)
-        )
-    ).unsqueeze(1)
+    use_task_tokens = meta.get('use_task_tokens', True)
+    
+    # Compute context length per input based on task type and task tokens
+    if use_task_tokens:
+        # Use task tokens to determine context length
+        context_length_per_input = torch.where(
+            input[:, 0] == meta['task_tokens']['EDGE'],
+            torch.tensor((1 if use_task_tokens else 0) + (1 if meta['use_directional_tokens'] else 0) + 1, device=input.device),
+            torch.where(
+                input[:, 0] == meta['task_tokens']['PATH'],
+                torch.tensor((1 if use_task_tokens else 0) + 1 + meta['num_pause_tokens'], device=input.device),
+                torch.tensor(0, device=input.device)
+            )
+        ).unsqueeze(1)
+    else:
+        # No task tokens - compute based on task_type
+        if task_type == 'edge':
+            # Edge: (directional token if present) + 1
+            edge_context = (1 if meta['use_directional_tokens'] else 0) + 1
+            context_length_per_input = torch.full((input.size(0), 1), edge_context, device=input.device, dtype=torch.long)
+        else:  # path
+            # Path: leaf + pause tokens
+            path_context = 1 + meta['num_pause_tokens']
+            context_length_per_input = torch.full((input.size(0), 1), path_context, device=input.device, dtype=torch.long)
     
     for token_pos in token_positions:
         y_idx = context_length_per_input + token_pos - 2
@@ -151,7 +171,12 @@ def compute_per_token_accuracy_autoregressive(ctx, model, meta, val_data_batch, 
     """Compute per-token accuracy using autoregressive generation"""
     sample_indices = np.random.choice(len(val_data_batch), size=min(num_samples, len(val_data_batch)), replace=False)
     
-    context_length = 2 + meta['num_pause_tokens']
+    # Calculate context length based on whether task tokens are used
+    use_task_tokens = meta.get('use_task_tokens', True)
+    if use_task_tokens:
+        context_length = 2 + meta['num_pause_tokens']  # task token + leaf + pause tokens
+    else:
+        context_length = 1 + meta['num_pause_tokens']  # leaf + pause tokens
     
     contexts = []
     ground_truths = []
@@ -187,11 +212,12 @@ def compute_per_token_accuracy_autoregressive(ctx, model, meta, val_data_batch, 
 def evaluate_samples(device, ctx, model, meta, data, data_size, split_name, num_samples=5, eval_batch_size=512):
     """
     Evaluate autoregressive generation on samples from a dataset.
+    Assumes data is path-only (no filtering needed).
     
     Args:
         ctx: context 
         meta: the dictionary of graph parameters and dataset parameters
-        data: Dataset to sample from (train_data or val_data)
+        data: Dataset to sample from (assumed to be path-only)
         data_size: Size of the dataset
         split_name: Name of the split for logging ('train' or 'val')
         num_samples: Number of samples to evaluate
@@ -203,27 +229,15 @@ def evaluate_samples(device, ctx, model, meta, data, data_size, split_name, num_
     num_samples = min(num_samples, data_size)
     eval_batch_size = min(eval_batch_size, num_samples)
     
-    # For train data, filter to only PATH tasks
-    if split_name == 'train':
-        # Find indices where first token is path_token
-        path_indices = []
-        for idx in range(data_size):
-            if data[idx, 0] == meta['task_tokens']['PATH']:
-                path_indices.append(idx)
-        
-        if len(path_indices) == 0:
-            print(f"Warning: No PATH tasks found in {split_name} data")
-            return 0.0
-        
-        # Sample from valid PATH indices without replacement
-        num_samples = min(num_samples, len(path_indices))
-        sample_indices = np.random.choice(path_indices, size=num_samples, replace=False)
-    else:
-        # For val data, sample randomly without replacement
-        sample_indices = np.random.choice(data_size, size=num_samples, replace=False)
+    # Sample randomly without replacement (data is already path-only)
+    sample_indices = np.random.choice(data_size, size=num_samples, replace=False)
     
-    # Prepare contexts and ground truths
-    context_length = 2 + meta['num_pause_tokens']
+    # Calculate context length based on whether task tokens are used
+    use_task_tokens = meta.get('use_task_tokens', True)
+    if use_task_tokens:
+        context_length = 2 + meta['num_pause_tokens']  # task token + leaf + pause tokens
+    else:
+        context_length = 1 + meta['num_pause_tokens']  # leaf + pause tokens
     contexts = []
     ground_truths = []
     
@@ -607,10 +621,22 @@ def train(config=None):
     dataset = gen.generate_dataset_if_needed(
         num_pause_tokens=default_config['num_pause_tokens'],
         use_undirected=default_config['use_undirected'],
-        use_directional_tokens=default_config['use_directional_tokens']
+        use_directional_tokens=default_config['use_directional_tokens'],
+        combine=False  # Always use separate datasets for train_separate.py
     )
     
-    meta, train_data, val_data = gen.load_dataset()
+    result = gen.load_dataset()
+    if len(result) == 3:
+        # Combined mode (shouldn't happen, but handle gracefully)
+        meta, train_data, val_data = result
+        raise ValueError("train_separate.py requires combine=False. Please regenerate dataset with --combine flag omitted.")
+    else:
+        # Separate mode
+        meta, paths_data, edges_data, val_data = result
+    
+    # Verify combine is False
+    if meta.get('combine', True):
+        raise ValueError("train_separate.py requires combine=False in metadata. Please regenerate dataset.")
     
     # Extract graph parameters from metadata
     graph_length = meta['l']
@@ -618,16 +644,15 @@ def train(config=None):
     holdout_ratio = meta['holdout_percentage']
 
     num_holdout = round(graph_spokes * holdout_ratio)
-    total_train_paths = (graph_spokes - num_holdout)
     
-    # Account for path replication to balance classes
-    replication_factor = meta['replication_factor']
-    replicated_train_paths = meta['replicated_train_paths']
+    # Get dataset sizes from metadata
+    paths_size = meta['PATHS_DATASET_SIZE']
+    edges_size = meta['EDGES_DATASET_SIZE']
     
-    print(f"Class balancing: {total_train_paths} training paths replicated by factor {replication_factor} → {replicated_train_paths} replicated paths")
-    print(f"Training dataset composition: {replicated_train_paths} replicated paths + {meta['total_edge_size']} edges = {replicated_train_paths + total_edge_size} total samples")
-    
-    max_allowed_batch_size = meta['total_edge_size'] + replicated_train_paths
+    print(f"Training dataset composition:")
+    print(f"  Paths: {paths_size} (no replication)")
+    print(f"  Edges: {edges_size}")
+    print(f"  Total: {paths_size + edges_size} samples")
 
     # TODO: port model defintion here
     # Auto-detect device
@@ -651,19 +676,28 @@ def train(config=None):
     )
     
     # Calculate training iteration parameters
-    TRAIN_DATASET_SIZE = meta['TRAIN_DATASET_SIZE']
     VAL_DATASET_SIZE = meta['VAL_DATASET_SIZE']
-
+    
+    # Calculate iterations per epoch for edges and paths
+    edge_iterations_per_epoch = default_config['edge_iterations_per_epoch']
+    path_iterations_per_epoch = default_config['path_iterations_per_epoch']
+    
+    # Calculate batches per dataset
+    edge_batches_per_iteration = int(np.ceil(edges_size / (train_batch_size * default_config['gradient_accumulation_steps'])))
+    path_batches_per_iteration = int(np.ceil(paths_size / (train_batch_size * default_config['gradient_accumulation_steps'])))
+    
+    # One epoch = A edge iterations + B path iterations
+    batches_per_epoch = edge_iterations_per_epoch * edge_batches_per_iteration + path_iterations_per_epoch * path_batches_per_iteration
+    max_iters = default_config['epochs'] * batches_per_epoch
+    
     val_batch_size = min(num_holdout, train_batch_size)
-
-    batch_per_dataset = int(np.ceil(TRAIN_DATASET_SIZE / (train_batch_size * default_config['gradient_accumulation_steps'])))
     eval_iters = int(np.ceil(VAL_DATASET_SIZE / val_batch_size))
-    max_iters = default_config['epochs'] * batch_per_dataset
     # Calculate learning rate schedule parameters
     warmup_iters = int(max_iters * default_config['warmup_frac'])
     lr_decay_iters = int(max_iters * default_config['lr_decay_frac'])
     
-    theoretical_token_1_loss = get_theoretical_loss(meta)
+    # Skip theoretical loss calculation for separate datasets (not applicable)
+    # theoretical_token_1_loss = get_theoretical_loss(meta)
     
     
     # Calculate optimal batch size based on available GPU memory
@@ -721,33 +755,39 @@ def train(config=None):
         print(f"Loaded vocabulary mappings: {len(itos)} tokens")
     
     # Calculate dataset structure from metadata
-    train_size = meta.get('train_size', TRAIN_DATASET_SIZE)
     val_size = meta.get('val_size', VAL_DATASET_SIZE)
-    train_seq_length = len(train_data) // train_size
+    
+    # Calculate sequence lengths
+    paths_seq_length = len(paths_data) // paths_size
+    edges_seq_length = len(edges_data) // edges_size
     val_seq_length = len(val_data) // val_size
     
     print(f"Dataset info:")
-    print(f"  Train: {train_size} sequences of length {train_seq_length}")
+    print(f"  Paths: {paths_size} sequences of length {paths_seq_length}")
+    print(f"  Edges: {edges_size} sequences of length {edges_seq_length}")
     print(f"  Val: {val_size} sequences of length {val_seq_length}")
     print(f"  Block size: {meta['block_size']}")
     
-    assert train_size == TRAIN_DATASET_SIZE, f"Train size mismatch: {train_size} != {TRAIN_DATASET_SIZE}"
+    assert paths_seq_length == edges_seq_length, f"Sequence length mismatch: paths={paths_seq_length}, edges={edges_seq_length}"
     assert val_size == VAL_DATASET_SIZE, f"Val size mismatch: {val_size} != {VAL_DATASET_SIZE}"
     
     # Reshape data for easier indexing
-    train_data = train_data.reshape(train_size, train_seq_length)
+    paths_data = paths_data.reshape(paths_size, paths_seq_length)
+    edges_data = edges_data.reshape(edges_size, edges_seq_length)
     val_data = val_data.reshape(val_size, val_seq_length)
     
     # Determine if datasets can fit in GPU memory (policy: use at most 50% of available VRAM)
-    train_data_tensor = torch.from_numpy(train_data.astype(np.int64))
+    paths_data_tensor = torch.from_numpy(paths_data.astype(np.int64))
+    edges_data_tensor = torch.from_numpy(edges_data.astype(np.int64))
     val_data_tensor = torch.from_numpy(val_data.astype(np.int64))
     
     datasets_on_gpu = False
     if device_type == 'cuda':
         # Calculate dataset memory requirements
-        train_data_bytes = train_data_tensor.numel() * train_data_tensor.element_size()
+        paths_data_bytes = paths_data_tensor.numel() * paths_data_tensor.element_size()
+        edges_data_bytes = edges_data_tensor.numel() * edges_data_tensor.element_size()
         val_data_bytes = val_data_tensor.numel() * val_data_tensor.element_size()
-        total_dataset_bytes = train_data_bytes + val_data_bytes
+        total_dataset_bytes = paths_data_bytes + edges_data_bytes + val_data_bytes
         
         # Get available GPU memory
         torch.cuda.empty_cache()
@@ -761,7 +801,8 @@ def train(config=None):
         vram_limit = available_vram * 0.5
         
         print(f"\n=== Dataset Memory Policy Check ===")
-        print(f"Train dataset size: {train_data_bytes / 1e9:.3f} GB ({train_data_tensor.shape})")
+        print(f"Paths dataset size: {paths_data_bytes / 1e9:.3f} GB ({paths_data_tensor.shape})")
+        print(f"Edges dataset size: {edges_data_bytes / 1e9:.3f} GB ({edges_data_tensor.shape})")
         print(f"Val dataset size: {val_data_bytes / 1e9:.3f} GB ({val_data_tensor.shape})")
         print(f"Total dataset size: {total_dataset_bytes / 1e9:.3f} GB")
         print(f"Available VRAM: {available_vram / 1e9:.3f} GB")
@@ -769,7 +810,8 @@ def train(config=None):
         
         if total_dataset_bytes <= vram_limit:
             print("✓ Datasets fit within memory limit - loading to GPU for faster training")
-            train_data_tensor = train_data_tensor.pin_memory().to(device, non_blocking=True)
+            paths_data_tensor = paths_data_tensor.pin_memory().to(device, non_blocking=True)
+            edges_data_tensor = edges_data_tensor.pin_memory().to(device, non_blocking=True)
             val_data_tensor = val_data_tensor.pin_memory().to(device, non_blocking=True)
             datasets_on_gpu = True
         else:
@@ -779,79 +821,140 @@ def train(config=None):
     else:
         # For non-CUDA devices, always keep on CPU or move to device as appropriate
         if device_type != 'cpu':
-            train_data_tensor = train_data_tensor.to(device)
+            paths_data_tensor = paths_data_tensor.to(device)
+            edges_data_tensor = edges_data_tensor.to(device)
             val_data_tensor = val_data_tensor.to(device)
             datasets_on_gpu = True
         else:
             datasets_on_gpu = False
     
     # Keep NumPy versions for evaluate_samples (will optimize separately)
-    train_data_np = train_data
+    paths_data_np = paths_data
     val_data_np = val_data
     
     # Initialize epoch indices for sampling without replacement
-    train_epoch_indices = np.arange(train_size)
+    paths_epoch_indices = np.arange(paths_size)
+    edges_epoch_indices = np.arange(edges_size)
     val_epoch_indices = np.arange(val_size)
-    train_batch_idx = 0
+    paths_batch_idx = 0
+    edges_batch_idx = 0
     val_batch_idx = 0
     
-    def get_batch(split):
-        """Sample a batch from the dataset (handles both GPU and CPU tensors)"""
-        nonlocal train_batch_idx, val_batch_idx, train_epoch_indices, val_epoch_indices
-        
-        # Select dataset and indices
-        if split == 'train':
-            data_tensor = train_data_tensor
-            batch_idx = train_batch_idx
-            epoch_indices = train_epoch_indices
-            dataset_size = train_size
-            seq_length = train_seq_length
-            batch_size = train_batch_size
-        else:
-            data_tensor = val_data_tensor
-            batch_idx = val_batch_idx
-            epoch_indices = val_epoch_indices
-            dataset_size = val_size
-            seq_length = val_seq_length
-            batch_size = val_batch_size
+    def get_edge_batch():
+        """Sample a batch from the edge dataset"""
+        nonlocal edges_batch_idx, edges_epoch_indices
         
         # Check if we need to shuffle for new epoch
-        if batch_idx == 0:
-            np.random.shuffle(epoch_indices)
+        if edges_batch_idx == 0:
+            np.random.shuffle(edges_epoch_indices)
         
         # Get batch indices
-        start_idx = batch_idx * batch_size
-        end_idx = min(start_idx + batch_size, dataset_size)
-        batch_seq_indices = epoch_indices[start_idx:end_idx]
+        start_idx = edges_batch_idx * train_batch_size
+        end_idx = min(start_idx + train_batch_size, edges_size)
+        batch_seq_indices = edges_epoch_indices[start_idx:end_idx]
         
         actual_batch_size = len(batch_seq_indices)
         
         # Update batch index for next call
-        if split == 'train':
-            train_batch_idx = (batch_idx + 1) if end_idx < dataset_size else 0
-        else:
-            val_batch_idx = (batch_idx + 1) if end_idx < dataset_size else 0
+        edges_batch_idx = (edges_batch_idx + 1) if end_idx < edges_size else 0
         
         # Extract sequences (from GPU if available, otherwise from CPU and transfer)
         if datasets_on_gpu:
-            # Fast path: data already on GPU
-            sequences = data_tensor[batch_seq_indices]
+            sequences = edges_data_tensor[batch_seq_indices]
         else:
-            # Slower path: index CPU tensor and transfer to GPU
-            sequences = data_tensor[batch_seq_indices]
+            sequences = edges_data_tensor[batch_seq_indices]
             if device_type == 'cuda':
                 sequences = sequences.to(device, non_blocking=True)
         
         # Pad or truncate to block_size if needed
-        if seq_length < meta['block_size']:
-            raise ValueError(f"Sequence length ({seq_length}) is less than block_size ({meta['block_size']}). This should not happen.")
-            pad_value = pad_token_id if pad_token_id is not None else 0
-            padding = torch.full((actual_batch_size, meta['block_size'] - seq_length), pad_value, 
-                                dtype=torch.long, device=sequences.device)
-            sequences = torch.cat([sequences, padding], dim=1)
-        elif seq_length > meta['block_size']:
-            raise ValueError(f"Sequence length ({seq_length}) exceeds block_size ({meta['block_size']}). This should not happen.")
-            sequences = sequences[:, :meta['block_size']]
+        if edges_seq_length < meta['block_size']:
+            raise ValueError(f"Sequence length ({edges_seq_length}) is less than block_size ({meta['block_size']}). This should not happen.")
+        elif edges_seq_length > meta['block_size']:
+            raise ValueError(f"Sequence length ({edges_seq_length}) exceeds block_size ({meta['block_size']}). This should not happen.")
+        
+        # Create input (x) and target (y) by shifting
+        x = sequences[:, :-1].clone()
+        y = sequences[:, 1:].clone()
+        
+        # Mask PAD tokens in targets
+        if pad_token_id is not None:
+            y[y == pad_token_id] = -1
+        
+        return x, y
+    
+    def get_path_batch():
+        """Sample a batch from the path dataset"""
+        nonlocal paths_batch_idx, paths_epoch_indices
+        
+        # Check if we need to shuffle for new epoch
+        if paths_batch_idx == 0:
+            np.random.shuffle(paths_epoch_indices)
+        
+        # Get batch indices
+        start_idx = paths_batch_idx * train_batch_size
+        end_idx = min(start_idx + train_batch_size, paths_size)
+        batch_seq_indices = paths_epoch_indices[start_idx:end_idx]
+        
+        actual_batch_size = len(batch_seq_indices)
+        
+        # Update batch index for next call
+        paths_batch_idx = (paths_batch_idx + 1) if end_idx < paths_size else 0
+        
+        # Extract sequences (from GPU if available, otherwise from CPU and transfer)
+        if datasets_on_gpu:
+            sequences = paths_data_tensor[batch_seq_indices]
+        else:
+            sequences = paths_data_tensor[batch_seq_indices]
+            if device_type == 'cuda':
+                sequences = sequences.to(device, non_blocking=True)
+        
+        # Pad or truncate to block_size if needed
+        if paths_seq_length < meta['block_size']:
+            raise ValueError(f"Sequence length ({paths_seq_length}) is less than block_size ({meta['block_size']}). This should not happen.")
+        elif paths_seq_length > meta['block_size']:
+            raise ValueError(f"Sequence length ({paths_seq_length}) exceeds block_size ({meta['block_size']}). This should not happen.")
+        
+        # Create input (x) and target (y) by shifting
+        x = sequences[:, :-1].clone()
+        y = sequences[:, 1:].clone()
+        
+        # Mask PAD tokens in targets
+        if pad_token_id is not None:
+            y[y == pad_token_id] = -1
+        
+        return x, y
+    
+    def get_val_batch():
+        """Sample a batch from the validation dataset"""
+        nonlocal val_batch_idx, val_epoch_indices
+        
+        # Check if we need to shuffle for new epoch
+        if val_batch_idx == 0:
+            np.random.shuffle(val_epoch_indices)
+        
+        # Get batch indices
+        start_idx = val_batch_idx * val_batch_size
+        end_idx = min(start_idx + val_batch_size, val_size)
+        batch_seq_indices = val_epoch_indices[start_idx:end_idx]
+        
+        actual_batch_size = len(batch_seq_indices)
+        
+        # Update batch index for next call
+        val_batch_idx = (val_batch_idx + 1) if end_idx < val_size else 0
+        
+        # Extract sequences (from GPU if available, otherwise from CPU and transfer)
+        if datasets_on_gpu:
+            sequences = val_data_tensor[batch_seq_indices]
+        else:
+            sequences = val_data_tensor[batch_seq_indices]
+            if device_type == 'cuda':
+                sequences = sequences.to(device, non_blocking=True)
+        
+        # Pad or truncate to block_size if needed
+        if val_seq_length < meta['block_size']:
+            raise ValueError(f"Sequence length ({val_seq_length}) is less than block_size ({meta['block_size']}). This should not happen.")
+        elif val_seq_length > meta['block_size']:
+            raise ValueError(f"Sequence length ({val_seq_length}) exceeds block_size ({meta['block_size']}). This should not happen.")
         
         # Create input (x) and target (y) by shifting
         x = sequences[:, :-1].clone()
@@ -866,38 +969,25 @@ def train(config=None):
     
     @torch.no_grad()
     def estimate_loss():
-        """Estimate loss on train/val splits"""
+        """Estimate loss on validation split"""
         out = {}
         model.eval()
-        iters_dict = {'train': eval_iters, 'val': int(np.ceil(num_holdout / val_batch_size))}
         
-        train_token_losses = {1: []}
         val_token_losses = {i: [] for i in range(1, graph_length + 1)}
+        losses = torch.zeros(eval_iters)
         
-        for split in ['train', 'val']:
-            losses = torch.zeros(iters_dict[split])
-            for k in range(iters_dict[split]):
-                X, Y = get_batch(split)
-                with ctx:
-                    logits, loss = model(X, Y, label_smoothing=default_config['label_smoothing'])
-                losses[k] = loss.item()
-                
-                if split == 'train':
-                    batch_per_token = compute_per_token_loss_with_teacher_forcing(meta, logits, X, Y, [1], debug=False, split='train')
-                    if 1 in batch_per_token:
-                        train_token_losses[1].append(batch_per_token[1])
-                else:
-                    batch_per_token = compute_per_token_loss_with_teacher_forcing(meta, logits, X, Y, range(1, graph_length + 1), debug=False, split='val')
-                    for token_pos, token_loss in batch_per_token.items():
-                        if not math.isnan(token_loss):
-                            val_token_losses[token_pos].append(token_loss)
+        for k in range(eval_iters):
+            X, Y = get_val_batch()
+            with ctx:
+                logits, loss = model(X, Y, label_smoothing=default_config['label_smoothing'])
+            losses[k] = loss.item()
             
-            out[split] = losses.mean()
+            batch_per_token = compute_per_token_loss_with_teacher_forcing(meta, logits, X, Y, range(1, graph_length + 1), task_type='path', debug=False, split='val')
+            for token_pos, token_loss in batch_per_token.items():
+                if not math.isnan(token_loss):
+                    val_token_losses[token_pos].append(token_loss)
         
-        if train_token_losses[1]:
-            out['train_per_token'] = {1: np.mean(train_token_losses[1])}
-        else:
-            out['train_per_token'] = {1: float('nan')}
+        out['val'] = losses.mean()
         
         if val_token_losses[1]:
             out['val_per_token'] = {
@@ -915,11 +1005,20 @@ def train(config=None):
         model.train()
         return out
     
-    # Training loop
-    X, Y = get_batch('train')
+    # Training loop with interleaved edge and path training
     t0 = time.time()
     local_iter_num = 0
     running_mfu = -1.0
+    
+    # Track which phase we're in (edge or path)
+    current_phase = 'edge'  # Start with edges
+    phase_iteration_count = 0
+    
+    # Initialize with first batch
+    if current_phase == 'edge':
+        X, Y = get_edge_batch()
+    else:
+        X, Y = get_path_batch()
     
     while True:
         # Set learning rate
@@ -932,13 +1031,9 @@ def train(config=None):
         if iter_num % default_config['eval_interval'] == 0:
             losses = estimate_loss()
             
-            samples_processed = iter_num * train_batch_size * default_config['gradient_accumulation_steps']
-            current_epoch = samples_processed / TRAIN_DATASET_SIZE
+            current_epoch = iter_num / batches_per_epoch
             
-            print(f"step {iter_num}: epoch {current_epoch:.2f}, train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-            
-            if 'train_per_token' in losses and 1 in losses['train_per_token']:
-                print(f"  Train 1st token loss: {losses['train_per_token'][1]:.4f}")
+            print(f"step {iter_num}: epoch {current_epoch:.2f}, val loss {losses['val']:.4f}")
             
             if 'val_per_token' in losses:
                 print("  Val per-token losses:")
@@ -965,23 +1060,18 @@ def train(config=None):
             is_sweep_mode = wandb.run is not None and hasattr(wandb.run, 'sweep_id') and wandb.run.sweep_id is not None
             eval_samples = 20 if is_sweep_mode else 100
             val_avg_accuracy = evaluate_samples(device, ctx, model,  meta, val_data_np, val_size, 'val', num_samples=min(val_size, eval_samples))
-            train_avg_accuracy = evaluate_samples(device, ctx, model, meta, train_data_np, train_size, 'train', num_samples=min(replicated_train_paths, eval_samples))
+            train_avg_accuracy = evaluate_samples(device, ctx, model, meta, paths_data_np, paths_size, 'train', num_samples=min(paths_size, eval_samples))
             
             if default_config['wandb_log']:
                 log_dict = {
                     "iter": iter_num,
-                    "epoch": round(iter_num / batch_per_dataset, 4),
-                    "train/loss/overall": losses['train'],
+                    "epoch": round(current_epoch, 4),
                     "val/loss/overall": losses['val'],
                     "lr": lr,
                     "mfu": running_mfu*100,
                     "gen/val_avg_accuracy": val_avg_accuracy,
                     "gen/train_avg_accuracy": train_avg_accuracy
                 }
-                
-                if 'train_per_token' in losses and 1 in losses['train_per_token']:
-                    log_dict["train/loss/token_1"] = losses['train_per_token'][1]
-                    log_dict["train/loss/token_1_baseline"] = theoretical_token_1_loss
                 
                 if 'val_per_token' in losses:
                     for token_pos in range(1, graph_length + 1):
@@ -1031,7 +1121,10 @@ def train(config=None):
             
             # Prefetch next batch while backward pass runs (overlap I/O with compute)
             if micro_step < default_config['gradient_accumulation_steps'] - 1:
-                X_next, Y_next = get_batch('train')
+                if current_phase == 'edge':
+                    X_next, Y_next = get_edge_batch()
+                else:
+                    X_next, Y_next = get_path_batch()
             
             scaler.scale(loss).backward()
             
@@ -1039,8 +1132,30 @@ def train(config=None):
             if micro_step < default_config['gradient_accumulation_steps'] - 1:
                 X, Y = X_next, Y_next
         
+        # Determine next batch based on interleaving schedule
+        # Check if we've completed the current phase's iterations
+        if current_phase == 'edge':
+            phase_iteration_count += 1
+            if phase_iteration_count >= edge_iterations_per_epoch * edge_batches_per_iteration:
+                # Switch to path phase
+                current_phase = 'path'
+                phase_iteration_count = 0
+                # Reset batch indices for new phase
+                paths_batch_idx = 0
+        else:  # path phase
+            phase_iteration_count += 1
+            if phase_iteration_count >= path_iterations_per_epoch * path_batches_per_iteration:
+                # Switch back to edge phase (new epoch)
+                current_phase = 'edge'
+                phase_iteration_count = 0
+                # Reset batch indices for new phase
+                edges_batch_idx = 0
+        
         # Get batch for next iteration
-        X, Y = get_batch('train')
+        if current_phase == 'edge':
+            X, Y = get_edge_batch()
+        else:
+            X, Y = get_path_batch()
         
         # Clip gradients
         if default_config['grad_clip'] != 0.0:

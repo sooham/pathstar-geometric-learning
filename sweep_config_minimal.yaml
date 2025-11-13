@@ -9,35 +9,37 @@ metric:
 parameters:
   # Dataset parameters - small fixed values for quick iteration
   graph_d:
-    values: [5000]
+    values: [1000]
   graph_l:
     value: 5
   graph_vocab_size:
     value: '1max'
   graph_holdout_percentage:
-    value: 0.5
+    value: 0.2
   num_pause_tokens:
-    values: [4]
+    values: [1]
   use_undirected:
     value: true
   use_directional_tokens:
     value: true
+  use_task_tokens:
+    value: false
   
   # Model architecture parameters - sweep these
   n_layer:
-    values: [12]
+    values: [5]
   n_head:
     values: [8]
   n_embd:
-    values: [384]
+    values: [64]
   dropout:
-    values: [0.01]
+    values: [0]
   bias:
     value: false
   
   # Training hyperparameters - sweep learning rate
   learning_rate:
-    value: 1e-5
+    value: 1e-3
   label_smoothing:
     value: 0.1
   weight_decay:
@@ -61,7 +63,7 @@ parameters:
   
   # Fixed training parameters
   epochs:
-    value: 5000  # Shorter for quick testing
+    value: 1000  # Shorter for quick testing
   gradient_accumulation_steps:
     value: 8  # Reduced from 4 for fewer optimizer steps, better GPU utilization
   compile:
@@ -69,5 +71,5 @@ parameters:
   eval_interval:
     value: 100  # Increased from 50 to reduce evaluation overhead
   log_interval:
-    value: 50  # Increased from 10 to reduce print overhead
+    value: 10  # Increased from 10 to reduce print overhead
 
