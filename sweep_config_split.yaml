@@ -9,7 +9,7 @@ metric:
 parameters:
   # Dataset parameters - small fixed values for quick iteration
   graph_d:
-    values: [1000]
+    values: [5000]
   graph_l:
     value: 5
   graph_vocab_size:
@@ -27,11 +27,11 @@ parameters:
   
   # Model architecture parameters - sweep these
   n_layer:
-    values: [12]
+    values: [9]
   n_head:
     values: [8]
   n_embd:
-    values: [384]
+    values: [64]
   dropout:
     values: [0.01]
   bias:
@@ -53,7 +53,7 @@ parameters:
   
   # Learning rate schedule
   decay_lr:
-    value: false
+    value: true
   warmup_frac:
     value: 0.10
   lr_decay_frac:
@@ -63,13 +63,13 @@ parameters:
   
   # Fixed training parameters
   epochs:
-    value: 5000  # Shorter for quick testing
+    value: 1000  # Shorter for quick testing
   edge_iterations_per_epoch: 
-    value: 1  # 10k edges total 
+    value: 100 # 8k edges total 
   path_iterations_per_epoch: 
-    value: 12  # 200 paths in validation, 800 paths in training 
+    value: 100  # 200 paths in validation, 800 paths in training 
   gradient_accumulation_steps:
-    value: 2  # Reduced from 4 for fewer optimizer steps, better GPU utilization
+    value: 9  # Reduced from 4 for fewer optimizer steps, better GPU utilization
   compile:
     value: true
   eval_interval:

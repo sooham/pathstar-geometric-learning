@@ -449,7 +449,7 @@ def get_theoretical_loss(meta):
     return theoretical_token_1_loss
     
 def calculate_optimal_batch_size_for_training(model, block_size, vocab_size, device, dtype, 
-                                    gradient_accumulation_steps, safety_factor=0.90):
+                                    gradient_accumulation_steps, safety_factor=0.90, reserved_memory=0):
     """
     Calculate maximum safe batch size based on available GPU memory.
     
@@ -461,7 +461,8 @@ def calculate_optimal_batch_size_for_training(model, block_size, vocab_size, dev
     - Output logits: batch_size × seq_len × vocab_size (MAJOR memory consumer!)
     
     Args:
-        safety_factor: Use 70% of available memory (conservative for torch.compile)
+        safety_factor: Use 90% of available memory (conservative for torch.compile)
+        reserved_memory: Memory reserved for datasets (in bytes). Will be subtracted from available memory.
     
     Returns:
         max_batch_size: Maximum safe batch size
@@ -477,7 +478,7 @@ def calculate_optimal_batch_size_for_training(model, block_size, vocab_size, dev
     props = torch.cuda.get_device_properties(device)
     total_memory = props.total_memory
     allocated_memory = torch.cuda.memory_allocated(device)
-    available_memory = (total_memory - allocated_memory) * safety_factor
+    available_memory = (total_memory - allocated_memory) * safety_factor - reserved_memory
     
     # Bytes per parameter based on dtype
     bytes_per_param = 2 if dtype in ['float16', 'bfloat16'] else 4
@@ -551,6 +552,8 @@ def calculate_optimal_batch_size_for_training(model, block_size, vocab_size, dev
     print(f"GPU: {props.name}")
     print(f"Total VRAM: {total_memory/1e9:.2f} GB")
     print(f"Currently allocated: {allocated_memory/1e9:.2f} GB")
+    if reserved_memory > 0:
+        print(f"Reserved for datasets: {reserved_memory/1e9:.2f} GB")
     print(f"Available for batches: {memory_for_batch/1e9:.2f} GB")
     print(f"Static memory breakdown:")
     print(f"  - Model params: {model_memory/1e9:.2f} GB ({num_params:,} params)")
@@ -670,9 +673,63 @@ def train(config=None):
 
     model, model_args, checkpoint, iter_num, best_val_loss = initalize_model(device, meta, default_config, checkpoint_filename)
 
+    # Calculate dataset structure from metadata (needed for memory calculation)
+    VAL_DATASET_SIZE = meta['VAL_DATASET_SIZE']
+    val_size = meta.get('val_size', VAL_DATASET_SIZE)
+    
+    # Calculate sequence lengths
+    paths_seq_length = len(paths_data) // paths_size
+    edges_seq_length = len(edges_data) // edges_size
+    val_seq_length = len(val_data) // val_size
+    
+    # Reshape data for easier indexing (needed for memory calculation)
+    paths_data = paths_data.reshape(paths_size, paths_seq_length)
+    edges_data = edges_data.reshape(edges_size, edges_seq_length)
+    val_data = val_data.reshape(val_size, val_seq_length)
+    
+    # Calculate dataset memory requirements BEFORE batch size calculation
+    # This ensures batch size accounts for dataset memory if it will be loaded to GPU
+    dataset_reserved_memory = 0
+    if device_type == 'cuda':
+        paths_data_tensor_temp = torch.from_numpy(paths_data.astype(np.int64))
+        edges_data_tensor_temp = torch.from_numpy(edges_data.astype(np.int64))
+        val_data_tensor_temp = torch.from_numpy(val_data.astype(np.int64))
+        
+        paths_data_bytes = paths_data_tensor_temp.numel() * paths_data_tensor_temp.element_size()
+        edges_data_bytes = edges_data_tensor_temp.numel() * edges_data_tensor_temp.element_size()
+        val_data_bytes = val_data_tensor_temp.numel() * val_data_tensor_temp.element_size()
+        total_dataset_bytes = paths_data_bytes + edges_data_bytes + val_data_bytes
+        
+        # Get available GPU memory (before model is fully loaded)
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        props_temp = torch.cuda.get_device_properties(device)
+        total_vram = props_temp.total_memory
+        allocated_vram = torch.cuda.memory_allocated(device)
+        available_vram = total_vram - allocated_vram
+        
+        # Policy: Only reserve memory if datasets use < 50% of available VRAM
+        vram_limit = available_vram * 0.5
+        
+        if total_dataset_bytes <= vram_limit:
+            # Datasets will be loaded to GPU, so reserve this memory
+            dataset_reserved_memory = total_dataset_bytes
+            print(f"\n=== Pre-calculation: Dataset Memory Check ===")
+            print(f"Total dataset size: {total_dataset_bytes / 1e9:.3f} GB")
+            print(f"VRAM limit (50%): {vram_limit / 1e9:.3f} GB")
+            print(f"✓ Datasets will be loaded to GPU - reserving {dataset_reserved_memory / 1e9:.3f} GB for batch size calculation")
+            print(f"============================================\n")
+        else:
+            print(f"\n=== Pre-calculation: Dataset Memory Check ===")
+            print(f"Total dataset size: {total_dataset_bytes / 1e9:.3f} GB")
+            print(f"VRAM limit (50%): {vram_limit / 1e9:.3f} GB")
+            print(f"✗ Datasets will stay on CPU - no memory reservation needed")
+            print(f"============================================\n")
+    
     train_batch_size = calculate_optimal_batch_size_for_training(
         model, meta['block_size'], meta['vocab_size'], device, dtype,
-        default_config['gradient_accumulation_steps']
+        default_config['gradient_accumulation_steps'],
+        reserved_memory=dataset_reserved_memory
     )
     
     # Calculate training iteration parameters
@@ -686,6 +743,13 @@ def train(config=None):
     edge_batches_per_iteration = int(np.ceil(edges_size / (train_batch_size * default_config['gradient_accumulation_steps'])))
     path_batches_per_iteration = int(np.ceil(paths_size / (train_batch_size * default_config['gradient_accumulation_steps'])))
     
+    print(f"\n=== Training Schedule ===")
+    print(f"Edge batches per iteration: {edge_batches_per_iteration}")
+    print(f"Path batches per iteration: {path_batches_per_iteration}")
+    print(f"Edge iterations per epoch: {edge_iterations_per_epoch}")
+    print(f"Path iterations per epoch: {path_iterations_per_epoch}")
+    print(f"=========================\n")
+
     # One epoch = A edge iterations + B path iterations
     batches_per_epoch = edge_iterations_per_epoch * edge_batches_per_iteration + path_iterations_per_epoch * path_batches_per_iteration
     max_iters = default_config['epochs'] * batches_per_epoch
@@ -754,14 +818,6 @@ def train(config=None):
     if itos:
         print(f"Loaded vocabulary mappings: {len(itos)} tokens")
     
-    # Calculate dataset structure from metadata
-    val_size = meta.get('val_size', VAL_DATASET_SIZE)
-    
-    # Calculate sequence lengths
-    paths_seq_length = len(paths_data) // paths_size
-    edges_seq_length = len(edges_data) // edges_size
-    val_seq_length = len(val_data) // val_size
-    
     print(f"Dataset info:")
     print(f"  Paths: {paths_size} sequences of length {paths_seq_length}")
     print(f"  Edges: {edges_size} sequences of length {edges_seq_length}")
@@ -771,53 +827,28 @@ def train(config=None):
     assert paths_seq_length == edges_seq_length, f"Sequence length mismatch: paths={paths_seq_length}, edges={edges_seq_length}"
     assert val_size == VAL_DATASET_SIZE, f"Val size mismatch: {val_size} != {VAL_DATASET_SIZE}"
     
-    # Reshape data for easier indexing
-    paths_data = paths_data.reshape(paths_size, paths_seq_length)
-    edges_data = edges_data.reshape(edges_size, edges_seq_length)
-    val_data = val_data.reshape(val_size, val_seq_length)
-    
-    # Determine if datasets can fit in GPU memory (policy: use at most 50% of available VRAM)
+    # Create tensors and load to GPU if pre-calculated decision indicates they fit
     paths_data_tensor = torch.from_numpy(paths_data.astype(np.int64))
     edges_data_tensor = torch.from_numpy(edges_data.astype(np.int64))
     val_data_tensor = torch.from_numpy(val_data.astype(np.int64))
     
     datasets_on_gpu = False
     if device_type == 'cuda':
-        # Calculate dataset memory requirements
-        paths_data_bytes = paths_data_tensor.numel() * paths_data_tensor.element_size()
-        edges_data_bytes = edges_data_tensor.numel() * edges_data_tensor.element_size()
-        val_data_bytes = val_data_tensor.numel() * val_data_tensor.element_size()
-        total_dataset_bytes = paths_data_bytes + edges_data_bytes + val_data_bytes
-        
-        # Get available GPU memory
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-        props = torch.cuda.get_device_properties(device)
-        total_vram = props.total_memory
-        allocated_vram = torch.cuda.memory_allocated(device)
-        available_vram = total_vram - allocated_vram
-        
-        # Policy: Only load to GPU if datasets use < 50% of available VRAM
-        vram_limit = available_vram * 0.5
-        
-        print(f"\n=== Dataset Memory Policy Check ===")
-        print(f"Paths dataset size: {paths_data_bytes / 1e9:.3f} GB ({paths_data_tensor.shape})")
-        print(f"Edges dataset size: {edges_data_bytes / 1e9:.3f} GB ({edges_data_tensor.shape})")
-        print(f"Val dataset size: {val_data_bytes / 1e9:.3f} GB ({val_data_tensor.shape})")
-        print(f"Total dataset size: {total_dataset_bytes / 1e9:.3f} GB")
-        print(f"Available VRAM: {available_vram / 1e9:.3f} GB")
-        print(f"VRAM limit (50%): {vram_limit / 1e9:.3f} GB")
-        
-        if total_dataset_bytes <= vram_limit:
-            print("✓ Datasets fit within memory limit - loading to GPU for faster training")
+        # Use pre-calculated decision: if reserved_memory > 0, datasets will be loaded to GPU
+        if dataset_reserved_memory > 0:
+            print(f"\n=== Loading Datasets to GPU ===")
+            print(f"Reserved memory: {dataset_reserved_memory / 1e9:.3f} GB")
+            print("✓ Loading datasets to GPU for faster training")
             paths_data_tensor = paths_data_tensor.pin_memory().to(device, non_blocking=True)
             edges_data_tensor = edges_data_tensor.pin_memory().to(device, non_blocking=True)
             val_data_tensor = val_data_tensor.pin_memory().to(device, non_blocking=True)
             datasets_on_gpu = True
+            print(f"===================================\n")
         else:
-            print("✗ Datasets exceed memory limit - keeping on CPU (will transfer batches on-demand)")
+            print(f"\n=== Dataset Loading Decision ===")
+            print("✗ Datasets will stay on CPU (will transfer batches on-demand)")
+            print(f"===================================\n")
             datasets_on_gpu = False
-        print(f"===================================\n")
     else:
         # For non-CUDA devices, always keep on CPU or move to device as appropriate
         if device_type != 'cpu':
@@ -970,6 +1001,12 @@ def train(config=None):
     @torch.no_grad()
     def estimate_loss():
         """Estimate loss on validation split"""
+        # Reset validation batch state for reproducible evaluation
+        # This ensures each evaluation starts from the beginning
+        nonlocal val_batch_idx, val_epoch_indices
+        val_batch_idx = 0
+        np.random.shuffle(val_epoch_indices)
+        
         out = {}
         model.eval()
         
@@ -1065,12 +1102,14 @@ def train(config=None):
             if default_config['wandb_log']:
                 log_dict = {
                     "iter": iter_num,
+                    'max_iters': max_iters,
+                    'warmup_iters': warmup_iters,
                     "epoch": round(current_epoch, 4),
                     "val/loss/overall": losses['val'],
                     "lr": lr,
                     "mfu": running_mfu*100,
-                    "gen/val_avg_accuracy": val_avg_accuracy,
-                    "gen/train_avg_accuracy": train_avg_accuracy
+                    "gen/val_paths_avg_accuracy": val_avg_accuracy,
+                    "gen/train_paths_avg_accuracy": train_avg_accuracy
                 }
                 
                 if 'val_per_token' in losses:
@@ -1114,13 +1153,15 @@ def train(config=None):
             break
         
         # Forward backward update with batch prefetching for better GPU utilization
-        for micro_step in range(default_config['gradient_accumulation_steps']):
+        cur_batch_size = ( edge_batches_per_iteration if current_phase == 'edge' else path_batches_per_iteration)   
+        steps = min(default_config['gradient_accumulation_steps'], cur_batch_size) 
+        for micro_step in range(steps):
             with ctx:
                 logits, loss = model(X, Y, label_smoothing=default_config['label_smoothing'])
-                loss = loss / default_config['gradient_accumulation_steps']
+                loss = loss / steps
             
             # Prefetch next batch while backward pass runs (overlap I/O with compute)
-            if micro_step < default_config['gradient_accumulation_steps'] - 1:
+            if micro_step < steps - 1:
                 if current_phase == 'edge':
                     X_next, Y_next = get_edge_batch()
                 else:
@@ -1129,7 +1170,7 @@ def train(config=None):
             scaler.scale(loss).backward()
             
             # Move prefetched batch to current (if not last step)
-            if micro_step < default_config['gradient_accumulation_steps'] - 1:
+            if micro_step < steps - 1:
                 X, Y = X_next, Y_next
         
         # Determine next batch based on interleaving schedule
@@ -1177,6 +1218,9 @@ def train(config=None):
                 running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
             phase_label = "[EDGE]" if current_phase == 'edge' else "[PATH]"
             print(f"iter {iter_num}: {phase_label} loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+            wandb.log({
+                'train/loss/overall': lossf
+            })
 
         
         iter_num += 1
