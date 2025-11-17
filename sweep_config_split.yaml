@@ -9,29 +9,29 @@ metric:
 parameters:
   # Dataset parameters - small fixed values for quick iteration
   graph_d:
-    values: [5000]
+    values: [1000,5000]
   graph_l:
     value: 5
-  graph_vocab_size:
-    value: '1max'
+  randomized_vocab_size:
+    value: 'auto'
   graph_holdout_percentage:
     value: 0.2
   num_pause_tokens:
     values: [4]
   use_undirected:
-    value: true
+    values: [true, false]
   use_directional_tokens:
-    value: false
+    value: [false, true]
   use_task_tokens:
-    value: false
+    value: [false, true]
   
   # Model architecture parameters - sweep these
   n_layer:
-    values: [9]
+    values: [1,9]
   n_head:
     values: [8]
   n_embd:
-    values: [64]
+    values: [8,64]
   dropout:
     values: [0.01]
   bias:
@@ -63,13 +63,13 @@ parameters:
   
   # Fixed training parameters
   epochs:
-    value: 1000  # Shorter for quick testing
+    value: 2000  # Shorter for quick testing
   edge_iterations_per_epoch: 
-    value: 100 # 8k edges total 
+    value: 10 # 8k edges total 
   path_iterations_per_epoch: 
-    value: 100  # 200 paths in validation, 800 paths in training 
+    value: 40  # 200 paths in validation, 800 paths in training 
   gradient_accumulation_steps:
-    value: 9  # Reduced from 4 for fewer optimizer steps, better GPU utilization
+    value: 1  # Reduced from 4 for fewer optimizer steps, better GPU utilization
   compile:
     value: true
   eval_interval:
