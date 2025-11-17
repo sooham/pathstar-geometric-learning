@@ -768,8 +768,8 @@ def train(config=None):
         default_config['wandb_run_name'] = custom_name
 
     # Validate vocab_size
-    assert default_config['randomize_vocab_size == 'auto' or (default_config['rrrandomize_vocab_size= default_config['graph_d'] * (default_config['graph_l'] - 1) + 1), \
-        f"randomize_vocab_sizeust be >= graph_d * (graph_l - 1) + 1"
+    assert default_config['randomize_vocab_size'] == 'auto' or (default_config['randomize_vocab_size']= default_config['graph_d'] * (default_config['graph_l'] - 1) + 1), \
+        f"randomize_vocab_size must be >= graph_d * (graph_l - 1) + 1"
     
     # Generate/load dataset
     gen = InWeightsPathStar(
