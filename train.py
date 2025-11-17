@@ -47,7 +47,7 @@ def get_default_config():
         # Dataset generation parameters
         'graph_d': 1000,
         'graph_l': 5,
-        'randomized_vocab_size': 'auto',
+        'randomize_vocab_size': 'auto',
         'graph_holdout_percentage': 0.2,
         'num_pause_tokens': 5,
         'use_undirected': True,
@@ -768,14 +768,14 @@ def train(config=None):
         default_config['wandb_run_name'] = custom_name
 
     # Validate vocab_size
-    assert default_config['randomized_vocab_size'] >= default_config['graph_d'] * (default_config['graph_l'] - 1) + 1, \
-        f"randomized_vocab_size must be >= graph_d * (graph_l - 1) + 1"
+    assert default_config['randomize_vocab_size == 'auto' or (default_config['rrrandomize_vocab_size= default_config['graph_d'] * (default_config['graph_l'] - 1) + 1), \
+        f"randomize_vocab_sizeust be >= graph_d * (graph_l - 1) + 1"
     
     # Generate/load dataset
     gen = InWeightsPathStar(
         d=default_config['graph_d'],
         l=default_config['graph_l'],
-        randomized_vocab_size=default_config['randomized_vocab_size'],
+        randomize_vocab_sizedefault_config['rrandomize_vocab_size,
         holdout_percentage=default_config['graph_holdout_percentage'],
     )
 
@@ -838,7 +838,7 @@ def train(config=None):
     dataset_reserved_memory = determine_dataset_in_device_size(device_type, paths_data, edges_data, val_data)
     
     train_batch_size = calculate_optimal_batch_size_for_training(
-        model, meta['block_size'], meta['randomized_vocab_size'], device, dtype,
+        model, meta['block_size'], meta['randomize_vocab_size'], device, dtype,
         default_config['gradient_accumulation_steps'],
         reserved_memory=dataset_reserved_memory
     )
@@ -910,8 +910,8 @@ def train(config=None):
     # Init tracking variables
     iter_num = 0
     
-    meta_vocab_size = meta['randomized_vocab_size']
-    print(f"found randomized_vocab_size = {meta_vocab_size}")
+    meta_vocab_size = meta['randomize_vocab_size']
+    print(f"found randomize_vocab_size= {meta_vocab_size}")
     
     if 'special_tokens' in meta:
         pause_token_id = meta['special_tokens'].get('PAUSE')

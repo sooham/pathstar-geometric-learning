@@ -12,7 +12,7 @@ parameters:
     values: [1000,5000]
   graph_l:
     value: 5
-  randomized_vocab_size:
+  randomize_vocab_size:
     value: 'auto'
   graph_holdout_percentage:
     value: 0.2
