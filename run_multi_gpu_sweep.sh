@@ -43,21 +43,22 @@ cleanup() {
 trap cleanup SIGINT SIGTERM EXIT
 
 if [ "$#" -lt 1 ]; then
-    echo "Usage: $0 <sweep_config.yaml> [num_runs_per_gpu] [project_name] [entity_name]"
-    echo "Example: $0 sweep_config_minimal.yaml 3 pathstar_sweep my_entity"
+    echo "Usage: $0 <sweep_config.yaml> [project_name] [entity_name]"
+    echo "Example: $0 sweep_config_minimal.yaml pathstar_sweep my_entity"
+    echo ""
+    echo "Note: For grid search, runs are automatically calculated and distributed across GPUs."
+    echo "      For bayes/random search, agents will run until manually stopped."
     exit 1
 fi
 
 SWEEP_CONFIG=$1
-NUM_RUNS=${2:-10}  # Default 10 runs per GPU
-PROJECT=${3:-pathstar_sweep_dataset}  # Default project name
-ENTITY=${4:-}  # Optional entity name
+PROJECT=${2:-pathstar_sweep_dataset}  # Default project name
+ENTITY=${3:-}  # Optional entity name
 
 echo "========================================="
 echo "Multi-GPU Sweep Runner"
 echo "========================================="
 echo "Sweep Config: $SWEEP_CONFIG"
-echo "Runs per GPU: $NUM_RUNS"
 echo "Project: $PROJECT"
 if [ -n "$ENTITY" ]; then
     echo "Entity: $ENTITY"
@@ -109,18 +110,26 @@ echo ""
 
 if [ $NUM_GPUS -eq 0 ]; then
     echo "No GPUs detected! Running on CPU..."
-    python3 run_sweep.py --sweep_id $SWEEP_ID --project $PROJECT $ENTITY_ARG --count $NUM_RUNS
+    python3 run_sweep.py \
+        --sweep_id $SWEEP_ID \
+        --project $PROJECT \
+        --sweep_config $SWEEP_CONFIG \
+        --num_gpus 1 \
+        --gpu_id 0 \
+        $ENTITY_ARG
     exit 0
 fi
 
 # Launch agents on each GPU in the background
 for ((gpu=0; gpu<$NUM_GPUS; gpu++)); do
-    echo "Launching agent on GPU $gpu (running $NUM_RUNS experiments)..."
+    echo "Launching agent on GPU $gpu..."
     CUDA_VISIBLE_DEVICES=$gpu python3 run_sweep.py \
         --sweep_id $SWEEP_ID \
         --project $PROJECT \
+        --sweep_config $SWEEP_CONFIG \
+        --num_gpus $NUM_GPUS \
+        --gpu_id $gpu \
         $ENTITY_ARG \
-        --count $NUM_RUNS \
         > gpu_${gpu}_sweep.log 2>&1 &
     
     # Store process ID in array for cleanup
@@ -138,10 +147,16 @@ echo "========================================="
 echo "All agents launched!"
 echo "========================================="
 echo ""
+echo "Run distribution is automatic for grid search:"
+echo "  - Total runs calculated from sweep config"
+echo "  - Distributed evenly across $NUM_GPUS GPU(s)"
+echo "  - Each agent knows exactly how many runs to execute"
+echo ""
 echo "Monitor progress:"
 echo "  - wandb dashboard: https://wandb.ai/<your-entity>/$PROJECT/sweeps/$SWEEP_ID"
-echo "  - GPU 0 log: tail -f gpu_0_sweep.log"
-echo "  - GPU 1 log: tail -f gpu_1_sweep.log"
+for ((gpu=0; gpu<$NUM_GPUS; gpu++)); do
+    echo "  - GPU $gpu log: tail -f gpu_${gpu}_sweep.log"
+done
 echo ""
 echo "To stop all agents:"
 echo "  Press Ctrl+C or run: pkill -f 'run_sweep.py --sweep_id $SWEEP_ID'"

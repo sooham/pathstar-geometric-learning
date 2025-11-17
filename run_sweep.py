@@ -1,16 +1,28 @@
 """
 Script to launch wandb sweeps for hyperparameter optimization.
 
+Features:
+    - Automatic run calculation for grid search from YAML config
+    - Intelligent distribution across multiple GPUs
+    - Manual count override available if needed
+
 Usage:
-    # Single GPU
+    # Easy multi-GPU (recommended) - uses run_multi_gpu_sweep.sh
+    ./run_multi_gpu_sweep.sh sweep_config.yaml [project_name] [entity_name]
+    
+    # Single GPU with auto-count (for grid search)
+    python run_sweep.py --sweep_config sweep_config.yaml
+    
+    # Single GPU with manual count
     python run_sweep.py --sweep_config sweep_config.yaml --count 10
     
-    # Multi-GPU (creates sweep, then run agents manually on each GPU)
+    # Multi-GPU (manual setup)
+    # 1. Create sweep
     python run_sweep.py --sweep_config sweep_config.yaml --create_only
-    # Then on GPU 0:
-    CUDA_VISIBLE_DEVICES=0 python run_sweep.py --sweep_id <sweep_id> --count 10
-    # And on GPU 1:
-    CUDA_VISIBLE_DEVICES=1 python run_sweep.py --sweep_id <sweep_id> --count 10
+    
+    # 2. Launch agents (auto-distributes grid search runs)
+    CUDA_VISIBLE_DEVICES=0 python run_sweep.py --sweep_id <sweep_id> --sweep_config sweep_config.yaml --num_gpus 2 --gpu_id 0
+    CUDA_VISIBLE_DEVICES=1 python run_sweep.py --sweep_id <sweep_id> --sweep_config sweep_config.yaml --num_gpus 2 --gpu_id 1
 """
 
 import argparse
@@ -20,10 +32,41 @@ import os
 import signal
 import sys
 import torch
-from train_separate import sweep_train
+from train import sweep_train
 
 # Flag to track if we're shutting down
 _shutting_down = False
+
+
+def calculate_total_runs(sweep_config):
+    """
+    Calculate total number of runs from sweep configuration.
+    Only works for grid search method.
+    
+    Returns:
+        int: Total number of runs, or None if cannot be determined
+    """
+    method = sweep_config.get('method', 'grid')
+    
+    if method != 'grid':
+        # For bayes, random, etc., there's no fixed total
+        return None
+    
+    # Count combinations for grid search
+    param_counts = []
+    for param_name, param_config in sweep_config.get('parameters', {}).items():
+        if 'values' in param_config:
+            param_counts.append(len(param_config['values']))
+    
+    if not param_counts:
+        return None
+    
+    # Calculate total combinations
+    total_runs = 1
+    for count in param_counts:
+        total_runs *= count
+    
+    return total_runs
 
 def signal_handler(signum, frame):
     """Handle interrupt signals gracefully"""
@@ -71,7 +114,7 @@ def main():
     parser.add_argument('--sweep_id', type=str, default=None,
                         help='Existing sweep ID to join (for multi-GPU)')
     parser.add_argument('--count', type=int, default=None,
-                        help='Number of runs to execute (default: run until stopped)')
+                        help='Number of runs to execute (default: auto-calculate for grid search, or run until stopped)')
     parser.add_argument('--project', type=str, default='pathstar_sweep_dataset',
                         help='Wandb project name')
     parser.add_argument('--entity', type=str, default=None,
@@ -80,6 +123,8 @@ def main():
                         help='Only create sweep and print ID, do not run agent')
     parser.add_argument('--gpu_id', type=str, default=None,
                         help='GPU ID to use (will set CUDA_VISIBLE_DEVICES)')
+    parser.add_argument('--num_gpus', type=int, default=1,
+                        help='Total number of GPUs running agents (for auto-distributing grid search runs)')
     args = parser.parse_args()
     
     # Set GPU if specified
@@ -90,6 +135,9 @@ def main():
     # Check if CUDA_VISIBLE_DEVICES is set
     cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', 'not set')
     print(f"CUDA_VISIBLE_DEVICES: {cuda_visible}")
+    
+    # Variable to store sweep config for auto-counting
+    sweep_config = None
     
     # Either create new sweep or join existing one
     if args.sweep_id:
@@ -102,6 +150,12 @@ def main():
         # We need to ensure we pass the project parameter to wandb.agent()
         if '/' not in sweep_id:
             print(f"Note: Sweep ID format is bare ID. Will use project parameter: {args.project}")
+        
+        # Try to load sweep config if provided (for auto-counting)
+        if args.sweep_config and args.count is None:
+            print(f"Loading sweep config for auto-count calculation: {args.sweep_config}")
+            with open(args.sweep_config, 'r') as f:
+                sweep_config = yaml.safe_load(f)
     else:
         # Create new sweep
         if args.sweep_config is None:
@@ -151,6 +205,28 @@ def main():
             print("\n--create_only specified. Exiting without running agent.")
             return
     
+    # Auto-calculate count if not provided and we have sweep config
+    run_count = args.count
+    if run_count is None and sweep_config is not None:
+        total_runs = calculate_total_runs(sweep_config)
+        if total_runs is not None:
+            # Distribute runs across GPUs
+            runs_per_gpu = total_runs // args.num_gpus
+            remainder = total_runs % args.num_gpus
+            
+            # Current GPU gets extra run if there's a remainder and it's one of the first GPUs
+            gpu_idx = int(args.gpu_id) if args.gpu_id is not None else 0
+            if gpu_idx < remainder:
+                run_count = runs_per_gpu + 1
+            else:
+                run_count = runs_per_gpu
+            
+            print(f"\nAuto-calculated run distribution:")
+            print(f"  Total grid search runs: {total_runs}")
+            print(f"  Number of GPUs: {args.num_gpus}")
+            print(f"  Runs per GPU: {runs_per_gpu} (+ {remainder} GPU(s) get 1 extra)")
+            print(f"  This GPU (ID {gpu_idx}): {run_count} runs")
+    
     # Run agent
     # Note: If sweep_id is in full format (entity/project/sweep_id), entity/project parameters may be ignored
     # If sweep_id is bare, we need to pass entity/project to help wandb locate the sweep
@@ -164,13 +240,13 @@ def main():
     if args.entity:
         agent_kwargs['entity'] = args.entity
     
-    if args.count:
-        print(f"\nStarting sweep agent (will run {args.count} experiments)...")
+    if run_count:
+        print(f"\nStarting sweep agent (will run {run_count} experiments)...")
         print(f"  Sweep ID: {sweep_id}")
         print(f"  Project: {args.project}")
         if args.entity:
             print(f"  Entity: {args.entity}")
-        agent_kwargs['count'] = args.count
+        agent_kwargs['count'] = run_count
         wandb.agent(**agent_kwargs)
     else:
         print(f"\nStarting sweep agent (will run until stopped)...")

@@ -5,9 +5,9 @@ import os
 import pickle
 from unittest.mock import patch, mock_open, call, Mock
 from pathstar import InWeightsPathStar
-import random
 import tempfile
 import shutil
+import math
 
 class TestInWeightsPathStar(unittest.TestCase):
     @classmethod
@@ -16,44 +16,42 @@ class TestInWeightsPathStar(unittest.TestCase):
         """
         Set up a deterministic generator instance for all tests.
         Mocks random.sample to control:
-        1. The vocabulary mapping (to be canonical: node <i> maps to i + 11).
+        1. The vocabulary mapping (to be canonical: node <i> maps to i + 6).
         2. The holdout leaf selection (to be deterministic).
         """
         
         # --- Test Parameters ---
         cls.D = 5
         cls.L = 5
-        cls.VOCAB_SIZE = 2000
-        cls.HOLDOUT_PERC = 0.5
+        cls.RANDOMIZE_VOCAB_SIZE = 2000
+        cls.HOLDOUT_PERC = 0.4  # Will result in 2 holdout leaves (ceil(5 * 0.4) = 2)
         cls.NUM_VERTICES = cls.D * (cls.L - 1) + 1  # 5 * 4 + 1 = 21
 
         # --- Mock Configuration ---
         
         # 1. Mock the __init__ mapping generation:
-        #    random.sample(range(vocab_size), num_vertices)
+        #    random.sample(range(randomize_vocab_size), num_vertices)
         #    We return [0, 1, ..., 20] so node <i> maps to <i>.
-        #    The class logic then adds 11 (for special tokens).
-        #    Final mapping: 0 -> 11, 1 -> 12, ..., 20 -> 31.
+        #    The class logic then adds 6 (for special tokens).
+        #    Final mapping: 0 -> 6, 1 -> 7, ..., 20 -> 26.
         init_mapping_call = list(range(cls.NUM_VERTICES))
 
         # 2. Mock the _setup_holdout_paths holdout selection:
-        # .  0 1 2 3 4 5
         #    Canonical leaves are [4, 8, 12, 16, 20].
-        #    Mapped leaves are [15, 19, 23, 27, 31].
-        #    num_holdout = round(5 * 0.5) = 3.
-        #    We will deterministically select [15, 23, 31] as holdout.
-        #    The call will be random.sample([15, 19, 23, 27, 31], 3)
-        holdout_selection_call = [15, 23, 31]
+        #    Mapped leaves are [10, 14, 18, 22, 26].
+        #    num_holdout = ceil(5 * 0.4) = 2.
+        #    We will deterministically select [10, 18] as holdout.
+        #    The call will be random.sample([10, 14, 18, 22, 26], 2)
+        holdout_selection_call = [10, 18]
 
-        import random
         # Configure the mock to return values based on the call signature
         def sample_side_effect(*args, **kwargs):
-            if args[0] == range(cls.VOCAB_SIZE) and args[1] == cls.NUM_VERTICES:
+            if args[0] == range(cls.RANDOMIZE_VOCAB_SIZE) and args[1] == cls.NUM_VERTICES:
                 return init_mapping_call
-            elif set(args[0]) == {15, 19, 23, 27, 31} and args[1] == 2:
+            elif set(args[0]) == {10, 14, 18, 22, 26} and args[1] == 2:
                 return holdout_selection_call
             else:
-                raise ValueError('This shouldnt happen')
+                raise ValueError(f'Unexpected random.sample call: args={args}, kwargs={kwargs}')
 
         mock_random_sample.side_effect = sample_side_effect
 
@@ -61,32 +59,32 @@ class TestInWeightsPathStar(unittest.TestCase):
         cls.gen = InWeightsPathStar(
             d=cls.D,
             l=cls.L,
-            vocab_size=cls.VOCAB_SIZE,
+            randomize_vocab_size=cls.RANDOMIZE_VOCAB_SIZE,
             holdout_percentage=cls.HOLDOUT_PERC
         )
         
         # --- Define Expected Values ---
         
-        # 11 special tokens [0-10] + 21 nodes [11-31]
-        cls.MAPPED_NODES = list(range(11, 32)) # 11 ... 31
+        # 6 special tokens [0-5] + 21 nodes [6-26]
+        cls.MAPPED_NODES = list(range(6, 27))  # 6 ... 26
         
-        # Canonical 0 -> Mapped 11
-        cls.ROOT = 11 
+        # Canonical 0 -> Mapped 6
+        cls.ROOT = 6
         
-        # Canonical [4, 8, 12, 16, 20] -> Mapped [15, 19, 23, 27, 31]
-        cls.LEAVES = [15, 19, 23, 27, 31] 
+        # Canonical [4, 8, 12, 16, 20] -> Mapped [10, 14, 18, 22, 26]
+        cls.LEAVES = [10, 14, 18, 22, 26]
         
         # From our mock:
-        cls.HOLDOUT_LEAVES = {15, 23, 31}
-        cls.TRAIN_LEAVES = {19, 27}
+        cls.HOLDOUT_LEAVES = {10, 18}
+        cls.TRAIN_LEAVES = {14, 22, 26}
         
         # Special Tokens
         cls.TOK_PAD = 0
         cls.TOK_PAUSE = 1
         cls.TOK_GT = 2
         cls.TOK_LT = 3
-        cls.TOK_PATH = 9
-        cls.TOK_EDGE = 10
+        cls.TOK_PATH = 4
+        cls.TOK_EDGE = 5
 
     def test_01_init_and_graph_structure(self):
         """
@@ -95,64 +93,64 @@ class TestInWeightsPathStar(unittest.TestCase):
         # Test basic properties
         self.assertEqual(self.gen.d, self.D)
         self.assertEqual(self.gen.l, self.L)
-        self.assertEqual(self.gen.vocab_size, self.VOCAB_SIZE)
-        self.assertEqual(self.gen.total_vert, self.NUM_VERTICES)
+        self.assertEqual(self.gen.randomize_vocab_size, self.RANDOMIZE_VOCAB_SIZE)
+        self.assertEqual(self.gen.num_vertices, self.NUM_VERTICES)
         
         # Test root and leaf nodes (post-mapping)
         self.assertEqual(self.gen.v_root, self.ROOT)
-        self.assertEqual(self.gen.v_leaf, self.LEAVES)
+        self.assertEqual(set(self.gen.v_leaf), set(self.LEAVES))
         
         # Test holdout/train split (post-mapping)
         self.assertEqual(set(self.gen.holdout_leaves), self.HOLDOUT_LEAVES)
         self.assertEqual(set(self.gen.train_leaves), self.TRAIN_LEAVES)
 
         # Test adjacency list (post-mapping)
-        # Node <i> maps to i+11
+        # Node <i> maps to i+6
         expected_adj_list = {
-            11: [12, 16, 20, 24, 28], # Root -> spoke starts
-            12: [13], 13: [14], 14: [15], 15: [], # Spoke 0
-            16: [17], 17: [18], 18: [19], 19: [], # Spoke 1
-            20: [21], 21: [22], 22: [23], 23: [], # Spoke 2
-            24: [25], 25: [26], 26: [27], 27: [], # Spoke 3
-            28: [29], 29: [30], 30: [31], 31: [], # Spoke 4
+            6: [7, 11, 15, 19, 23],  # Root -> spoke starts
+            7: [8], 8: [9], 9: [10], 10: [],  # Spoke 0
+            11: [12], 12: [13], 13: [14], 14: [],  # Spoke 1
+            15: [16], 16: [17], 17: [18], 18: [],  # Spoke 2
+            19: [20], 20: [21], 21: [22], 22: [],  # Spoke 3
+            23: [24], 24: [25], 25: [26], 26: [],  # Spoke 4
         }
         self.assertEqual(self.gen.adj_list, expected_adj_list)
         
         # Test paths_by_leaf (post-mapping)
         expected_paths = {
-            15: [11, 12, 13, 14, 15],
-            19: [11, 16, 17, 18, 19],
-            23: [11, 20, 21, 22, 23],
-            27: [11, 24, 25, 26, 27],
-            31: [11, 28, 29, 30, 31],
+            10: [6, 7, 8, 9, 10],
+            14: [6, 11, 12, 13, 14],
+            18: [6, 15, 16, 17, 18],
+            22: [6, 19, 20, 21, 22],
+            26: [6, 23, 24, 25, 26],
         }
         self.assertEqual(self.gen.paths_by_leaf, expected_paths)
 
-    @patch('random.shuffle', side_effect=lambda x: x) # No-op shuffle
+    @patch('random.shuffle', side_effect=lambda x: x)  # No-op shuffle
     def test_02_generate_edge_memorization(self, mock_shuffle):
         """
-        Tests generate_edge_memorization_training_set for all 4 combinations
+        Tests _generate_edge_memorization_training_set for all 4 combinations
         of undirected and use_directional_tokens.
         """
         # Total directed edges = D * (L-1) = 5 * 4 = 20
         
-        # --- Case 1: undirected=False, use_directional_tokens=False ---
-        edges_case_1 = self.gen.generate_edge_memorization_training_set(
-            size=20, undirected=False, use_directional_tokens=False
+        # --- Case 1: undirected=False, use_directional_tokens=False, use_task_tokens=False ---
+        edges_case_1 = self.gen._generate_edge_memorization_training_set(
+            size=20, undirected=False, use_directional_tokens=False, use_task_tokens=False
         )
         self.assertEqual(edges_case_1.shape, (20, 2))
         expected_set_1 = {
-            (11, 12), (12, 13), (13, 14), (14, 15),
-            (11, 16), (16, 17), (17, 18), (18, 19),
-            (11, 20), (20, 21), (21, 22), (22, 23),
-            (11, 24), (24, 25), (25, 26), (26, 27),
-            (11, 28), (28, 29), (29, 30), (30, 31),
+            (6, 7), (7, 8), (8, 9), (9, 10),
+            (6, 11), (11, 12), (12, 13), (13, 14),
+            (6, 15), (15, 16), (16, 17), (17, 18),
+            (6, 19), (19, 20), (20, 21), (21, 22),
+            (6, 23), (23, 24), (24, 25), (25, 26),
         }
         self.assertEqual(set(map(tuple, edges_case_1.tolist())), expected_set_1)
 
-        # --- Case 2: undirected=False, use_directional_tokens=True ---
-        edges_case_2 = self.gen.generate_edge_memorization_training_set(
-            size=20, undirected=False, use_directional_tokens=True
+        # --- Case 2: undirected=False, use_directional_tokens=True, use_task_tokens=False ---
+        edges_case_2 = self.gen._generate_edge_memorization_training_set(
+            size=20, undirected=False, use_directional_tokens=True, use_task_tokens=False
         )
         self.assertEqual(edges_case_2.shape, (20, 3))
         expected_set_2 = {
@@ -160,9 +158,9 @@ class TestInWeightsPathStar(unittest.TestCase):
         }
         self.assertEqual(set(map(tuple, edges_case_2.tolist())), expected_set_2)
 
-        # --- Case 3: undirected=True, use_directional_tokens=False ---
-        edges_case_3 = self.gen.generate_edge_memorization_training_set(
-            size=40, undirected=True, use_directional_tokens=False
+        # --- Case 3: undirected=True, use_directional_tokens=False, use_task_tokens=False ---
+        edges_case_3 = self.gen._generate_edge_memorization_training_set(
+            size=40, undirected=True, use_directional_tokens=False, use_task_tokens=False
         )
         self.assertEqual(edges_case_3.shape, (40, 2))
         expected_set_3 = set()
@@ -171,83 +169,78 @@ class TestInWeightsPathStar(unittest.TestCase):
             expected_set_3.add((v, u))
         self.assertEqual(set(map(tuple, edges_case_3.tolist())), expected_set_3)
 
-        # --- Case 4: undirected=True, use_directional_tokens=True ---
-        edges_case_4 = self.gen.generate_edge_memorization_training_set(
-            size=40, undirected=True, use_directional_tokens=True
+        # --- Case 4: undirected=True, use_directional_tokens=True, use_task_tokens=True ---
+        edges_case_4 = self.gen._generate_edge_memorization_training_set(
+            size=40, undirected=True, use_directional_tokens=True, use_task_tokens=True
         )
-        self.assertEqual(edges_case_4.shape, (40, 3))
+        self.assertEqual(edges_case_4.shape, (40, 4))  # EDGE + direction + u + v
         expected_set_4 = set()
         for (u, v) in expected_set_1:
-            expected_set_4.add((self.TOK_GT, u, v))
-            expected_set_4.add((self.TOK_LT, v, u))
+            expected_set_4.add((self.TOK_EDGE, self.TOK_GT, u, v))
+            expected_set_4.add((self.TOK_EDGE, self.TOK_LT, v, u))
         self.assertEqual(set(map(tuple, edges_case_4.tolist())), expected_set_4)
 
-    @patch('random.sample', side_effect=lambda pop, k: sorted(pop)[:k]) # Deterministic sample
+    @patch('random.sample', side_effect=lambda pop, k: sorted(pop)[:k])  # Deterministic sample
     def test_03_generate_path_prediction(self, mock_sample):
         """
-        Tests generate_path_prediction_training_set for:
+        Tests _generate_path_prediction_training_set for:
         - num_pause_tokens = 1, 2, 3
-        - obey_holdout = True (train only)
-        - holdout_only = True (holdout only)
-        - obey_holdout = False (all)
+        - split = 'train', 'val', 'all'
+        - use_task_tokens = True, False
         """
         
         # --- Paths ---
-        # Path 19 (train): [11, 16, 17, 18, 19]
-        # Path 27 (train): [11, 24, 25, 26, 27]
-        # Path 15 (holdout): [11, 12, 13, 14, 15]
-        # Path 23 (holdout): [11, 20, 21, 22, 23]
-        # Path 31 (holdout): [11, 28, 29, 30, 31]
+        # Path 14 (train): [6, 11, 12, 13, 14]
+        # Path 22 (train): [6, 19, 20, 21, 22]
+        # Path 26 (train): [6, 23, 24, 25, 26]
+        # Path 10 (holdout): [6, 7, 8, 9, 10]
+        # Path 18 (holdout): [6, 15, 16, 17, 18]
 
-        # --- Test: num_pause_tokens=1 ---
-        seq_p1 = self.gen.generate_path_prediction_training_set(
-            size=2, num_pause_tokens=1, obey_holdout=True, holdout_only=False
+        # --- Test: num_pause_tokens=1, split='train', use_task_tokens=True ---
+        seq_p1 = self.gen._generate_path_prediction_training_set(
+            size=3, split='train', num_pause_tokens=1, use_task_tokens=True
         )
-        # Mock samples [19, 27] from self.TRAIN_LEAVES
-        self.assertEqual(seq_p1.shape, (2, 8)) # 1(PATH)+1(leaf)+1(PAUSE)+5(path)
+        # Mock samples [14, 22, 26] from self.TRAIN_LEAVES
+        self.assertEqual(seq_p1.shape, (3, 8))  # 1(PATH)+1(leaf)+1(PAUSE)+5(path)
         expected_p1 = [
-            [self.TOK_PATH, 19, self.TOK_PAUSE, 11, 16, 17, 18, 19],
-            [self.TOK_PATH, 27, self.TOK_PAUSE, 11, 24, 25, 26, 27],
+            [self.TOK_PATH, 14, self.TOK_PAUSE, 6, 11, 12, 13, 14],
+            [self.TOK_PATH, 22, self.TOK_PAUSE, 6, 19, 20, 21, 22],
+            [self.TOK_PATH, 26, self.TOK_PAUSE, 6, 23, 24, 25, 26],
         ]
         self.assertTrue(torch.equal(seq_p1, torch.tensor(expected_p1)))
 
-        # --- Test: num_pause_tokens=2 ---
-        seq_p2 = self.gen.generate_path_prediction_training_set(
-            size=3, num_pause_tokens=2, obey_holdout=False, holdout_only=True
+        # --- Test: num_pause_tokens=2, split='val', use_task_tokens=True ---
+        seq_p2 = self.gen._generate_path_prediction_training_set(
+            size=2, split='val', num_pause_tokens=2, use_task_tokens=True
         )
-        # Mock samples [15, 23, 31] from self.HOLDOUT_LEAVES
-        self.assertEqual(seq_p2.shape, (3, 9)) # 1+1+2+5
+        # Mock samples [10, 18] from self.HOLDOUT_LEAVES
+        self.assertEqual(seq_p2.shape, (2, 9))  # 1+1+2+5
         expected_p2 = [
-            [self.TOK_PATH, 15, self.TOK_PAUSE, self.TOK_PAUSE, 11, 12, 13, 14, 15],
-            [self.TOK_PATH, 23, self.TOK_PAUSE, self.TOK_PAUSE, 11, 20, 21, 22, 23],
-            [self.TOK_PATH, 31, self.TOK_PAUSE, self.TOK_PAUSE, 11, 28, 29, 30, 31],
+            [self.TOK_PATH, 10, self.TOK_PAUSE, self.TOK_PAUSE, 6, 7, 8, 9, 10],
+            [self.TOK_PATH, 18, self.TOK_PAUSE, self.TOK_PAUSE, 6, 15, 16, 17, 18],
         ]
         self.assertTrue(torch.equal(seq_p2, torch.tensor(expected_p2)))
 
-        # --- Test: num_pause_tokens=3 ---
-        seq_p3 = self.gen.generate_path_prediction_training_set(
-            size=5, num_pause_tokens=3, obey_holdout=False, holdout_only=False
+        # --- Test: num_pause_tokens=1, split='train', use_task_tokens=False ---
+        seq_p3 = self.gen._generate_path_prediction_training_set(
+            size=3, split='train', num_pause_tokens=1, use_task_tokens=False
         )
-        # Mock samples [15, 19, 23, 27, 31] from all leaves
-        self.assertEqual(seq_p3.shape, (5, 10)) # 1+1+3+5
+        self.assertEqual(seq_p3.shape, (3, 7))  # 1(leaf)+1(PAUSE)+5(path), no PATH token
         expected_p3 = [
-            [self.TOK_PATH, 15, self.TOK_PAUSE, self.TOK_PAUSE, self.TOK_PAUSE, 11, 12, 13, 14, 15],
-            [self.TOK_PATH, 19, self.TOK_PAUSE, self.TOK_PAUSE, self.TOK_PAUSE, 11, 16, 17, 18, 19],
-            [self.TOK_PATH, 23, self.TOK_PAUSE, self.TOK_PAUSE, self.TOK_PAUSE, 11, 20, 21, 22, 23],
-            [self.TOK_PATH, 27, self.TOK_PAUSE, self.TOK_PAUSE, self.TOK_PAUSE, 11, 24, 25, 26, 27],
-            [self.TOK_PATH, 31, self.TOK_PAUSE, self.TOK_PAUSE, self.TOK_PAUSE, 11, 28, 29, 30, 31],
+            [14, self.TOK_PAUSE, 6, 11, 12, 13, 14],
+            [22, self.TOK_PAUSE, 6, 19, 20, 21, 22],
+            [26, self.TOK_PAUSE, 6, 23, 24, 25, 26],
         ]
         self.assertTrue(torch.equal(seq_p3, torch.tensor(expected_p3)))
-    
-        
-    @patch('torch.randperm', return_value=torch.arange(80)) # Deterministic shuffling (no reordering)
-    def test_04_prepare(self, mock_randperm):
-        """Tests the prepare method: directory naming, size calculations, and data shape/content."""
+
+    def test_04_prepare_basic(self):
+        """Tests the prepare method: directory naming, file creation, and metadata."""
         
         g = self.gen
         num_pause_tokens = 1
         use_undirected = True
         use_directional_tokens = True
+        use_task_tokens = True
 
         # Create a temporary directory for test output
         temp_dir = tempfile.mkdtemp()
@@ -258,46 +251,35 @@ class TestInWeightsPathStar(unittest.TestCase):
                 num_pause_tokens=num_pause_tokens, 
                 output_dir=temp_dir, 
                 use_undirected=use_undirected, 
-                use_directional_tokens=use_directional_tokens
+                use_directional_tokens=use_directional_tokens,
+                use_task_tokens=use_task_tokens
             )
             
             # --- Expected Calculations ---
-            # Edges (directed): d * (l - 1) = 5 * 4 = 20
-            num_edges = g.d * (g.l - 1)
-            # Edge Samples (undirected): 2 * 20 = 40
-            num_edge_samples = 2 * num_edges
+            num_edges = g.d * (g.l - 1)  # 20
+            num_edge_samples = 2 * num_edges if use_undirected else num_edges  # 40
+            num_train_path_samples = len(g.train_leaves)  # 3
+            num_val_path_samples = len(g.holdout_leaves)  # 2
             
-            # Path Samples: 2 (self.train_leaves)
-            num_train_path_samples = len(g.train_leaves) # 2
+            # Final vocab_size: randomize_vocab_size + special tokens = 2000 + 6 = 2006
+            final_vocab_size = self.RANDOMIZE_VOCAB_SIZE + self.gen.num_special_tokens
             
-            # Replication factor: 40 // 2 = 20
-            replication_factor = num_edge_samples // num_train_path_samples # 20
-            replicated_path_samples = num_train_path_samples * replication_factor # 40
-            
-            # Training size: 40 paths + 40 edges = 80
-            train_size = replicated_path_samples + num_edge_samples # 80
-            
-            # Validation size: 3 (self.holdout_leaves)
-            val_size = len(g.holdout_leaves) # 3
-            
-            # Final calculated vocab_size: initial vocab_size + special tokens = 2000 + 11 = 2011
-            final_vocab_size = self.VOCAB_SIZE + 11 
-
-            # Sequence Length: l + num_pause_tokens + 2 = 5 + 1 + 2 = 8
-            seq_len = g.l + num_pause_tokens + 2 # 8
+            # Sequence Length: l + num_pause_tokens + 1(leaf) + 1(task_token) = 5 + 1 + 1 + 1 = 8
+            path_seq_len = g.l + num_pause_tokens + 1 + (1 if use_task_tokens else 0)
             
             # --- 1. Verify Directory Naming ---
-            # With use_task_tokens=True (default), name should have _tt suffix
-            expected_dir_name = f'inweights_pathstar_v{self.VOCAB_SIZE}_d{self.D}_l{self.L}_p1_undirected_dt_tt'
+            expected_dir_name = f'inweights_pathstar_v{self.RANDOMIZE_VOCAB_SIZE}_d{self.D}_l{self.L}_p1_undirected_dt_tt'
             self.assertTrue(output_dir.endswith(expected_dir_name))
             self.assertTrue(os.path.exists(output_dir))
             
             # --- 2. Verify Files Exist ---
-            train_path = os.path.join(output_dir, 'train.bin')
+            paths_path = os.path.join(output_dir, 'paths.bin')
+            edges_path = os.path.join(output_dir, 'edges.bin')
             val_path = os.path.join(output_dir, 'val.bin')
             meta_path = os.path.join(output_dir, 'meta.pkl')
             
-            self.assertTrue(os.path.exists(train_path))
+            self.assertTrue(os.path.exists(paths_path))
+            self.assertTrue(os.path.exists(edges_path))
             self.assertTrue(os.path.exists(val_path))
             self.assertTrue(os.path.exists(meta_path))
             
@@ -311,285 +293,50 @@ class TestInWeightsPathStar(unittest.TestCase):
             self.assertEqual(actual_meta['holdout_percentage'], self.HOLDOUT_PERC)
             self.assertEqual(actual_meta['use_undirected'], use_undirected)
             self.assertEqual(actual_meta['use_directional_tokens'], use_directional_tokens)
-            self.assertEqual(actual_meta['use_task_tokens'], True)  # Default value
+            self.assertEqual(actual_meta['use_task_tokens'], use_task_tokens)
             
-            # Check context lengths (use_task_tokens=True, use_directional_tokens=True)
-            self.assertEqual(actual_meta['edge_context_length'], 3)  # 1(EDGE) + 1(direction) + 1 = 3
-            self.assertEqual(actual_meta['path_context_length'], 3)  # 1(PATH) + 1(leaf) + 1(pause) = 3
+            # Check context lengths
+            self.assertEqual(actual_meta['edge_context_length'], 3)  # 1(EDGE) + 1(direction) + 1
+            self.assertEqual(actual_meta['path_context_length'], 3)  # 1(PATH) + 1(leaf) + 1(pause)
             
-            # Check calculated sizes
-            self.assertEqual(actual_meta['train_size'], train_size) # 80
-            self.assertEqual(actual_meta['val_size'], val_size) # 3
-            self.assertEqual(actual_meta['num_train_path_samples'], num_train_path_samples) # 2
-            self.assertEqual(actual_meta['num_val_path_samples'], val_size) # 3
-            self.assertEqual(actual_meta['total_edge_size'], num_edge_samples) # 40
+            # Check dataset sizes
+            self.assertEqual(actual_meta['num_train_path_samples'], num_train_path_samples)
+            self.assertEqual(actual_meta['num_val_path_samples'], num_val_path_samples)
+            self.assertEqual(actual_meta['total_edge_size'], num_edge_samples)
+            self.assertEqual(actual_meta['PATHS_DATASET_SIZE'], num_train_path_samples)
+            self.assertEqual(actual_meta['EDGES_DATASET_SIZE'], num_edge_samples)
+            self.assertEqual(actual_meta['VAL_DATASET_SIZE'], num_val_path_samples)
             
-            # Check ITOS mapping size (Total tokens used: 21 vertices + 11 special tokens = 32)
-            self.assertEqual(len(actual_meta['itos']), 32)
-            self.assertEqual(len(actual_meta['stoi']), 32)
+            # --- 4. Verify data shapes ---
+            paths_data = np.memmap(paths_path, dtype=np.uint16, mode='r')
+            edges_data = np.memmap(edges_path, dtype=np.uint16, mode='r')
+            val_data = np.memmap(val_path, dtype=np.uint16, mode='r')
             
-            # --- 4. Load and verify train data ---
-            train_data = np.fromfile(train_path, dtype=np.uint16)
-            train_data = train_data.reshape(train_size, seq_len)
+            # Paths: 3 sequences of length 8
+            self.assertEqual(paths_data.shape[0], num_train_path_samples * path_seq_len)
             
-            self.assertEqual(train_data.shape, (80, 8))
+            # Edges: 40 sequences of length 8 (padded to match path length)
+            self.assertEqual(edges_data.shape[0], num_edge_samples * path_seq_len)
             
-            # First 40 rows should be PATH sequences (alternating between two paths due to replication)
-            for i in range(40):
-                self.assertEqual(train_data[i, 0], self.TOK_PATH)
-                # The leaf should be either 19 or 27 (our train leaves)
-                self.assertIn(train_data[i, 1], [19, 27])
-                # Third token should be PAUSE
-                self.assertEqual(train_data[i, 2], self.TOK_PAUSE)
-                # Fourth token should be root (11)
-                self.assertEqual(train_data[i, 3], 11)
-            
-            # Next 40 rows should be EDGE sequences
-            for i in range(40, 80):
-                self.assertEqual(train_data[i, 0], self.TOK_EDGE)
-                # Second token should be directional (GT or LT)
-                self.assertIn(train_data[i, 1], [self.TOK_GT, self.TOK_LT])
-                # Positions 4-7 should be PAD
-                for j in range(4, 8):
-                    self.assertEqual(train_data[i, j], self.TOK_PAD)
-            
-            # --- 5. Load and verify validation data ---
-            val_data = np.fromfile(val_path, dtype=np.uint16)
-            val_data = val_data.reshape(val_size, seq_len)
-            
-            self.assertEqual(val_data.shape, (3, 8))
-            
-            # All validation sequences should be PATH sequences to holdout leaves
-            for i in range(3):
-                self.assertEqual(val_data[i, 0], self.TOK_PATH)
-                # The leaf should be one of our holdout leaves (15, 23, 31)
-                self.assertIn(val_data[i, 1], [15, 23, 31])
-                # Third token should be PAUSE
-                self.assertEqual(val_data[i, 2], self.TOK_PAUSE)
-                # Fourth token should be root (11)
-                self.assertEqual(val_data[i, 3], 11)
+            # Val: 2 sequences of length 8
+            self.assertEqual(val_data.shape[0], num_val_path_samples * path_seq_len)
         
         finally:
             # Clean up temp directory
             shutil.rmtree(temp_dir)
 
-
-    @patch('random.shuffle', side_effect=lambda x: x) # No-op shuffle to make edges deterministic
-    @patch('random.sample', side_effect=lambda pop, k: sorted(pop)[:k]) # Deterministic sample
-    @patch('torch.randperm', return_value=torch.arange(80)) # Deterministic permutation (no reordering)
-    def test_04b_prepare_data_content(self, mock_randperm, mock_sample, mock_shuffle):
-        """Tests the actual content of train_data and val_data generated by prepare."""
+    def test_05_prepare_without_task_tokens(self):
+        """Tests prepare with use_task_tokens=False."""
         
         g = self.gen
         num_pause_tokens = 1
         use_undirected = True
         use_directional_tokens = True
-        
-        # --- Expected Calculations ---
-        num_edges = g.d * (g.l - 1)  # 20
-        num_edge_samples = 2 * num_edges  # 40
-        num_train_path_samples = len(g.train_leaves)  # 2
-        replication_factor = num_edge_samples // num_train_path_samples  # 20
-        replicated_path_samples = num_train_path_samples * replication_factor  # 40
-        train_size = replicated_path_samples + num_edge_samples  # 80
-        val_size = len(g.holdout_leaves)  # 3
-        seq_len = g.l + num_pause_tokens + 2  # 8
-        
-        # --- Generate the sequences manually (what prepare() should create) ---
-        
-        # Training path sequences (will be replicated 20 times)
-        # train_leaves = {19, 27} (from our mock setup)
-        # With deterministic sample, we get [19, 27]
-        train_path_sequences = g.generate_path_prediction_training_set(
-            size=num_train_path_samples,
-            num_pause_tokens=num_pause_tokens,
-            obey_holdout=True
-        )
-        expected_train_paths = [
-            [self.TOK_PATH, 19, self.TOK_PAUSE, 11, 16, 17, 18, 19],  # Path to leaf 19
-            [self.TOK_PATH, 27, self.TOK_PAUSE, 11, 24, 25, 26, 27],  # Path to leaf 27
-        ]
-        self.assertTrue(torch.equal(train_path_sequences, torch.tensor(expected_train_paths)))
-        
-        # Replicate the path sequences
-        train_path_sequences_replicated = train_path_sequences.repeat(replication_factor, 1)
-        self.assertEqual(train_path_sequences_replicated.shape, (40, 8))
-        
-        # Edge sequences
-        edges = g.generate_edge_memorization_training_set(
-            size=num_edge_samples,
-            undirected=use_undirected,
-            use_directional_tokens=use_directional_tokens
-        )
-        
-        # Build expected edge set (all directed edges in the graph)
-        expected_edges = []
-        # Spoke 0: 11->12, 12->13, 13->14, 14->15
-        expected_edges.extend([
-            [self.TOK_GT, 11, 12], [self.TOK_LT, 12, 11],
-            [self.TOK_GT, 12, 13], [self.TOK_LT, 13, 12],
-            [self.TOK_GT, 13, 14], [self.TOK_LT, 14, 13],
-            [self.TOK_GT, 14, 15], [self.TOK_LT, 15, 14],
-        ])
-        # Spoke 1: 11->16, 16->17, 17->18, 18->19
-        expected_edges.extend([
-            [self.TOK_GT, 11, 16], [self.TOK_LT, 16, 11],
-            [self.TOK_GT, 16, 17], [self.TOK_LT, 17, 16],
-            [self.TOK_GT, 17, 18], [self.TOK_LT, 18, 17],
-            [self.TOK_GT, 18, 19], [self.TOK_LT, 19, 18],
-        ])
-        # Spoke 2: 11->20, 20->21, 21->22, 22->23
-        expected_edges.extend([
-            [self.TOK_GT, 11, 20], [self.TOK_LT, 20, 11],
-            [self.TOK_GT, 20, 21], [self.TOK_LT, 21, 20],
-            [self.TOK_GT, 21, 22], [self.TOK_LT, 22, 21],
-            [self.TOK_GT, 22, 23], [self.TOK_LT, 23, 22],
-        ])
-        # Spoke 3: 11->24, 24->25, 25->26, 26->27
-        expected_edges.extend([
-            [self.TOK_GT, 11, 24], [self.TOK_LT, 24, 11],
-            [self.TOK_GT, 24, 25], [self.TOK_LT, 25, 24],
-            [self.TOK_GT, 25, 26], [self.TOK_LT, 26, 25],
-            [self.TOK_GT, 26, 27], [self.TOK_LT, 27, 26],
-        ])
-        # Spoke 4: 11->28, 28->29, 29->30, 30->31
-        expected_edges.extend([
-            [self.TOK_GT, 11, 28], [self.TOK_LT, 28, 11],
-            [self.TOK_GT, 28, 29], [self.TOK_LT, 29, 28],
-            [self.TOK_GT, 29, 30], [self.TOK_LT, 30, 29],
-            [self.TOK_GT, 30, 31], [self.TOK_LT, 31, 30],
-        ])
-        
-        # Verify we have the right edges (shuffle mock makes them deterministic)
-        self.assertEqual(edges.shape, (40, 3))
-        self.assertEqual(set(map(tuple, edges.tolist())), set(map(tuple, expected_edges)))
-        
-        # Build edge sequences with EDGE task token and padding
-        edge_task_tokens = torch.full((num_edge_samples, 1), self.TOK_EDGE, dtype=torch.long)
-        edge_sequences = torch.cat([edge_task_tokens, edges], dim=1)  # Shape: (40, 4)
-        
-        # Pad edge sequences to match path sequence length (8)
-        padding = torch.full((num_edge_samples, seq_len - 4), self.TOK_PAD, dtype=torch.long)
-        edge_sequences = torch.cat([edge_sequences, padding], dim=1)  # Shape: (40, 8)
-        
-        # Verify edge sequence structure
-        self.assertEqual(edge_sequences.shape, (40, 8))
-        # Each edge sequence should be: [EDGE, direction_token, u, v, PAD, PAD, PAD, PAD]
-        for i in range(num_edge_samples):
-            self.assertEqual(edge_sequences[i, 0].item(), self.TOK_EDGE)
-            self.assertIn(edge_sequences[i, 1].item(), [self.TOK_GT, self.TOK_LT])
-            # Remaining positions should be PAD
-            self.assertTrue(torch.all(edge_sequences[i, 4:] == self.TOK_PAD))
-        
-        # Concatenate and verify final training data
-        # With mock randperm returning arange(80), order is preserved
-        train_sequences = torch.cat([train_path_sequences_replicated, edge_sequences], dim=0)
-        self.assertEqual(train_sequences.shape, (80, 8))
-        
-        # First 40 should be replicated path sequences
-        # Since we replicated [path_19, path_27] 20 times, we get:
-        # [path_19, path_27, path_19, path_27, ..., path_19, path_27] (20 repetitions)
-        for i in range(40):
-            expected_path = expected_train_paths[i % 2]  # Alternates between path_19 and path_27
-            self.assertEqual(train_sequences[i].tolist(), expected_path)
-            self.assertEqual(train_sequences[i, 0].item(), self.TOK_PATH)
-        
-        # Next 40 should be edge sequences
-        for i in range(40, 80):
-            self.assertEqual(train_sequences[i, 0].item(), self.TOK_EDGE)
-        
-        # --- Validation sequences ---
-        val_sequences = g.generate_path_prediction_training_set(
-            size=val_size,
-            num_pause_tokens=num_pause_tokens,
-            holdout_only=True
-        )
-        
-        # holdout_leaves = {15, 23, 31} (from our mock setup)
-        # With deterministic sample, we get [15, 23, 31]
-        expected_val_paths = [
-            [self.TOK_PATH, 15, self.TOK_PAUSE, 11, 12, 13, 14, 15],  # Path to leaf 15
-            [self.TOK_PATH, 23, self.TOK_PAUSE, 11, 20, 21, 22, 23],  # Path to leaf 23
-            [self.TOK_PATH, 31, self.TOK_PAUSE, 11, 28, 29, 30, 31],  # Path to leaf 31
-        ]
-        
-        self.assertEqual(val_sequences.shape, (3, 8))
-        self.assertTrue(torch.equal(val_sequences, torch.tensor(expected_val_paths)))
-        
-        # All validation sequences should be PATH tasks (no EDGE tasks)
-        for i in range(val_size):
-            self.assertEqual(val_sequences[i, 0].item(), self.TOK_PATH)
-            self.assertIn(val_sequences[i, 1].item(), [15, 23, 31])  # Holdout leaves
+        use_task_tokens = False
 
-    @patch('random.sample', side_effect=lambda pop, k: sorted(pop)[:k]) # Deterministic sample
-    def test_05_use_task_tokens_path_prediction(self, mock_sample):
-        """
-        Tests generate_path_prediction_training_set with use_task_tokens=False.
-        Verifies that sequences omit the PATH task prefix token when use_task_tokens=False.
-        """
-        
-        # --- Test: use_task_tokens=True (default behavior) ---
-        seq_with_task = self.gen.generate_path_prediction_training_set(
-            size=2, num_pause_tokens=1, obey_holdout=True, holdout_only=False, use_task_tokens=True
-        )
-        # Shape should be 1(PATH) + 1(leaf) + 1(PAUSE) + 5(path) = 8
-        self.assertEqual(seq_with_task.shape, (2, 8))
-        expected_with_task = [
-            [self.TOK_PATH, 19, self.TOK_PAUSE, 11, 16, 17, 18, 19],
-            [self.TOK_PATH, 27, self.TOK_PAUSE, 11, 24, 25, 26, 27],
-        ]
-        self.assertTrue(torch.equal(seq_with_task, torch.tensor(expected_with_task)))
-        
-        # --- Test: use_task_tokens=False ---
-        seq_without_task = self.gen.generate_path_prediction_training_set(
-            size=2, num_pause_tokens=1, obey_holdout=True, holdout_only=False, use_task_tokens=False
-        )
-        # Shape should be 1(leaf) + 1(PAUSE) + 5(path) = 7 (no PATH token)
-        self.assertEqual(seq_without_task.shape, (2, 7))
-        expected_without_task = [
-            [19, self.TOK_PAUSE, 11, 16, 17, 18, 19],  # No PATH token
-            [27, self.TOK_PAUSE, 11, 24, 25, 26, 27],  # No PATH token
-        ]
-        self.assertTrue(torch.equal(seq_without_task, torch.tensor(expected_without_task)))
-        
-        # Verify length difference is exactly 1 (the PATH token)
-        length_diff = seq_with_task.shape[1] - seq_without_task.shape[1]
-        self.assertEqual(length_diff, 1)
-        
-        # Verify that the content after the PATH token matches
-        self.assertTrue(torch.equal(seq_with_task[:, 1:], seq_without_task))
-        
-        # --- Test with different num_pause_tokens ---
-        seq_without_task_p2 = self.gen.generate_path_prediction_training_set(
-            size=3, num_pause_tokens=2, obey_holdout=False, holdout_only=True, use_task_tokens=False
-        )
-        # Shape should be 1(leaf) + 2(PAUSE) + 5(path) = 8 (no PATH token)
-        self.assertEqual(seq_without_task_p2.shape, (3, 8))
-        expected_without_task_p2 = [
-            [15, self.TOK_PAUSE, self.TOK_PAUSE, 11, 12, 13, 14, 15],
-            [23, self.TOK_PAUSE, self.TOK_PAUSE, 11, 20, 21, 22, 23],
-            [31, self.TOK_PAUSE, self.TOK_PAUSE, 11, 28, 29, 30, 31],
-        ]
-        self.assertTrue(torch.equal(seq_without_task_p2, torch.tensor(expected_without_task_p2)))
-
-    @patch('torch.randperm', return_value=torch.arange(80)) # Deterministic shuffling (no reordering)
-    def test_06_prepare_without_task_tokens(self, mock_randperm):
-        """
-        Tests the prepare method with use_task_tokens=False.
-        Verifies that PATH and EDGE tokens are omitted from sequences.
-        """
-        
-        g = self.gen
-        num_pause_tokens = 1
-        use_undirected = True
-        use_directional_tokens = True
-        use_task_tokens = False  # Key difference
-        
-        # Create a temporary directory for test output
         temp_dir = tempfile.mkdtemp()
         
         try:
-            # Run prepare with use_task_tokens=False
             output_dir = g.prepare(
                 num_pause_tokens=num_pause_tokens, 
                 output_dir=temp_dir, 
@@ -599,176 +346,194 @@ class TestInWeightsPathStar(unittest.TestCase):
             )
             
             # --- Expected Calculations ---
-            num_edges = g.d * (g.l - 1)  # 20
-            num_edge_samples = 2 * num_edges  # 40
-            num_train_path_samples = len(g.train_leaves)  # 2
-            replication_factor = num_edge_samples // num_train_path_samples  # 20
-            replicated_path_samples = num_train_path_samples * replication_factor  # 40
-            train_size = replicated_path_samples + num_edge_samples  # 80
-            val_size = len(g.holdout_leaves)  # 3
-            
-            # Sequence lengths WITHOUT task tokens:
-            # Path: 1(leaf) + 1(PAUSE) + 5(path) = 7
-            # Edge: 1(direction) + 2(nodes) = 3
-            path_seq_len = g.l + num_pause_tokens + 1  # 7 (no PATH token)
-            edge_seq_len = 3  # direction + u + v (no EDGE token)
+            path_seq_len = g.l + num_pause_tokens + 1  # 7 (no task token)
             
             # --- 1. Verify Directory Naming ---
-            expected_dir_name = f'inweights_pathstar_v{self.VOCAB_SIZE}_d{self.D}_l{self.L}_p1_undirected_dt_nott'
+            expected_dir_name = f'inweights_pathstar_v{self.RANDOMIZE_VOCAB_SIZE}_d{self.D}_l{self.L}_p1_undirected_dt_nott'
             self.assertTrue(output_dir.endswith(expected_dir_name))
-            self.assertTrue(os.path.exists(output_dir))
             
-            # --- 2. Verify Files Exist ---
-            train_path = os.path.join(output_dir, 'train.bin')
-            val_path = os.path.join(output_dir, 'val.bin')
+            # --- 2. Load and verify metadata ---
             meta_path = os.path.join(output_dir, 'meta.pkl')
-            
-            self.assertTrue(os.path.exists(train_path))
-            self.assertTrue(os.path.exists(val_path))
-            self.assertTrue(os.path.exists(meta_path))
-            
-            # --- 3. Load and verify metadata ---
             with open(meta_path, 'rb') as f:
                 actual_meta = pickle.load(f)
             
-            # Verify use_task_tokens is stored correctly
             self.assertEqual(actual_meta['use_task_tokens'], False)
+            self.assertEqual(actual_meta['edge_context_length'], 2)  # direction + 1
+            self.assertEqual(actual_meta['path_context_length'], 2)  # leaf + pause
+            self.assertEqual(actual_meta['block_size'], path_seq_len)
             
-            # Verify context lengths
-            # edge_context_length = 0(no EDGE) + 1(direction) + 1 = 2
-            # path_context_length = 0(no PATH) + 1(leaf) + 1(pause) = 2
-            self.assertEqual(actual_meta['edge_context_length'], 2)
-            self.assertEqual(actual_meta['path_context_length'], 2)
+            # --- 3. Verify data shapes ---
+            paths_path = os.path.join(output_dir, 'paths.bin')
+            paths_data = np.memmap(paths_path, dtype=np.uint16, mode='r')
+            paths_data = paths_data.reshape(-1, path_seq_len)
             
-            # --- 4. Load and verify train data ---
-            train_data = np.fromfile(train_path, dtype=np.uint16)
-            train_data = train_data.reshape(train_size, path_seq_len)
-            
-            self.assertEqual(train_data.shape, (80, 7))
-            
-            # First 40 rows should be PATH sequences (WITHOUT PATH token)
-            for i in range(40):
-                # First token should be the leaf (19 or 27), NOT the PATH token
-                self.assertIn(train_data[i, 0], [19, 27])
-                # Second token should be PAUSE
-                self.assertEqual(train_data[i, 1], self.TOK_PAUSE)
-                # Third token should be root (11)
-                self.assertEqual(train_data[i, 2], 11)
-            
-            # Next 40 rows should be EDGE sequences (WITHOUT EDGE token)
-            for i in range(40, 80):
-                # First token should be directional (GT or LT), NOT the EDGE token
-                self.assertIn(train_data[i, 0], [self.TOK_GT, self.TOK_LT])
-                # Second and third tokens should be node IDs
-                self.assertIn(train_data[i, 1], range(11, 32))
-                self.assertIn(train_data[i, 2], range(11, 32))
-                # Positions 3-6 should be PAD
-                for j in range(3, 7):
-                    self.assertEqual(train_data[i, j], self.TOK_PAD)
-            
-            # --- 5. Load and verify validation data ---
-            val_data = np.fromfile(val_path, dtype=np.uint16)
-            val_data = val_data.reshape(val_size, path_seq_len)
-            
-            self.assertEqual(val_data.shape, (3, 7))
-            
-            # All validation sequences should be path sequences WITHOUT PATH token
-            for i in range(3):
-                # First token should be the leaf (15, 23, or 31), NOT the PATH token
-                self.assertIn(val_data[i, 0], [15, 23, 31])
-                # Second token should be PAUSE
-                self.assertEqual(val_data[i, 1], self.TOK_PAUSE)
-                # Third token should be root (11)
-                self.assertEqual(val_data[i, 2], 11)
+            # First token should be leaf (not PATH token)
+            self.assertIn(paths_data[0, 0], [14, 22, 26])
+            self.assertEqual(paths_data[0, 1], self.TOK_PAUSE)
         
         finally:
-            # Clean up temp directory
             shutil.rmtree(temp_dir)
 
-    def test_07_context_length_calculations(self):
-        """
-        Tests that edge_context_length and path_context_length are calculated correctly
-        for all combinations of use_task_tokens and use_directional_tokens.
-        """
+    def test_06_edge_cases_holdout_percentage(self):
+        """Tests edge cases for holdout_percentage."""
         
-        num_pause_tokens = 1
+        # Test 0% holdout
+        gen_0 = InWeightsPathStar(d=5, l=5, holdout_percentage=0.0)
+        self.assertEqual(len(gen_0.holdout_leaves), 0)
+        self.assertEqual(len(gen_0.train_leaves), 5)
         
-        # --- Case 1: use_task_tokens=True, use_directional_tokens=True ---
-        edge_ctx_1 = (1 if True else 0) + (1 if True else 0) + 1  # EDGE + direction + 1 = 3
-        path_ctx_1 = (1 if True else 0) + 1 + num_pause_tokens  # PATH + leaf + pause = 3
-        self.assertEqual(edge_ctx_1, 3)
-        self.assertEqual(path_ctx_1, 3)
+        # Test 100% holdout
+        gen_100 = InWeightsPathStar(d=5, l=5, holdout_percentage=1.0)
+        self.assertEqual(len(gen_100.holdout_leaves), 5)
+        self.assertEqual(len(gen_100.train_leaves), 0)
         
-        # --- Case 2: use_task_tokens=True, use_directional_tokens=False ---
-        edge_ctx_2 = (1 if True else 0) + (1 if False else 0) + 1  # EDGE + 0 + 1 = 2
-        path_ctx_2 = (1 if True else 0) + 1 + num_pause_tokens  # PATH + leaf + pause = 3
-        self.assertEqual(edge_ctx_2, 2)
-        self.assertEqual(path_ctx_2, 3)
+        # Test invalid holdout percentage
+        with self.assertRaises(ValueError):
+            InWeightsPathStar(d=5, l=5, holdout_percentage=1.5)
         
-        # --- Case 3: use_task_tokens=False, use_directional_tokens=True ---
-        edge_ctx_3 = (1 if False else 0) + (1 if True else 0) + 1  # 0 + direction + 1 = 2
-        path_ctx_3 = (1 if False else 0) + 1 + num_pause_tokens  # 0 + leaf + pause = 2
-        self.assertEqual(edge_ctx_3, 2)
-        self.assertEqual(path_ctx_3, 2)
-        
-        # --- Case 4: use_task_tokens=False, use_directional_tokens=False ---
-        edge_ctx_4 = (1 if False else 0) + (1 if False else 0) + 1  # 0 + 0 + 1 = 1
-        path_ctx_4 = (1 if False else 0) + 1 + num_pause_tokens  # 0 + leaf + pause = 2
-        self.assertEqual(edge_ctx_4, 1)
-        self.assertEqual(path_ctx_4, 2)
-        
-        # Test with different num_pause_tokens
-        num_pause_tokens = 3
-        path_ctx_5 = (1 if True else 0) + 1 + num_pause_tokens  # PATH + leaf + 3 pauses = 5
-        path_ctx_6 = (1 if False else 0) + 1 + num_pause_tokens  # 0 + leaf + 3 pauses = 4
-        self.assertEqual(path_ctx_5, 5)
-        self.assertEqual(path_ctx_6, 4)
+        with self.assertRaises(ValueError):
+            InWeightsPathStar(d=5, l=5, holdout_percentage=-0.1)
 
-    def test_08_dataset_name_with_task_tokens(self):
-        """
-        Tests that generate_dataset_name includes the correct suffix based on use_task_tokens.
-        """
+    def test_07_edge_cases_size_validation(self):
+        """Tests size validation in generation methods."""
         
         g = self.gen
         
-        # --- Test with use_task_tokens=True ---
-        name_with_tt = g.generate_dataset_name(
-            num_pause_tokens=1,
-            use_undirected=True,
-            use_directional_tokens=True,
-            use_task_tokens=True
-        )
-        self.assertIn('_tt', name_with_tt)
-        self.assertNotIn('_nott', name_with_tt)
-        expected_name_tt = f'inweights_pathstar_v{self.VOCAB_SIZE}_d{self.D}_l{self.L}_p1_undirected_dt_tt'
-        self.assertEqual(name_with_tt, expected_name_tt)
+        # Test requesting more paths than available (train)
+        with self.assertRaises(ValueError):
+            g._generate_path_prediction_training_set(
+                size=10, split='train', num_pause_tokens=1
+            )
         
-        # --- Test with use_task_tokens=False ---
-        name_without_tt = g.generate_dataset_name(
-            num_pause_tokens=1,
-            use_undirected=True,
-            use_directional_tokens=True,
-            use_task_tokens=False
-        )
-        self.assertIn('_nott', name_without_tt)
-        self.assertNotIn('_tt', name_without_tt.replace('_nott', ''))  # Ensure only _nott, not _tt
-        expected_name_nott = f'inweights_pathstar_v{self.VOCAB_SIZE}_d{self.D}_l{self.L}_p1_undirected_dt_nott'
-        self.assertEqual(name_without_tt, expected_name_nott)
+        # Test requesting more paths than available (val)
+        with self.assertRaises(ValueError):
+            g._generate_path_prediction_training_set(
+                size=10, split='val', num_pause_tokens=1
+            )
         
-        # Verify that stored instance variables are correct
-        self.assertEqual(g.use_task_tokens, False)
+        # Test requesting more edges than available
+        max_edges = 2 * g.d * (g.l - 1)  # 40 for undirected
+        with self.assertRaises(ValueError):
+            g._generate_edge_memorization_training_set(
+                size=max_edges + 1, undirected=True, use_directional_tokens=False
+            )
+
+    def test_08_load_dataset(self):
+        """Tests load_dataset method."""
         
-        # Reset and test with use_task_tokens=True again
-        name_with_tt_2 = g.generate_dataset_name(
-            num_pause_tokens=2,
-            use_undirected=False,
-            use_directional_tokens=False,
-            use_task_tokens=True
-        )
-        self.assertIn('_tt', name_with_tt_2)
-        self.assertEqual(g.use_task_tokens, True)
+        g = self.gen
+        temp_dir = tempfile.mkdtemp()
+        
+        try:
+            # First prepare a dataset
+            g.prepare(
+                num_pause_tokens=1,
+                output_dir=temp_dir,
+                use_undirected=True,
+                use_directional_tokens=True,
+                use_task_tokens=True
+            )
+            
+            # Update dir_name to match what was created
+            g.dir_name = f'inweights_pathstar_v{self.RANDOMIZE_VOCAB_SIZE}_d{self.D}_l{self.L}_p1_undirected_dt_tt'
+            
+            # Now load it
+            meta, paths_data, edges_data, val_data = g.load_dataset()
+            
+            # Verify metadata
+            self.assertEqual(meta['d'], self.D)
+            self.assertEqual(meta['l'], self.L)
+            
+            # Verify data is loaded as memmap
+            self.assertIsInstance(paths_data, np.memmap)
+            self.assertIsInstance(edges_data, np.memmap)
+            self.assertIsInstance(val_data, np.memmap)
+            
+            # Verify sizes
+            self.assertEqual(paths_data.shape[0], 3 * 8)  # 3 paths * 8 tokens
+            self.assertEqual(edges_data.shape[0], 40 * 8)  # 40 edges * 8 tokens
+            self.assertEqual(val_data.shape[0], 2 * 8)  # 2 val paths * 8 tokens
+        
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_09_check_dataset_exists(self):
+        """Tests _check_dataset_exists method."""
+        
+        g = self.gen
+        temp_dir = tempfile.mkdtemp()
+        
+        try:
+            # Generate dataset name
+            g._generate_dataset_name(
+                num_pause_tokens=1,
+                use_undirected=True,
+                use_directional_tokens=True,
+                use_task_tokens=True
+            )
+            
+            # Should not exist initially
+            self.assertFalse(g._check_dataset_exists())
+            
+            # Create the dataset
+            g.prepare(
+                num_pause_tokens=1,
+                output_dir=temp_dir,
+                use_undirected=True,
+                use_directional_tokens=True,
+                use_task_tokens=True
+            )
+            
+            # Now should exist
+            self.assertTrue(g._check_dataset_exists())
+            
+            # Change parameters - should not match
+            g._generate_dataset_name(
+                num_pause_tokens=2,  # Different!
+                use_undirected=True,
+                use_directional_tokens=True,
+                use_task_tokens=True
+            )
+            self.assertFalse(g._check_dataset_exists())
+        
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_10_vocab_size_validation(self):
+        """Tests vocabulary size validation."""
+        
+        # Test insufficient vocab_size
+        with self.assertRaises(ValueError):
+            gen = InWeightsPathStar(d=100, l=10, randomize_vocab_size=50)
+        
+        # Test valid vocab_size
+        gen = InWeightsPathStar(d=5, l=5, randomize_vocab_size=100)
+        self.assertEqual(gen.randomize_vocab_size, 100)
+        
+        # Test auto vocab_size
+        gen_auto = InWeightsPathStar(d=5, l=5, randomize_vocab_size='auto')
+        self.assertEqual(gen_auto.randomize_vocab_size, gen_auto.num_vertices)
+
+    def test_11_special_tokens(self):
+        """Tests special token definitions."""
+        
+        g = self.gen
+        
+        # Verify all special tokens are defined
+        self.assertEqual(g.SPECIAL_TOKENS['PAD'], 0)
+        self.assertEqual(g.SPECIAL_TOKENS['PAUSE'], 1)
+        self.assertEqual(g.SPECIAL_TOKENS['GT'], 2)
+        self.assertEqual(g.SPECIAL_TOKENS['LT'], 3)
+        self.assertEqual(g.SPECIAL_TOKENS['PATH'], 4)
+        self.assertEqual(g.SPECIAL_TOKENS['EDGE'], 5)
+        
+        # Verify num_special_tokens
+        self.assertEqual(g.num_special_tokens, 6)
+        
+        # Verify convenience attributes
+        self.assertEqual(g.pause_token, 1)
+        self.assertEqual(g.pad_token, 0)
 
 
 if __name__ == '__main__':
     unittest.main()
-

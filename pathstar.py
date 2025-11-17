@@ -4,44 +4,63 @@ import os
 import pickle
 import numpy as np
 import argparse
-import matplotlib.pyplot as plt
-import networkx as nx
+import math
 
 
 class InWeightsPathStar:
-    def __init__(self, d=5, l=5, vocab_size=None, holdout_percentage=0.0):
+    def __init__(self, d=5, l=5, randomize_vocab_size=None, holdout_percentage=0.0):
         """
         Generator instance for a pathstar graph with d spokes
-        of length l
+        of length l.
         
         Args:
             d: Number of spokes/paths in the path-star
             l: Length of each path (number of nodes from root to leaf)
-            vocab_size: Optional vocabulary mapping size
-            mapping: Optional mapping from canonical node IDs to vocabulary tokens
+            randomize_vocab_size: Optional vocabulary mapping size we want to randomize vertices with 
             holdout_percentage: Percentage of paths to hold out (0.0 to 1.0)
         """
 
         self.d = d
         self.l = l
-        self.vocab_size = vocab_size
+        self.randomize_vocab_size = randomize_vocab_size
 
         self.adj_list = {}
         self.num_vertices = d * (l-1) + 1
+        self.num_graph_edges = d * (l-1)
+        # populate the vertices with d * (l-1) + 1 vertices
+        # 0 is the root node
+        # Spokes start at: 1, l, 2l-1, 3l-2, ... = 1+(l-1)*k for k in [0, d-1]
+        # d = 3
+        # g = 5
+        # 0 1 2 3 4 
+        #   5 6 7 8
+        #   9 10 11 12
+        # start index is d*(l-1)+1 = 0*4+1 = 1 , 1*4+1 = 5 , 2*4+1 = 9
+        # end index is d*(l-1)+(l-1) = (d+1)*(l-1) 
+        self.v_root = 0
+        self.v_leaf = [(self.l-1)*(k+1) for k in range(self.d)]  # Last node of each spoke
+        self.vertices = list(range(d * (l-1) + 1))
+
         # Sample random tokens from vocabulary without replacement
         canonical_nodes = list(range(self.num_vertices))
-        vocab_tokens = random.sample(range(vocab_size), self.num_vertices)
-        self.mapping = None
-        if vocab_size:
-            self.mapping = dict(zip(canonical_nodes, vocab_tokens))
 
-        # populate the vertices with d * (l-1) + 1 vertices
-        # 0 jis the root node
-        # Spokes start at: 1, l, 2l-1, 3l-2, ... = 1+(l-1)*k for k in [0, d-1]
-        self.vertices = list(range(d * (l-1) + 1))
-        self.v_root = 0
-        self.total_vert = len(self.vertices)
-        self.v_leaf = [1 + (self.l-1)*(k+1) - 1 for k in range(self.d)]  # Last node of each spoke
+        if randomize_vocab_size == 'auto':
+            print(f"Using auto vocab_size of {self.num_vertices}")
+            self.randomize_vocab_size = self.num_vertices
+            
+        if self.randomize_vocab_size and self.num_vertices > self.randomize_vocab_size:
+            raise ValueError(
+                f"Graph requires {self.num_vertices} vertices but vocab_size is only {self.randomize_vocab_size}. "
+                f"Please increase vocab_size to at least {self.num_vertices}."
+            )
+
+        if self.randomize_vocab_size and self.randomize_vocab_size >= self.num_vertices:
+            vocab_tokens = random.sample(range(self.randomize_vocab_size), self.num_vertices)
+        else:
+            vocab_tokens = list(range(self.num_vertices))
+
+        self.mapping = dict(zip(canonical_nodes, vocab_tokens))
+
 
         # add the root to the adjacency list
         self.paths_by_leaf = {}
@@ -62,36 +81,22 @@ class InWeightsPathStar:
                 path_list.append(node_val)
             self.paths_by_leaf[node_val] = path_list
         
-
-        if self.mapping is not None:
-            # modify the mapping to accomodate for the special tokens 
-            self.mapping = {k:v+11 for k,v in self.mapping.items()}
-            assert len(self.mapping) == self.total_vert and set(self.mapping.keys()) == set(self.vertices)
-            self._apply_mapping()
-        
         # Define special tokens
         self.SPECIAL_TOKENS = {
             'PAD': 0,
             'PAUSE': 1,
             'GT': 2,  # > directional token means parent > child
             'LT': 3,  # < directional token child < parent
-            'SEP': 4,  # separator token
-            'START': 5,  # start marker
-            'GOAL': 6,   # goal marker
-            'PATH_START': 7,  # path start marker
-            'EOS': 8,  # end of sequence
-            'PATH': 9,
-            'EDGE': 10,
+            'PATH': 4,
+            'EDGE': 5
         }
-        # Determine pause token based on mapping
         self.pause_token = self.SPECIAL_TOKENS['PAUSE']
         self.pad_token = self.SPECIAL_TOKENS['PAD']
-        
-        # Define task prefix tokens (after pad token)
-        self.TASK_TOKENS = {
-            'PATH': self.SPECIAL_TOKENS['PATH'],
-            'EDGE': self.SPECIAL_TOKENS['EDGE'],
-        }
+        self.num_special_tokens = len(self.SPECIAL_TOKENS)
+
+        # modify the mapping to accomodate for the special tokens 
+        self.mapping = {k:v+self.num_special_tokens for k,v in self.mapping.items()}
+        self._apply_mapping()
         
         # Set up holdout paths
         self.holdout_percentage = holdout_percentage
@@ -132,7 +137,7 @@ class InWeightsPathStar:
             raise ValueError(f"holdout_percentage must be between 0.0 and 1.0, got {self.holdout_percentage}")
         
         all_leaf_nodes = list(self.paths_by_leaf.keys())
-        num_holdout = round(self.d * self.holdout_percentage)
+        num_holdout = math.ceil(self.d * self.holdout_percentage)
         
         if num_holdout > 0:
             # Randomly select holdout leaves
@@ -153,13 +158,13 @@ class InWeightsPathStar:
         lines = []
         lines.append(f"InWeightsPathStar(d={self.d}, l={self.l}, holdout_percentage={self.holdout_percentage})")
         lines.append(f"  Root vertex: {self.v_root}")
-        lines.append(f"  Total vertices: {self.total_vert}")
+        lines.append(f"  Total vertices: {self.num_vertices}")
         lines.append(f"  Leaf vertices: {self.v_leaf}")
         lines.append(f"  Train leaves: {sorted(self.train_leaves)} ({len(self.train_leaves)} paths)")
         lines.append(f"  Holdout leaves: {sorted(self.holdout_leaves)} ({len(self.holdout_leaves)} paths)")
         lines.append(f"  Pause token: {self.pause_token}")
         lines.append(f"  Pad token: {self.pad_token}")
-        lines.append(f"  Task tokens: PATH={self.TASK_TOKENS['PATH']}, EDGE={self.TASK_TOKENS['EDGE']}")
+        lines.append(f"  Task tokens: PATH={self.SPECIAL_TOKENS['PATH']}, EDGE={self.SPECIAL_TOKENS['EDGE']}")
         lines.append(f"  Vertices: {sorted(self.vertices) if isinstance(self.vertices, set) else self.vertices}")
         lines.append(f"\n  Adjacency List:")
         for node in sorted(self.adj_list.keys()):
@@ -173,7 +178,7 @@ class InWeightsPathStar:
             lines.append(f"    {self.paths_by_leaf}")
         return "\n".join(lines)
     
-    def generate_adjacency_list(self):
+    def _generate_adjacency_list(self):
         """
         Generate an adjacency list as a shuffled list of edge pairs
         """
@@ -189,27 +194,29 @@ class InWeightsPathStar:
 
         return adjacency_pairs_list
     
-    def generate_paths_by_leaf(self):
+    def _generate_paths_by_leaf(self):
         """
         Generate paths by leaf (returns a copy of the internal paths_by_leaf)
         """
         return dict(self.paths_by_leaf)
     
-    def generate_edge_memorization_training_set(self, size, undirected=True, use_directional_tokens=True):
+    def _generate_edge_memorization_training_set(self, size, undirected=True, use_directional_tokens=True, use_task_tokens=True):
         """
         Generate a training set of edges sampled randomly from the path-star graph.
         
         Args:
             size: Number of samples (K) to generate
             undirected: If True, also include reverse edges (y -> x) in the sampling pool
-        
+            use_directional_tokens: If true uses GT and LT tokens to show direction
+            use_task_tokens: If true uses EDGE token to show the task
         Returns:
-            edges: shape (size, 2) or (size, 3) if use directional otkesn 
+            edges: shape (size, 2+A+B) where A == 1 if use_directional_tokens is true and B == 1 if use_task_tokens is true, otherwise 0 
         """
         # Collect all edges from the adjacency list
         edges = []
         for u in self.adj_list:
             for v in self.adj_list[u]:
+
                 if use_directional_tokens:
                     edges.append([self.SPECIAL_TOKENS['GT'], u, v])
                 else:
@@ -234,15 +241,22 @@ class InWeightsPathStar:
         sampled_edges = edges[:size]
         
         # Return as torch tensor
-        return torch.tensor(sampled_edges, dtype=torch.long)
+        edges =  torch.tensor(sampled_edges, dtype=torch.long)
+        # Convert edge pairs to sequences: [<EDGE>,<optional direction token>, x, y] or [<optional direction token>, x, y]
+        if use_task_tokens:
+            edge_task_tokens = torch.full((size, 1), self.SPECIAL_TOKENS['EDGE'], dtype=torch.long)
+            edge_sequences = torch.cat([edge_task_tokens, edges], dim=1)
+        else:
+            edge_sequences = edges
+        
+        return edge_sequences
 
-    def generate_path_prediction_training_set(self, size, num_pause_tokens=1, 
-                                             obey_holdout=True, holdout_only=False, use_task_tokens=True):
+    def _generate_path_prediction_training_set(self, size, split, num_pause_tokens=1, use_task_tokens=True):
         """
         Generate a path-finding training set for the in-weights path memorization objective.
         
         Each training example has the format:
-        Input: [<PATH>, leaf, <PAUSE>, <PAUSE>, ..., <PAUSE>, root, n_2, n_3, ..., n_ℓ]
+        Input: [<optional PATH>, leaf, <PAUSE>, <PAUSE>, ..., <PAUSE>, root, n_2, n_3, ..., n_ℓ]
                where <PATH> is a task prefix token and the number of <PAUSE> tokens 
                is controlled by num_pause_tokens
         Target: predict each next token left-to-right
@@ -250,21 +264,20 @@ class InWeightsPathStar:
         Args:
             size: Number of samples (K) to generate
             num_pause_tokens: Number of <PAUSE> tokens to insert between leaf and path (default: 1)
-            obey_holdout: If True, only sample from training leaves (default: True)
-            holdout_only: If True, only sample from holdout leaves (default: False)
+            split: either 'train' (training leaves only), 'val' (holdout leaves) or all (both)
             use_task_tokens: If True, include <PATH> task prefix token (default: True)
         
         Returns:
-            sequences: torch tensor of shape [size, l+2+num_pause_tokens] containing full sequences
-                      (<PATH>, leaf, pause_1, ..., pause_n, root, n_2, ..., n_ℓ) if use_task_tokens=True
+            sequences: torch tensor of shape [size, l+1+num_pause_tokens+t] where t is if task_token is used or not, containing full sequences
+                      <PATH>, leaf, pause_1, ..., pause_n, root, n_2, ..., n_ℓ) if use_task_tokens=True
                       or (leaf, pause_1, ..., pause_n, root, n_2, ..., n_ℓ) if use_task_tokens=False
         """
         # Determine which leaf nodes to sample from
-        if holdout_only:
+        if split == 'val':
             if len(self.holdout_leaves) == 0:
                 raise ValueError("Cannot generate holdout_only data: no holdout paths available")
             leaf_nodes = self.holdout_leaves
-        elif obey_holdout:
+        elif split == 'train':
             if len(self.train_leaves) == 0:
                 raise ValueError("Cannot generate training data with obey_holdout=True: no training paths available")
             if len(self.train_leaves) < size:
@@ -277,9 +290,8 @@ class InWeightsPathStar:
         # Validate size
         max_paths = len(leaf_nodes)
         if size > max_paths:
-            mode_str = "holdout" if holdout_only else ("training" if obey_holdout else "all")
             raise ValueError(
-                f"Requested size ({size}) exceeds the number of available {mode_str} paths ({max_paths}). "
+                f"Requested size ({size}) exceeds the number of available {split} paths ({max_paths}). "
                 f"Graph has {len(self.train_leaves)} training paths and {len(self.holdout_leaves)} holdout paths."
             )
         
@@ -295,7 +307,7 @@ class InWeightsPathStar:
             pause_tokens = [self.pause_token] * num_pause_tokens
             if use_task_tokens:
                 # With task token: [<PATH>, leaf, <PAUSE>, ..., <PAUSE>, root, n_2, ..., n_ℓ]
-                sequence = [self.TASK_TOKENS['PATH'], leaf] + pause_tokens + path
+                sequence = [self.SPECIAL_TOKENS['PATH'], leaf] + pause_tokens + path
             else:
                 # Without task token: [leaf, <PAUSE>, ..., <PAUSE>, root, n_2, ..., n_ℓ]
                 sequence = [leaf] + pause_tokens + path
@@ -307,7 +319,7 @@ class InWeightsPathStar:
         return sequences
     
     def prepare(self, num_pause_tokens=1, output_dir='./data', 
-                use_undirected=True, use_directional_tokens=True, use_task_tokens=True, combine=True):
+                use_undirected=True, use_directional_tokens=True, use_task_tokens=True):
         """
         Prepare and save training and validation datasets to disk for in-weights path-star.
         
@@ -326,99 +338,73 @@ class InWeightsPathStar:
             use_undirected: If True, use undirected edges (both x->y and y->x) (default: True)
             use_directional_tokens: If True, use special tokens to demarcate edge directions in the edge training set
             use_task_tokens: If True, include PATH and EDGE task prefix tokens in sequences (default: True)
-            combine: If True, combine paths and edges into train.bin with class balancing. If False, save separately to paths.bin and edges.bin (default: True)
         """
         # Calculate dataset sizes based on graph structure
-        num_edges = self.d * (self.l - 1)
         num_train_path_samples = len(self.train_leaves)  # Training paths
         num_val_path_samples = len(self.holdout_leaves)  # Validation paths (holdout)
         
         # Calculate edge dataset size
-        num_edge_samples = (2 if use_undirected else 1) * num_edges
-        
-        # Calculate replication factor for path sequences to balance classes
-        replication_factor = num_edge_samples // num_train_path_samples if num_train_path_samples > 0 else 1
-        if replication_factor < 1:
-            replication_factor = 1
-        replicated_path_samples = num_train_path_samples * replication_factor
-        
-        # Training set: replicated train paths + all edges
-        train_size = replicated_path_samples + num_edge_samples
+        num_edge_samples = (2 if use_undirected else 1) * self.num_graph_edges
         
         # Validation set: only holdout paths (no edges)
-        val_size = num_val_path_samples
         
         # Create output directory with parameters in name
-        dir_name = self.generate_dataset_name(num_pause_tokens, use_undirected, use_directional_tokens, use_task_tokens, combine)
-        self.dir_name = dir_name
-        self.num_pause_tokens = num_pause_tokens
-        self.use_undirected = use_undirected
-        self.use_directional_tokens = use_directional_tokens
-        self.use_task_tokens = use_task_tokens
+        dir_name = self._generate_dataset_name(num_pause_tokens, use_undirected, use_directional_tokens, use_task_tokens)
         full_output_dir = os.path.join(output_dir, dir_name)
         os.makedirs(full_output_dir, exist_ok=True)
         
         print(f"Preparing InWeightsPathStar dataset...")
         print(f"  Parameters: d={self.d}, l={self.l}")
         print(f"  Graph structure:")
-        print(f"    Total vertices: {self.total_vert}")
-        print(f"    Total edges: {num_edges}")
+        print(f"    Total vertices: {self.num_vertices}")
+        print(f"    Total edges: {self.num_graph_edges}")
         print(f"    Total paths (spokes): {self.d}")
         print(f"    Training paths: {num_train_path_samples}")
         print(f"    Validation paths (holdout): {num_val_path_samples}")
         print(f"  Dataset composition:")
+        print(f"    Holdout percentage: {self.holdout_percentage}")
+        print(f"    Number of pause tokens: {num_pause_tokens}")
         print(f"    Edge samples: {num_edge_samples} ({'undirected' if use_undirected else 'directed'})")
         print(f"    Training path samples (original): {num_train_path_samples}")
-        print(f"    Training path samples (replicated): {replicated_path_samples} (factor: {replication_factor})")
         print(f"    Validation path samples: {num_val_path_samples}")
         print(f"  Final dataset sizes:")
-        if combine:
-            print(f"    Training set: {train_size} ({replicated_path_samples} replicated paths + {num_edge_samples} edges)")
-        else:
-            print(f"    Path dataset: {num_train_path_samples} (no replication)")
-            print(f"    Edge dataset: {num_edge_samples}")
-        print(f"    Validation set: {val_size} (holdout paths only, no edges)")
-        print(f"    2d dimension of training set is : {self.l + num_pause_tokens + 2}")
+        print(f"    Path dataset: {num_train_path_samples} (no replication)")
+        print(f"    Edge dataset: {num_edge_samples}")
+        print(f"    Validation set: {num_val_path_samples} (holdout paths only, no edges)")
+        print(f"    2d dimension of training set is : {self.l + num_pause_tokens + 1 + (1 if use_task_tokens else 0)}")
         print(f"  Output directory: {full_output_dir}")
         print(f"  Pause token: {self.pause_token}")
         print(f"  Pad token: {self.pad_token}")
         print(f"  EDGE token: {self.SPECIAL_TOKENS['EDGE']}")
         print(f"  PATH token: {self.SPECIAL_TOKENS['PATH']}")
-        print(f"  Number of pause tokens: {num_pause_tokens}")
-        print(f"  Holdout percentage: {self.holdout_percentage}")
         
         # Print paths_by_leaf in a pretty manner
-        # print(f"\n  Paths by leaf node:")
-        # for leaf, path in sorted(self.paths_by_leaf.items()):
-        #     path_str = ' -> '.join(map(str, path))
-        #     is_train = leaf in self.train_leaves
-        #     is_holdout = leaf in self.holdout_leaves
-        #     status = "TRAIN" if is_train else ("HOLDOUT" if is_holdout else "UNKNOWN")
-        #     print(f"    Leaf {leaf} [{status}]: {path_str}")
+        print(f"\n  Paths by leaf node:")
+        for leaf, path in sorted(self.paths_by_leaf.items()):
+            path_str = ' -> '.join(map(str, path))
+            is_train = leaf in self.train_leaves
+            is_holdout = leaf in self.holdout_leaves
+            status = "TRAIN" if is_train else ("HOLDOUT" if is_holdout else "UNKNOWN")
+            print(f"    Leaf {leaf} [{status}]: {path_str}")
         
         # Generate training set: paths + edges
         # print("\nGenerating training set (training paths + edges)...")
         
         # Generate path sequences for training (uses self.train_leaves)
-        train_path_sequences = self.generate_path_prediction_training_set(
+        train_path_sequences = self._generate_path_prediction_training_set(
             size=num_train_path_samples,
+            split='train',
             num_pause_tokens=num_pause_tokens,
-            obey_holdout=True,  # Uses train_leaves
             use_task_tokens=use_task_tokens
         )
         
         # Generate edge sequences
-        edges = self.generate_edge_memorization_training_set(
+        edge_sequences = self._generate_edge_memorization_training_set(
             size=num_edge_samples,
             undirected=use_undirected,
-            use_directional_tokens=use_directional_tokens
+            use_directional_tokens=use_directional_tokens,
+            use_task_tokens=use_task_tokens
         )
-        # Convert edge pairs to sequences: [<EDGE>,<optional direction token>, x, y] or [<optional direction token>, x, y]
-        if use_task_tokens:
-            edge_task_tokens = torch.full((num_edge_samples, 1), self.TASK_TOKENS['EDGE'], dtype=torch.long)
-            edge_sequences = torch.cat([edge_task_tokens, edges], dim=1)
-        else:
-            edge_sequences = edges
         
         # Pad edge sequences to match path sequence length using <PAD> token
         path_seq_len = train_path_sequences.shape[1]
@@ -432,66 +418,38 @@ class InWeightsPathStar:
             )
             edge_sequences = torch.cat([edge_sequences, padding], dim=1)
         
-        if combine:
-            # Replicate path sequences to account for class imbalance
-            # The imbalance factor is approximately (num_edge_samples / num_train_path_samples)
-            # which is roughly (l-1) for directed edges or 2*(l-1) for undirected
-            if num_train_path_samples > 0:
-                replication_factor = num_edge_samples // num_train_path_samples
-                if replication_factor > 1:
-                    print(f"  Replicating path sequences by factor of {replication_factor} to balance classes")
-                    train_path_sequences = train_path_sequences.repeat(replication_factor, 1)
-                    print(f"  Path sequences after replication: {train_path_sequences.shape[0]}")
-            
-            # Concatenate and shuffle training sequences
-            train_sequences = torch.cat([train_path_sequences, edge_sequences], dim=0)
-            train_indices = torch.randperm(train_sequences.shape[0])
-            train_sequences = train_sequences[train_indices]
-        else:
-            # No replication when not combining
-            replication_factor = 1
         
         # Generate validation set: only holdout paths (no edges)
         print("Generating validation set (holdout paths only, no edges)...")
-        val_sequences = self.generate_path_prediction_training_set(
+        val_sequences = self._generate_path_prediction_training_set(
             size=num_val_path_samples,
+            split='val',
             num_pause_tokens=num_pause_tokens,
-            holdout_only=True,  # Uses holdout_leaves
             use_task_tokens=use_task_tokens
         )
         
         # Debug: Print train and val sequences
-        if combine:
-            print(f"\nDebug - Train sequences (numpy):")
-            print(train_sequences.numpy())
-        else:
-            print(f"\nDebug - Path sequences (numpy):")
-            print(train_path_sequences.numpy())
-            print(f"\nDebug - Edge sequences (numpy):")
-            print(edge_sequences.numpy())
+        import numpy as np
+        np.set_printoptions(threshold=np.inf, linewidth=np.inf)
+        print(f"\nDebug - Path sequences (numpy):")
+        print(train_path_sequences.numpy())
+        print(f"\nDebug - Edge sequences (numpy):")
+        print(edge_sequences.numpy())
         print(f"\nDebug - Val sequences (numpy):")
         print(val_sequences.numpy())
         
-        # Save training data
-        if combine:
-            train_path = os.path.join(full_output_dir, 'train.bin')
-            print(f"\nSaving training data to {train_path}...")
-            train_data = train_sequences.numpy().astype(np.uint16)
-            train_data.tofile(train_path)
-            print(f"  Saved {train_data.shape[0]} sequences of length {train_data.shape[1]}")
-        else:
-            # Save paths and edges separately
-            paths_path = os.path.join(full_output_dir, 'paths.bin')
-            print(f"\nSaving path data to {paths_path}...")
-            paths_data = train_path_sequences.numpy().astype(np.uint16)
-            paths_data.tofile(paths_path)
-            print(f"  Saved {paths_data.shape[0]} sequences of length {paths_data.shape[1]}")
-            
-            edges_path = os.path.join(full_output_dir, 'edges.bin')
-            print(f"Saving edge data to {edges_path}...")
-            edges_data = edge_sequences.numpy().astype(np.uint16)
-            edges_data.tofile(edges_path)
-            print(f"  Saved {edges_data.shape[0]} sequences of length {edges_data.shape[1]}")
+        # Save paths and edges separately
+        paths_path = os.path.join(full_output_dir, 'paths.bin')
+        print(f"\nSaving path data to {paths_path}...")
+        paths_data = train_path_sequences.numpy().astype(np.uint16)
+        paths_data.tofile(paths_path)
+        print(f"  Saved {paths_data.shape[0]} sequences of length {paths_data.shape[1]}")
+        
+        edges_path = os.path.join(full_output_dir, 'edges.bin')
+        print(f"Saving edge data to {edges_path}...")
+        edges_data = edge_sequences.numpy().astype(np.uint16)
+        edges_data.tofile(edges_path)
+        print(f"  Saved {edges_data.shape[0]} sequences of length {edges_data.shape[1]}")
         
         # Save validation data
         val_path = os.path.join(full_output_dir, 'val.bin')
@@ -505,7 +463,10 @@ class InWeightsPathStar:
         all_tokens = sorted(set(self.vertices) | set(self.SPECIAL_TOKENS.values()))
         # vocab_size must be max_token_id + 1 for PyTorch embedding layers
         # also add <PAUSE> <PAD> <PATH> <EDGE> into consideration
-        vocab_size = self.vocab_size + 11
+        if self.randomize_vocab_size:
+            vocab_size = self.randomize_vocab_size + self.num_special_tokens 
+        else:
+            vocab_size = self.num_vertices + self.num_special_tokens
         
         itos = {}
         stoi = {}
@@ -556,12 +517,11 @@ class InWeightsPathStar:
             'stoi': stoi,
             'd': self.d,
             'l': self.l,
-            'total_vertices': self.total_vert,
-            'total_edges': num_edges,
+            'total_vertices': self.num_vertices,
+            'total_edges': self.num_graph_edges,
             'pause_token': self.SPECIAL_TOKENS["PAUSE"],
             'pad_token': self.SPECIAL_TOKENS["PAD"],
             'special_tokens': self.SPECIAL_TOKENS,
-            'task_tokens': self.TASK_TOKENS,
             'num_pause_tokens': num_pause_tokens,
             'root_vertex': self.v_root,
             'leaf_vertices': self.v_leaf,
@@ -575,22 +535,13 @@ class InWeightsPathStar:
             'edge_context_length': edge_context_length,
             'path_context_length': path_context_length,
             'block_size': path_seq_len,  # Use actual sequence length (path_context_length + l), not just context length
-            'combine': combine,
             'num_train_path_samples': num_train_path_samples,
             'num_val_path_samples': num_val_path_samples,
-            'total_edge_size': num_edge_samples,
-            'replication_factor': replication_factor,
+            'total_edge_size': num_edge_samples
         }
         
-        if combine:
-            meta['train_size'] = train_size
-            meta['replicated_train_paths'] = train_path_sequences.shape[0]
-            meta['TRAIN_DATASET_SIZE'] = train_data.shape[0]
-        else:
-            meta['PATHS_DATASET_SIZE'] = paths_data.shape[0]
-            meta['EDGES_DATASET_SIZE'] = edges_data.shape[0]
-        
-        meta['val_size'] = val_size
+        meta['PATHS_DATASET_SIZE'] = paths_data.shape[0]
+        meta['EDGES_DATASET_SIZE'] = edges_data.shape[0]
         meta['VAL_DATASET_SIZE'] = val_data.shape[0]
         
         meta_path = os.path.join(full_output_dir, 'meta.pkl')
@@ -600,11 +551,8 @@ class InWeightsPathStar:
         
         print(f"\nDataset preparation complete!")
         print(f"  Vocab size: {vocab_size}")
-        if combine:
-            print(f"  Total tokens (train): {train_data.size}")
-        else:
-            print(f"  Total tokens (paths): {paths_data.size}")
-            print(f"  Total tokens (edges): {edges_data.size}")
+        print(f"  Total tokens (paths): {paths_data.size}")
+        print(f"  Total tokens (edges): {edges_data.size}")
         print(f"  Total tokens (val): {val_data.size}")
         
         return full_output_dir
@@ -622,33 +570,27 @@ class InWeightsPathStar:
             meta = pickle.load(f)
         
         # Load data based on combine mode
-        combine_mode = meta.get('combine', True)  # Default to True for backward compatibility
         val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
         
-        if combine_mode:
-            # Load combined train.bin
-            train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-            return meta, train_data, val_data
-        else:
-            # Load separate paths.bin and edges.bin
-            paths_data = np.memmap(os.path.join(data_dir, 'paths.bin'), dtype=np.uint16, mode='r')
-            edges_data = np.memmap(os.path.join(data_dir, 'edges.bin'), dtype=np.uint16, mode='r')
-            return meta, paths_data, edges_data, val_data
+        # Load separate paths.bin and edges.bin
+        paths_data = np.memmap(os.path.join(data_dir, 'paths.bin'), dtype=np.uint16, mode='r')
+        edges_data = np.memmap(os.path.join(data_dir, 'edges.bin'), dtype=np.uint16, mode='r')
+        return meta, paths_data, edges_data, val_data
 
-    def generate_dataset_name(self, num_pause_tokens, use_undirected, use_directional_tokens, use_task_tokens=True, combine=True):
+    def _generate_dataset_name(self, num_pause_tokens, use_undirected, use_directional_tokens, use_task_tokens=True):
         """
         Generate dataset directory name matching the naming convention in pathstar.py
         """
-        task_token_suffix = "_tt" if use_task_tokens else "_nott"
-        combine_suffix = "_combined" if combine else "_separate"
-        self.dir_name = f'inweights_pathstar_v{self.vocab_size}_d{self.d}_l{self.l}_p{num_pause_tokens}_{"un" if use_undirected else ""}directed_{"dt" if use_directional_tokens else ""}{task_token_suffix}{combine_suffix}'
         self.num_pause_tokens = num_pause_tokens
         self.use_undirected = use_undirected
         self.use_directional_tokens = use_directional_tokens
         self.use_task_tokens = use_task_tokens
+        task_token_suffix = "_tt" if use_task_tokens else "_nott"
+        randomize = (f"_v{self.randomize_vocab_size}" if self.randomize_vocab_size else "")
+        self.dir_name = f'inweights_pathstar{randomize}_d{self.d}_l{self.l}_p{num_pause_tokens}_{"un" if use_undirected else ""}directed_{"dt" if use_directional_tokens else ""}{task_token_suffix}'
         return self.dir_name
 
-    def check_dataset_exists(self):
+    def _check_dataset_exists(self):
         """
         Check if dataset exists and validate that metadata matches requested parameters.
         
@@ -659,9 +601,14 @@ class InWeightsPathStar:
         data_dir = os.path.join('data', dataset_name)
         meta_path = os.path.join(data_dir, 'meta.pkl')
         val_path = os.path.join(data_dir, 'val.bin')
+        edges_path = os.path.join(data_dir, 'edges.bin')
+        paths_path = os.path.join(data_dir, 'paths.bin')
         
         # Check if metadata and val files exist
         if not (os.path.exists(data_dir) and os.path.exists(meta_path) and os.path.exists(val_path)):
+            return False
+
+        if not (os.path.exists(paths_path) and os.path.exists(edges_path)):
             return False
         
         # Load metadata to check combine mode
@@ -672,18 +619,6 @@ class InWeightsPathStar:
             print(f"Error reading metadata: {e}")
             return False
         
-        # Check for appropriate files based on combine mode
-        combine_mode = meta.get('combine', True)  # Default to True for backward compatibility
-        if combine_mode:
-            train_path = os.path.join(data_dir, 'train.bin')
-            if not os.path.exists(train_path):
-                return False
-        else:
-            paths_path = os.path.join(data_dir, 'paths.bin')
-            edges_path = os.path.join(data_dir, 'edges.bin')
-            if not (os.path.exists(paths_path) and os.path.exists(edges_path)):
-                return False
-        
         # Check if all key parameters match
         params_match = (
             meta.get('d') == self.d and
@@ -692,7 +627,6 @@ class InWeightsPathStar:
             meta.get('use_undirected') == self.use_undirected and
             meta.get('use_directional_tokens') == self.use_directional_tokens and
             meta.get('use_task_tokens', True) == self.use_task_tokens and  # Default to True for backward compatibility
-            meta.get('combine', True) == getattr(self, 'combine', True) and  # Check combine parameter
             abs(meta.get('holdout_percentage', 0.0) - self.holdout_percentage) < 1e-6  # Float comparison
         )
         
@@ -720,14 +654,13 @@ class InWeightsPathStar:
                 f"vocab_size ({self.vocab_size}) must be >= d * (l-1) + 1 = {self.num_vertices}"
             )
         
-        # Store combine parameter for check_dataset_exists
         self.combine = combine
         
         # Generate dataset name
-        dataset_name = self.generate_dataset_name(num_pause_tokens, use_undirected, use_directional_tokens, use_task_tokens, combine)
+        dataset_name = self._generate_dataset_name(num_pause_tokens, use_undirected, use_directional_tokens, use_task_tokens, combine)
         
         # Check if dataset exists and parameters match
-        if self.check_dataset_exists():
+        if self._check_dataset_exists():
             print(f"Dataset '{dataset_name}' exists with matching parameters. Using existing dataset.")
             return dataset_name
         
@@ -758,75 +691,46 @@ class InWeightsPathStar:
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Generate PathStar datasets')
-    parser.add_argument('--mode', type=str, required=True, choices=['incontext', 'inweights'],
-                        help='Dataset mode: incontext or inweights')
-    parser.add_argument('--d', type=int, default=10,
-                        help='Number of spokes/paths in the path-star (default: 10)')
-    parser.add_argument('--l', type=int, default=100,
-                        help='Length of each path (default: 100)')
-    parser.add_argument('--vocab_size', type=int, default=2000,
-                        help='Vocabulary size (default: 2000)')
-    parser.add_argument('--train_size', type=int, default=100000,
-                        help='Number of incontext training examples (default: 100000)')
-    parser.add_argument('--val_size', type=int, default=10000,
-                        help='Number of incontext validation examples (default: 10000)')
+    parser.add_argument('--d', type=int, default=100,
+                        help='Number of spokes/paths in the path-star (default: 100)')
+    parser.add_argument('--l', type=int, default=5,
+                        help='Length of each path (default: 5)')
+    parser.add_argument('--randomize_vocab_size', type=str, default=None,
+                        help='Vocabulary size to randomize on, "auto" will set it based on d and l. (default: None)')
     parser.add_argument('--num_pause_tokens', type=int, default=1,
                         help='Number of PAUSE tokens used (default: 1)')
     parser.add_argument('--use_directional_tokens', action='store_true',
-                        help='Use directional tokens (> and <) in incontext mode')
-    parser.add_argument('--use_directed', action='store_true',
-                        help='Use directed edges for inweights mode (default: undirected)')
-    parser.add_argument('--train_val_split', type=float, default=0.9,
-                        help='Train/validation split ratio for inweights mode (default: 0.9)')
-    parser.add_argument('--output_dir', type=str, default='./data',
-                        help='Output directory for datasets (default: ./data)')
+                        help='Use directional tokens (> and <)')
     parser.add_argument('--use_task_tokens', action='store_true',
                         help='Use task prefix tokens (PATH and EDGE) in sequences (default: False)')
-    parser.add_argument('--combine', action='store_true', default=False,
-                        help='Combine paths and edges into train.bin with class balancing (default: False, saves separately)')
+    parser.add_argument('--use_directed', action='store_true',
+                        help='Use directed edges for inweights mode (default: undirected)')
+    parser.add_argument('--holdout_percentage', type=float, default=0.2,
+                        help='validation split ratio (default: 0.2)')
+    parser.add_argument('--output_dir', type=str, default='./data',
+                        help='Output directory for datasets (default: ./data)')
     
     args = parser.parse_args()
     
-    if args.mode == 'incontext':
-        print(f"Generating InContextPathStar dataset...")
-        raise ValueError("This is not supported yet")
-        # generator = InContextPathStar(d=args.d, l=args.l, vocab_size=args.vocab_size)
-        # generator.prepare(
-        #     train_size=args.train_size,
-        #     val_size=args.val_size,
-        #     use_directional_tokens=args.use_directional_tokens,
-        #     num_pause_tokens=args.num_pause_tokens,
-        #     output_dir=args.output_dir
-        # )
-    elif args.mode == 'inweights':
-        print(f"Generating InWeightsPathStar dataset...")
-        
-        # Calculate holdout_percentage from train_val_split
-        # train_val_split=0.9 means 90% train, 10% validation
-        # so holdout_percentage = 1 - train_val_split = 0.1
-        holdout_percentage = 1.0 - args.train_val_split
-        
-        # Create randomized mapping from canonical node IDs to vocabulary tokens
-        num_vertices = args.d * (args.l - 1) + 1
-        if num_vertices > args.vocab_size:
-            raise ValueError(
-                f"Graph requires {num_vertices} vertices but vocab_size is only {args.vocab_size}. "
-                f"Please increase vocab_size to at least {num_vertices}."
-            )
-        
-        
-        generator = InWeightsPathStar(
-            d=args.d, 
-            l=args.l, 
-            holdout_percentage=holdout_percentage,
-            vocab_size=args.vocab_size
-        )
-        
-        generator.prepare(
-            num_pause_tokens=args.num_pause_tokens,
-            output_dir=args.output_dir,
-            use_undirected=not args.use_directed,
-            use_directional_tokens=args.use_directional_tokens,
-            use_task_tokens=args.use_task_tokens,
-            combine=args.combine
-        )
+    print(f"Generating InWeightsPathStar dataset...")
+    
+    # Create randomized mapping from canonical node IDs to vocabulary tokens
+    num_vertices = args.d * (args.l - 1) + 1
+
+    if args.randomize_vocab_size and args.randomize_vocab_size != "auto":
+        args.randomize_vocab_size = int(args.randomize_vocab_size)
+    
+    generator = InWeightsPathStar(
+        d=args.d, 
+        l=args.l, 
+        holdout_percentage=args.holdout_percentage,
+        randomize_vocab_size=args.randomize_vocab_size,
+    )
+    
+    generator.prepare(
+        num_pause_tokens=args.num_pause_tokens,
+        output_dir=args.output_dir,
+        use_undirected=not args.use_directed,
+        use_directional_tokens=args.use_directional_tokens,
+        use_task_tokens=args.use_task_tokens,
+    )
