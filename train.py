@@ -350,6 +350,9 @@ def set_wandb_name(config):
                 f"H{config['n_head']}_"
                 f"D{config['dropout']}_"
                 f"p{config['num_pause_tokens']}_"
+                f"undir_" if config["use_undirected"] else "dir_"
+                f"tt_" if config["use_task_tokens"] else "nott_"
+                f"dt_" if config["use_directional_tokens"] else "nodt_"
                 f"{config['epochs']}"
             )
             wandb.run.name = custom_name
