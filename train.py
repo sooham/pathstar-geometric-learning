@@ -112,10 +112,10 @@ def compute_per_token_loss_with_teacher_forcing(meta, logits, input, targets, to
     if use_task_tokens:
         # Use task tokens to determine context length
         context_length_per_input = torch.where(
-            input[:, 0] == meta['task_tokens']['EDGE'],
+            input[:, 0] == meta['special_tokens']['EDGE'],
             torch.tensor((1 if use_task_tokens else 0) + (1 if meta['use_directional_tokens'] else 0) + 1, device=input.device),
             torch.where(
-                input[:, 0] == meta['task_tokens']['PATH'],
+                input[:, 0] == meta['special_tokens']['PATH'],
                 torch.tensor((1 if use_task_tokens else 0) + 1 + meta['num_pause_tokens'], device=input.device),
                 torch.tensor(0, device=input.device)
             )
@@ -173,7 +173,7 @@ def compute_per_token_loss_with_teacher_forcing(meta, logits, input, targets, to
 
 
 # DONE
-def compute_per_token_accuracy_autoregressive(ctx, model, meta, val_data_batch, num_samples, device_local):
+def compute_per_token_accuracy_autoregressive(ctx, model, meta, val_data_batch, num_samples, device_local, print_samples=False):
     """Compute per-token accuracy using autoregressive generation"""
     sample_indices = np.random.choice(len(val_data_batch), size=min(num_samples, len(val_data_batch)), replace=False)
     
@@ -204,17 +204,17 @@ def compute_per_token_accuracy_autoregressive(ctx, model, meta, val_data_batch, 
     model.train()
     
     # Print generated tokens and ground truths side by side
-    print("\n=== Generated vs Ground Truth ===")
     ground_truths_array = np.stack(ground_truths)
-    itos = meta['itos']
-    
-    for sample_idx in range(len(generated_tokens_batch)):
-        generated_str = ' '.join([itos[token] for token in generated_tokens_batch[sample_idx]])
-        ground_truth_str = ' '.join([itos[token] for token in ground_truths_array[sample_idx]])
-        print(f"Sample {sample_idx}:")
-        print(f"  Generated:    {generated_str}")
-        print(f"  Ground Truth: {ground_truth_str}")
-    print("=" * 40 + "\n")
+    if print_samples:
+        print("\n=== Generated vs Ground Truth ===")
+        itos = meta['itos']
+        for sample_idx in range(len(generated_tokens_batch)):
+            generated_str = ' '.join([itos[token] for token in generated_tokens_batch[sample_idx]])
+            ground_truth_str = ' '.join([itos[token] for token in ground_truths_array[sample_idx]])
+            print(f"Sample {sample_idx}:")
+            print(f"  Generated:    {generated_str}")
+            print(f"  Ground Truth: {ground_truth_str}")
+        print("=" * 40 + "\n")
     
     per_token_accuracies = {}
     
@@ -341,6 +341,9 @@ def set_wandb_name(config):
         # Set custom run name for sweep runs
         if wandb.run is not None:
             utc_time = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+            dir_label = "undir_" if config["use_undirected"] else "dir_"
+            tt_label = "tt_" if config['use_task_tokens'] else 'nott_'
+            dt_label = 'dt_' if config['use_directional_tokens'] else 'nodt_'
             custom_name = (
                 f"{utc_time}_"
                 f"G{config['graph_d']},"
@@ -350,9 +353,9 @@ def set_wandb_name(config):
                 f"H{config['n_head']}_"
                 f"D{config['dropout']}_"
                 f"p{config['num_pause_tokens']}_"
-                f"undir_" if config["use_undirected"] else "dir_"
-                f"tt_" if config["use_task_tokens"] else "nott_"
-                f"dt_" if config["use_directional_tokens"] else "nodt_"
+                f"{dir_label}"
+                f"{tt_label}"
+                f"{dt_label}"
                 f"{config['epochs']}"
             )
             wandb.run.name = custom_name
@@ -398,8 +401,8 @@ def detect_device(config):
     return device, device_type, gpu_id
 
 def set_dtype(config):
-    torch.backends.cudnn.conv.fp32_precision = 'tf32'
-    torch.backends.cuda.matmul.fp32_precision = 'tf32'
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cuda.matmul.allow_tf32 = True
     
     # Auto-detect dtype with GPU-aware selection
     if config['dtype'] == 'auto':
@@ -602,8 +605,8 @@ def calculate_optimal_batch_size_for_training(model, block_size, vocab_size, dev
     return max_batch_size
 
 # GOOD
-def evaluate(estimate_loss_on_val, config, meta, iter_num, lr, ctx, device, model, val_data_np, paths_data_np):
-    losses = estimate_loss_on_val()
+def evaluate(estimate_loss_on_val, config, meta, iter_num, lr, ctx, device, model, val_data_np, paths_data_np, print_samples=False):
+    losses = estimate_loss_on_val(print_samples)
     graph_length = meta['l']
     PATHS_DATASET_SIZE = meta['PATHS_DATASET_SIZE']
     VAL_DATASET_SIZE = meta['VAL_DATASET_SIZE']
@@ -1053,7 +1056,7 @@ def train(config=None):
         return x, y
     
     @torch.no_grad()
-    def estimate_loss_on_val():
+    def estimate_loss_on_val(print_samples=False):
         """Estimate loss on validation split"""
         # Reset validation batch state for reproducible evaluation
         # This ensures each evaluation starts from the beginning
@@ -1073,7 +1076,7 @@ def train(config=None):
                 logits, loss = model(X, Y, label_smoothing=default_config['label_smoothing'])
             losses[k] = loss.item()
             
-            per_token_losses_in_batch = compute_per_token_loss_with_teacher_forcing(meta, logits, X, Y, range(1, graph_length + 1), task_type='path', debug=False)
+            per_token_losses_in_batch = compute_per_token_loss_with_teacher_forcing(meta, logits, X, Y, range(1, graph_length + 1), task_type='path')
             for token_pos, (token_loss_sum, batch_size_local) in per_token_losses_in_batch.items():
                 if not math.isnan(token_loss_sum):
                     val_token_losses[token_pos].append((token_loss_sum, batch_size_local))
@@ -1093,7 +1096,7 @@ def train(config=None):
         
         # Compute per-token accuracy
         num_samples_for_accuracy = min(100, VAL_DATASET_SIZE)
-        val_per_token_accuracy = compute_per_token_accuracy_autoregressive(ctx, model, meta, val_data, num_samples_for_accuracy, device)
+        val_per_token_accuracy = compute_per_token_accuracy_autoregressive(ctx, model, meta, val_data, num_samples_for_accuracy, device, print_samples)
         out['val_per_token_accuracy'] = val_per_token_accuracy
         
         model.train()
@@ -1121,7 +1124,8 @@ def train(config=None):
         
         # Evaluate
         if iter_num % default_config['eval_interval'] == 0:
-            evaluate(estimate_loss_on_val, default_config, meta, iter_num, lr, ctx, device, model, val_data_np, paths_data_np)
+            print_samples = iter_num % default_config['print_eval_interval'] == 0
+            evaluate(estimate_loss_on_val, default_config, meta, iter_num, lr, ctx, device, model, val_data_np, paths_data_np, print_samples)
         
         if iter_num == 0 and default_config['eval_only']:
             break

@@ -74,6 +74,8 @@ parameters:
     value: true
   eval_interval:
     value: 10  # Increased from 50 to reduce evaluation overhead
+  print_eval_interval:
+    value: 1000
   log_interval:
     value: 1  # Increased from 10 to reduce print overhead
 
