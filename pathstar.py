@@ -561,7 +561,6 @@ class InWeightsPathStar:
         dataset = self.dir_name
         # Data loading setup
         data_dir = os.path.join('data', dataset)
-        # Load metadata first to determine combine mode
         meta_path = os.path.join(data_dir, 'meta.pkl')
         if not os.path.exists(meta_path):
             raise ValueError(f"Metadata file not found at {meta_path}")
@@ -569,7 +568,6 @@ class InWeightsPathStar:
         with open(meta_path, 'rb') as f:
             meta = pickle.load(f)
         
-        # Load data based on combine mode
         val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
         
         # Load separate paths.bin and edges.bin
@@ -611,7 +609,6 @@ class InWeightsPathStar:
         if not (os.path.exists(paths_path) and os.path.exists(edges_path)):
             return False
         
-        # Load metadata to check combine mode
         try:
             with open(meta_path, 'rb') as f:
                 meta = pickle.load(f)
@@ -634,30 +631,28 @@ class InWeightsPathStar:
             print(f"Dataset exists but parameters don't match:")
             print(f"  Existing: d={meta.get('d')}, l={meta.get('l')}, pause={meta.get('num_pause_tokens')}, "
                 f"undirected={meta.get('use_undirected')}, directional_tokens={meta.get('use_directional_tokens')}, "
-                f"task_tokens={meta.get('use_task_tokens', True)}, combine={meta.get('combine', True)}, holdout={meta.get('holdout_percentage')}")
+                f"task_tokens={meta.get('use_task_tokens', True)}, holdout={meta.get('holdout_percentage')}")
             print(f"  Requested: d={self.d}, l={self.l}, pause={self.num_pause_tokens}, "
                 f"undirected={self.use_undirected}, directional_tokens={self.use_directional_tokens}, "
-                f"task_tokens={self.use_task_tokens}, combine={getattr(self, 'combine', True)}, holdout={self.holdout_percentage}")
+                f"task_tokens={self.use_task_tokens}, holdout={self.holdout_percentage}")
             print(f"  Will regenerate dataset...")
             return False
         
         return True
 
 
-    def generate_dataset_if_needed(self, num_pause_tokens, use_undirected, use_directional_tokens, use_task_tokens=True, combine=True):
+    def generate_dataset_if_needed(self, num_pause_tokens, use_undirected, use_directional_tokens, use_task_tokens=True):
         """
         Generate the dataset using InWeightsPathStar if it doesn't exist or parameters don't match.
         """
         # Validate vocab_size
-        if self.vocab_size < self.num_vertices:
+        if self.randomize_vocab_size != 'auto' and self.randomize_vocab_size < self.num_vertices:
             raise ValueError(
-                f"vocab_size ({self.vocab_size}) must be >= d * (l-1) + 1 = {self.num_vertices}"
+                f"vocab_size ({self.randomize_vocab_size}) must be >= d * (l-1) + 1 = {self.num_vertices}"
             )
         
-        self.combine = combine
-        
         # Generate dataset name
-        dataset_name = self._generate_dataset_name(num_pause_tokens, use_undirected, use_directional_tokens, use_task_tokens, combine)
+        dataset_name = self._generate_dataset_name(num_pause_tokens, use_undirected, use_directional_tokens, use_task_tokens)
         
         # Check if dataset exists and parameters match
         if self._check_dataset_exists():
@@ -679,7 +674,6 @@ class InWeightsPathStar:
             use_undirected=use_undirected,
             use_directional_tokens=use_directional_tokens,
             use_task_tokens=use_task_tokens,
-            combine=combine
         )
         
         print(f"\n{'='*80}")

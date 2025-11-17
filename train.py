@@ -690,7 +690,7 @@ def evaluate(estimate_loss_on_val, config, meta, iter_num, lr, ctx, device, mode
         print(f"saving checkpoint to {config['out_dir']}/{meta['checkpoint_filename']}")
         torch.save(checkpoint_data, os.path.join(config['out_dir'], meta['checkpoint_filename']))
 
-def determine_dataset_in_device_size(device_type, paths_data, edges_data, val_data, limit=0.1):
+def determine_dataset_in_device_size(device, device_type, paths_data, edges_data, val_data, limit=0.1):
     # Calculate dataset memory requirements BEFORE batch size calculation
     # This ensures batch size accounts for dataset memory if it will be loaded to GPU
     dataset_reserved_memory = 0
@@ -768,14 +768,14 @@ def train(config=None):
         default_config['wandb_run_name'] = custom_name
 
     # Validate vocab_size
-    assert default_config['randomize_vocab_size'] == 'auto' or (default_config['randomize_vocab_size']= default_config['graph_d'] * (default_config['graph_l'] - 1) + 1), \
+    assert default_config['randomize_vocab_size'] == 'auto' or (default_config['randomize_vocab_size'] == default_config['graph_d'] * (default_config['graph_l'] - 1) + 1), \
         f"randomize_vocab_size must be >= graph_d * (graph_l - 1) + 1"
     
     # Generate/load dataset
     gen = InWeightsPathStar(
         d=default_config['graph_d'],
         l=default_config['graph_l'],
-        randomize_vocab_sizedefault_config['rrandomize_vocab_size,
+        randomize_vocab_size=default_config['randomize_vocab_size'],
         holdout_percentage=default_config['graph_holdout_percentage'],
     )
 
@@ -786,6 +786,7 @@ def train(config=None):
     )
     
     meta, paths_data, edges_data, val_data = gen.load_dataset()
+    meta['randomize_vocab_size'] = gen.randomize_vocab_size
     
     # Extract graph parameters from metadata
     graph_length = meta['l']
@@ -835,7 +836,7 @@ def train(config=None):
     val_data = val_data.reshape(VAL_DATASET_SIZE, val_seq_length)
     
     
-    dataset_reserved_memory = determine_dataset_in_device_size(device_type, paths_data, edges_data, val_data)
+    dataset_reserved_memory = determine_dataset_in_device_size(device, device_type, paths_data, edges_data, val_data)
     
     train_batch_size = calculate_optimal_batch_size_for_training(
         model, meta['block_size'], meta['randomize_vocab_size'], device, dtype,
