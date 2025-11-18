@@ -9,7 +9,7 @@ metric:
 parameters:
   # Dataset parameters - small fixed values for quick iteration
   graph_d:
-    values: [1000,5000]
+    values: [1000]
   graph_l:
     value: 5
   randomize_vocab_size:
@@ -21,9 +21,9 @@ parameters:
   use_undirected:
     values: [true, false]
   use_directional_tokens:
-    value: [false, true]
+    values: [false, true]
   use_task_tokens:
-    value: [false, true]
+    values: [false, true]
   
   # Model architecture parameters - sweep these
   n_layer:
@@ -31,7 +31,7 @@ parameters:
   n_head:
     values: [8]
   n_embd:
-    values: [8,64]
+    values: [8,128]
   dropout:
     values: [0.01]
   bias:
@@ -63,7 +63,7 @@ parameters:
   
   # Fixed training parameters
   epochs:
-    value: 2000  # Shorter for quick testing
+    value: 1000  # Shorter for quick testing
   edge_iterations_per_epoch: 
     value: 10 # 8k edges total 
   path_iterations_per_epoch: 
