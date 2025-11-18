@@ -162,7 +162,7 @@ def compute_per_token_loss_with_teacher_forcing(meta, logits, input, targets, to
                 logits_valid = logits_at_pos[valid_mask]
                 targets_valid = targets_at_pos[valid_mask]
                 
-                token_loss = F.cross_entropy(logits_valid, targets_valid, reduction='sum')
+                token_loss = F.cross_entropy(logits_valid, targets_valid, reduction='mean')
                 per_token_losses[token_pos] = (token_loss.item(), batch_size_local)
             else:
                 raise ValueError("Issue at line 168")
