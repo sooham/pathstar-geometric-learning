@@ -226,7 +226,7 @@ def format_training_slice(sequences, itos, meta, num_samples=10):
         
     return "\n".join(lines)
 
-def create_metrics_table(metrics, graph_length, iter_num, epoch, lr, tokens_per_sec=None, batch_size=None, edge_memorization_pct=None):
+def create_metrics_table(metrics, graph_length, iter_num, epoch, lr, tokens_per_sec=None, batch_size=None, edge_memorization_pct=None, train_dataset_size=None, eval_dataset_size=None):
     """Create a Rich Table for per-token metrics (Train vs Val)"""
     title = f"Per-Token Metrics (Iter {iter_num}, Epoch {epoch:.2f}, LR {lr:.2e}"
     if batch_size is not None:
@@ -235,6 +235,8 @@ def create_metrics_table(metrics, graph_length, iter_num, epoch, lr, tokens_per_
         title += f", {tokens_per_sec:.2e} tok/s"
     if edge_memorization_pct is not None:
         title += f", Edge Mem: {edge_memorization_pct:.1f}%"
+    if train_dataset_size is not None and eval_dataset_size is not None:
+        title += f", Train N={train_dataset_size:,}, Eval N={eval_dataset_size:,}"
     title += ")"
     table = Table(title=title, show_header=True, header_style="bold magenta")
     table.add_column("Pos", style="cyan", justify="center")
@@ -867,7 +869,7 @@ def calculate_optimal_batch_size_for_training(model, block_size, vocab_size, dev
     return max_batch_size
 
 # GOOD
-def evaluate(estimate_metrics, config, meta, iter_num, lr, ctx, device, model, val_data_np, paths_data_np, edges_data_np, print_samples=False, eval_layout_component=None, metrics_layout_component=None, tokens_per_sec=None, batch_size=None):
+def evaluate(estimate_metrics, config, meta, iter_num, lr, ctx, device, model, val_data_np, paths_data_np, edges_data_np, print_samples=False, eval_layout_component=None, metrics_layout_component=None, tokens_per_sec=None, batch_size=None, train_dataset_size=None, eval_dataset_size=None):
     # Compute metrics for both splits
     val_metrics = estimate_metrics('val', print_samples)
     train_metrics = estimate_metrics('train', False) # Don't print train samples here
@@ -895,7 +897,18 @@ def evaluate(estimate_metrics, config, meta, iter_num, lr, ctx, device, model, v
 
     # Update metrics display
     if metrics_layout_component:
-        metrics_table = create_metrics_table(losses, graph_length, iter_num, current_epoch, lr, tokens_per_sec, batch_size, edge_memorization_pct)
+        metrics_table = create_metrics_table(
+            losses,
+            graph_length,
+            iter_num,
+            current_epoch,
+            lr,
+            tokens_per_sec,
+            batch_size,
+            edge_memorization_pct,
+            train_dataset_size=train_dataset_size,
+            eval_dataset_size=eval_dataset_size,
+        )
         metrics_layout_component.update(Panel(Align.center(metrics_table), title="Validation Metrics", border_style="magenta"))
 
     # # PRINTING
@@ -1674,7 +1687,27 @@ def train(config=None):
                      if 'steps' in locals():
                          current_tokens_per_sec = (train_batch_size * steps * meta['block_size']) / dt
                 
-                evaluate(estimate_metrics, default_config, meta, iter_num, lr, ctx, device, model, val_data_np, paths_data_np, edges_data_np, print_samples, eval_layout_component=layout["evaluation"], metrics_layout_component=layout["metrics"], tokens_per_sec=current_tokens_per_sec, batch_size=train_batch_size)
+                train_total_dataset_size = combined_size if default_config['interleave_dataset'] else (paths_size + edges_size)
+                evaluate(
+                    estimate_metrics,
+                    default_config,
+                    meta,
+                    iter_num,
+                    lr,
+                    ctx,
+                    device,
+                    model,
+                    val_data_np,
+                    paths_data_np,
+                    edges_data_np,
+                    print_samples,
+                    eval_layout_component=layout["evaluation"],
+                    metrics_layout_component=layout["metrics"],
+                    tokens_per_sec=current_tokens_per_sec,
+                    batch_size=train_batch_size,
+                    train_dataset_size=train_total_dataset_size,
+                    eval_dataset_size=VAL_DATASET_SIZE,
+                )
             
             if iter_num == 0 and default_config['eval_only']:
                 break
