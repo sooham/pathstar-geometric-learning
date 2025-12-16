@@ -3,7 +3,7 @@ This training script runs on a single GPU and supports wandb sweeps.
 This version handles separate edge and path datasets with interleaved training.
 
 To run standalone:
-$ python train_separate.py --batch_size=32 --compile=False
+$ python train.py --batch_size=32 --compile=False
 
 To run with wandb sweep:
 $ wandb sweep sweep_config.yaml
@@ -24,6 +24,18 @@ import torch.nn.functional as F
 from model import GPTConfig, GPT
 from pathstar import InWeightsPathStar
 
+# Rich imports
+from rich.console import Console
+from rich.live import Live
+from rich.panel import Panel
+from rich.text import Text
+from rich.layout import Layout
+from rich.align import Align
+from rich.table import Table
+
+console = Console()
+
+
 # GOOD
 def get_default_config():
     """
@@ -35,6 +47,7 @@ def get_default_config():
         'init_from': 'scratch',  # 'scratch' or 'resume'
         'out_dir': 'out',
         'eval_interval': 10,
+        'print_eval_interval': 100, # Interval to print generated samples
         'log_interval': 1,
         'eval_only': False,
         'always_save_checkpoint': True,
@@ -65,7 +78,9 @@ def get_default_config():
         'n_head': 8,
         'n_embd': 96,
         'dropout': 0.0,  # Dropout for attention, MLP, and residual connections
-        'embd_dropout': 0.0,  # Dropout for embedding layer output
+        'embd_dropout': 0.0,
+        'holdout_percentage': 0.0, # Percentage of paths to hold out for validation
+        'interleave_dataset': False, # If True, combines edges and paths into a single training dataset
         'bias': False,
         
         # Optimization
@@ -173,7 +188,64 @@ def compute_per_token_loss_with_teacher_forcing(meta, logits, input, targets, to
     return per_token_losses
 
 
-# DONE
+
+def get_rich_token_str(token, itos, meta):
+    """Helper to format a token with rich coloring based on training/validation splitting"""
+    token_str = itos.get(token, str(token))
+    # meta['token_colors'] maps token_id -> ANSI code
+    # We check for the specific ANSI codes used in train.py
+    ansi_color = meta.get('token_colors', {}).get(token, '')
+    if '\033[91m' in ansi_color: return f"[bold red]{token_str}[/]"
+    if '\033[92m' in ansi_color: return f"[bold green]{token_str}[/]"
+    return token_str
+
+def format_training_slice(sequences, itos, meta, num_samples=10):
+    """Format a batch of sequences for display in Rich panel"""
+    lines = []
+    num_samples = min(num_samples, len(sequences))
+    
+    # Check if we have tensors or numpy arrays
+    if isinstance(sequences, torch.Tensor):
+        sequences_np = sequences.detach().cpu().numpy()
+    else:
+        sequences_np = sequences
+        
+    for i in range(num_samples):
+        seq = sequences_np[i]
+        token_strs = []
+        for token in seq:
+            # Handle potential padding/special tokens if needed, but for now just display
+            if token == -1: continue # Ignore masked tokens if any
+            token_strs.append(get_rich_token_str(token, itos, meta))
+        
+        seq_str = " ".join(token_strs)
+        lines.append(f"Sample {i}: {seq_str}")
+        
+    return "\n".join(lines)
+
+def create_metrics_table(metrics, graph_length, iter_num, epoch, lr):
+    """Create a Rich Table for per-token metrics (Train vs Val)"""
+    table = Table(title=f"Per-Token Metrics (Iter {iter_num}, Epoch {epoch:.2f}, LR {lr:.2e})", show_header=True, header_style="bold magenta")
+    table.add_column("Pos", style="cyan", justify="center")
+    table.add_column("Train Loss", style="red", justify="right")
+    table.add_column("Val Loss", style="red", justify="right")
+    table.add_column("Train Acc", style="green", justify="right")
+    table.add_column("Val Acc", style="green", justify="right")
+    
+    for i in range(1, graph_length + 1):
+        t_loss = metrics.get('train_per_token', {}).get(i, float('nan'))
+        v_loss = metrics.get('val_per_token', {}).get(i, float('nan'))
+        t_acc = metrics.get('train_per_token_accuracy', {}).get(i, float('nan'))
+        v_acc = metrics.get('val_per_token_accuracy', {}).get(i, float('nan'))
+        
+        table.add_row(
+            str(i),
+            f"{t_loss:.4f}", f"{v_loss:.4f}",
+            f"{t_acc*100:.1f}%", f"{v_acc*100:.1f}%"
+        )
+            
+    return table
+
 def compute_per_token_accuracy_autoregressive(ctx, model, meta, val_data_batch, num_samples, device_local, print_samples=False):
     """Compute per-token accuracy using autoregressive generation"""
     sample_indices = np.random.choice(len(val_data_batch), size=min(num_samples, len(val_data_batch)), replace=False)
@@ -202,20 +274,83 @@ def compute_per_token_accuracy_autoregressive(ctx, model, meta, val_data_batch, 
         with ctx:
             generated_sequences = model.generate(contexts_batch, max_new_tokens=meta['l'], temperature=1.0, top_k=1)
             generated_tokens_batch = generated_sequences[:, context_length:].cpu().numpy()
+            model_context_prediction_batch = generated_sequences[:, :context_length].cpu().numpy()
     model.train()
     
-    # Print generated tokens and ground truths side by side
+    # Generate formatted text for Live display instead of printing
+    generated_text_output = None
+    
     ground_truths_array = np.stack(ground_truths)
     if print_samples:
-        print("\n=== Generated vs Ground Truth ===")
         itos = meta['itos']
+        # Rich colors
+        RICH_RED = "bold red"
+        RICH_GREEN = "bold green"
+        RICH_DEFAULT = "default"
+        
+        # We need to map the raw tokens to which set they belong to for coloring
+        # We can implement a helper or reuse the logic. 
+        # Since we are inside a function, let's use a simpler heuristic or passed config if possible.
+        # But wait, meta has 'token_colors' which uses ANSI codes. Rich doesn't parse ANSI codes inside Text objects nicely unless we tell it to.
+        # Alternatively, we can strip ANSI and use Rich styles. 
+        # Or simpler: Just construct a string and let Rich process it? No, Rich works best with Text objects for partial coloring.
+        
+        # Let's fallback to string construction but compatible with Rich (or just standard string if we put it in a Panel)
+        # Actually Panel accepts a string.
+        
+        lines = []
+        lines.append("=== Generated vs Ground Truth ===")
+
+        # Helper to get rich style
+        def get_rich_style(token, token_str):
+            # Check if token is in pure_train or pure_val sets
+            # meta['token_colors'] has the ANSI codes. 
+            # We can try to infer or just use the ANSI codes if we wrap in Text.from_ansi
+            
+            # Re-using the logic from meta['token_colors'] but adapting for Rich would be cleaner
+            # but for now let's rely on Text.from_ansi if we can, or just manual coloring.
+            
+            # Let's inspect meta['token_colors'] again. It maps token_id -> ANSI code string.
+            ansi_color = meta.get('token_colors', {}).get(token, '')
+            if '\033[91m' in ansi_color: return "[bold red]" + token_str + "[/]"
+            if '\033[92m' in ansi_color: return "[bold green]" + token_str + "[/]"
+            return token_str
+
         for sample_idx in range(len(generated_tokens_batch)):
-            generated_str = ' '.join([itos[token] for token in generated_tokens_batch[sample_idx]])
-            ground_truth_str = ' '.join([itos[token] for token in ground_truths_array[sample_idx]])
-            print(f"Sample {sample_idx}:")
-            print(f"  Generated:    {generated_str}")
-            print(f"  Ground Truth: {ground_truth_str}")
-        print("=" * 40 + "\n")
+            
+            # Generated
+            gen_tokens_str_list = []
+            for token in generated_tokens_batch[sample_idx]:
+                gen_tokens_str_list.append(get_rich_token_str(token, itos, meta))
+            generated_str = " ".join(gen_tokens_str_list)
+            
+            # Ground Truth
+            gt_tokens_str_list = []
+            for token in ground_truths_array[sample_idx]:
+                gt_tokens_str_list.append(get_rich_token_str(token, itos, meta))
+            ground_truth_str = " ".join(gt_tokens_str_list)
+
+            # Model Context
+            if 'model_context_prediction_batch' in locals():
+                mc_tokens_str_list = []
+                for token in model_context_prediction_batch[sample_idx]:
+                    mc_tokens_str_list.append(get_rich_token_str(token, itos, meta))
+                model_context_str = " ".join(mc_tokens_str_list)
+            else:
+                model_context_str = "N/A"
+            
+            # Input Context
+            ic_tokens_str_list = []
+            for token in contexts[sample_idx]:
+                ic_tokens_str_list.append(get_rich_token_str(token, itos, meta))
+            input_context_str = " ".join(ic_tokens_str_list)
+            
+            if sample_idx < 5:
+                lines.append(f"Sample {sample_idx}:")
+                lines.append(f"  Generated:    {model_context_str} {generated_str}")
+                lines.append(f"  Ground Truth: {input_context_str} {ground_truth_str}")
+        
+        generated_text_output = "\n".join(lines)
     
     per_token_accuracies = {}
     
@@ -228,7 +363,7 @@ def compute_per_token_accuracy_autoregressive(ctx, model, meta, val_data_batch, 
         else:
             per_token_accuracies[token_pos] = float('nan')
     
-    return per_token_accuracies
+    return per_token_accuracies, generated_text_output
 
 # DONE 
 def evaluate_samples(device, ctx, model, meta, data, data_size, split_name, num_samples=5, eval_batch_size=512):
@@ -298,7 +433,7 @@ def evaluate_samples(device, ctx, model, meta, data, data_size, split_name, num_
     all_generated_tokens = np.concatenate(all_generated_tokens, axis=0)
     
     # Calculate accuracies
-    print(f"\nAutoregressive generation on {num_samples} {split_name} samples:")
+    console.print(f"\nAutoregressive generation on {num_samples} {split_name} samples:")
     accuracies = []
     for ground_truth, generated_tokens in zip(ground_truths, all_generated_tokens):
         # Calculate accuracy
@@ -307,8 +442,8 @@ def evaluate_samples(device, ctx, model, meta, data, data_size, split_name, num_
     
     # Calculate average accuracy
     avg_accuracy = np.mean(accuracies)
-    print(f"  Average accuracy: {avg_accuracy*100:.1f}%")
-    print()  # Empty line for readability
+    console.print(f"  Average accuracy: {avg_accuracy*100:.1f}%")
+    console.print()  # Empty line for readability
     
     return avg_accuracy
 
@@ -403,7 +538,7 @@ def detect_device(config):
             gpu_id = 'cpu'
     
     
-    device_type = 'cuda' if 'cuda' in device else 'cpu'
+    device_type = 'cuda' if 'cuda' in device else ('mps' if 'mps' in device else 'cpu')
     return device, device_type, gpu_id
 
 def set_dtype(config):
@@ -491,7 +626,7 @@ def get_theoretical_loss(meta):
     return theoretical_token_1_loss
     
 def calculate_optimal_batch_size_for_training(model, block_size, vocab_size, device, dtype, 
-                                    gradient_accumulation_steps, safety_factor=0.90, reserved_memory=0):
+                                    gradient_accumulation_steps, safety_factor=0.90, reserved_memory=0, target_batch_size=None):
     """
     Calculate maximum safe batch size based on available GPU memory.
     
@@ -505,6 +640,7 @@ def calculate_optimal_batch_size_for_training(model, block_size, vocab_size, dev
     Args:
         safety_factor: Use 90% of available memory (conservative for torch.compile)
         reserved_memory: Memory reserved for datasets (in bytes). Will be subtracted from available memory.
+        target_batch_size: Optional target batch size (hint) for CPU/optimality calculations.
     
     Returns:
         max_batch_size: Maximum safe batch size
@@ -512,6 +648,11 @@ def calculate_optimal_batch_size_for_training(model, block_size, vocab_size, dev
     # Handle device as string or torch.device object
     device_type = device if isinstance(device, str) else device.type
     if device_type != 'cuda':
+        if target_batch_size is not None:
+            # For CPU, we default to the dataset size (or close to it) if provided, 
+            # to align with "one iteration means a complete iteration of that dataset".
+            # We maintain a minimum of 2000 for efficiency on very small datasets.
+            return max(2000, target_batch_size)
         return 2000  # Default for non-CUDA
     
     # Get GPU memory info
@@ -613,8 +754,12 @@ def calculate_optimal_batch_size_for_training(model, block_size, vocab_size, dev
     return max_batch_size
 
 # GOOD
-def evaluate(estimate_loss_on_val, config, meta, iter_num, lr, ctx, device, model, val_data_np, paths_data_np, print_samples=False):
-    losses = estimate_loss_on_val(print_samples)
+def evaluate(estimate_metrics, config, meta, iter_num, lr, ctx, device, model, val_data_np, paths_data_np, print_samples=False, eval_layout_component=None, metrics_layout_component=None):
+    # Compute metrics for both splits
+    val_metrics = estimate_metrics('val', print_samples)
+    train_metrics = estimate_metrics('train', False) # Don't print train samples here
+    losses = {**val_metrics, **train_metrics}
+    
     graph_length = meta['l']
     PATHS_DATASET_SIZE = meta['PATHS_DATASET_SIZE']
     VAL_DATASET_SIZE = meta['VAL_DATASET_SIZE']
@@ -628,28 +773,29 @@ def evaluate(estimate_loss_on_val, config, meta, iter_num, lr, ctx, device, mode
     val_avg_accuracy = evaluate_samples(device, ctx, model,  meta, val_data_np, VAL_DATASET_SIZE, 'val', num_samples=min(VAL_DATASET_SIZE, autoregressive_eval_samples))
     train_avg_accuracy = evaluate_samples(device, ctx, model, meta, paths_data_np, PATHS_DATASET_SIZE, 'train', num_samples=min(PATHS_DATASET_SIZE, autoregressive_eval_samples))
     
+    # Update Live display if new samples were generated
+    if 'generated_text' in losses and losses['generated_text'] and eval_layout_component:
+        eval_layout_component.update(Panel(losses['generated_text'], title="Evaluation Examples", border_style="blue"))
+
+    # Update metrics display
+    if metrics_layout_component:
+        metrics_table = create_metrics_table(losses, graph_length, iter_num, current_epoch, lr)
+        metrics_layout_component.update(Panel(Align.center(metrics_table), title="Validation Metrics", border_style="magenta"))
+
     # PRINTING
-    print(f"step {iter_num}: epoch {current_epoch:.2f}, val loss {losses['val']:.4f}")
+    console.print(f"step {iter_num}: epoch {current_epoch:.2f}, val loss {losses['val']:.4f}, train loss {losses['train']:.4f}")
     
     if 'val_per_token' in losses:
-        print("  Val per-token losses:")
-        per_token_str = ", ".join([f"tok{i}: {losses['val_per_token'][i]:.4f}" 
+        console.print("  Val per-token losses:")
+        per_token_str = ", ".join([f"tok{i}: {losses['val_per_token'].get(i, float('nan')):.4f}" 
                                 for i in range(1, min(graph_length + 1, 10))])
-        print(f"    {per_token_str}")
-        if graph_length > 9:
-            per_token_str_rest = ", ".join([f"tok{i}: {losses['val_per_token'][i]:.4f}" 
-                                            for i in range(10, graph_length + 1)])
-            print(f"    {per_token_str_rest}")
+        console.print(f"    {per_token_str}")
     
     if 'val_per_token_accuracy' in losses:
-        print("  Val per-token accuracies (autoregressive):")
-        per_token_acc_str = ", ".join([f"tok{i}: {losses['val_per_token_accuracy'][i]*100:.1f}%" 
+        console.print("  Val per-token accuracies (autoregressive):")
+        per_token_acc_str = ", ".join([f"tok{i}: {losses['val_per_token_accuracy'].get(i, float('nan'))*100:.1f}%" 
                                     for i in range(1, min(graph_length + 1, 10))])
-        print(f"    {per_token_acc_str}")
-        if graph_length > 9:
-            per_token_acc_str_rest = ", ".join([f"tok{i}: {losses['val_per_token_accuracy'][i]*100:.1f}%" 
-                                                for i in range(10, graph_length + 1)])
-            print(f"    {per_token_acc_str_rest}")
+        console.print(f"    {per_token_acc_str}")
     
     
     if config['wandb_log']:
@@ -659,6 +805,7 @@ def evaluate(estimate_loss_on_val, config, meta, iter_num, lr, ctx, device, mode
             'warmup_iters': meta['warmup_iters'],
             "epoch": round(current_epoch, 4),
             "val/loss/overall": losses['val'],
+            "train/loss/overall": losses['train'],
             "lr": lr,
             "gen/val_paths_avg_accuracy": val_avg_accuracy,
             "gen/train_paths_avg_accuracy": train_avg_accuracy
@@ -698,7 +845,7 @@ def evaluate(estimate_loss_on_val, config, meta, iter_num, lr, ctx, device, mode
             'best_val_loss': meta['best_val_loss'],
             'config': config,
         }
-        print(f"saving checkpoint to {config['out_dir']}/{meta['checkpoint_filename']}")
+        console.print(f"saving checkpoint to {config['out_dir']}/{meta['checkpoint_filename']}")
         torch.save(checkpoint_data, os.path.join(config['out_dir'], meta['checkpoint_filename']))
 
 def determine_dataset_in_device_size(device, device_type, paths_data, edges_data, val_data, limit=0.1):
@@ -794,9 +941,35 @@ def train(config=None):
         num_pause_tokens=default_config['num_pause_tokens'],
         use_undirected=default_config['use_undirected'],
         use_directional_tokens=default_config['use_directional_tokens'],
+        use_task_tokens=default_config['use_task_tokens'],
     )
     
     meta, paths_data, edges_data, val_data = gen.load_dataset()
+
+    # Precompute token colors for visualization
+    # Tokens exclusively in training set -> RED
+    # Tokens exclusively in validation set -> GREEN
+    # Shared tokens (Root, Special) -> No color
+    print("Precomputing token colors...")
+    train_tokens = set(np.unique(paths_data))
+    val_tokens = set(np.unique(val_data))
+    
+    pure_train_tokens = train_tokens - val_tokens
+    pure_val_tokens = val_tokens - train_tokens
+    
+    token_colors = {}
+    RED = '\033[91m'
+    GREEN = '\033[92m'
+    RESET = '\033[0m'
+    
+    for t in pure_train_tokens:
+        token_colors[t] = RED
+    for t in pure_val_tokens:
+        token_colors[t] = GREEN
+    
+    meta['token_colors'] = token_colors
+    meta['RESET_COLOR'] = RESET
+
     meta['randomize_vocab_size'] = gen.randomize_vocab_size
     
     # Extract graph parameters from metadata
@@ -811,10 +984,16 @@ def train(config=None):
     edges_size = meta['EDGES_DATASET_SIZE']
     VAL_DATASET_SIZE = meta['VAL_DATASET_SIZE']
     
-    print(f"Training dataset composition:")
-    print(f"  Paths: {paths_size} (no replication)")
-    print(f"  Edges: {edges_size}")
-    print(f"  Total: {paths_size + edges_size} samples")
+    if default_config['interleave_dataset']:
+        print(f"Training dataset composition (INTERLEAVED):")
+        print(f"  Paths: {paths_size}")
+        print(f"  Edges: {edges_size}")
+        print(f"  Total Combined: {paths_size + edges_size} samples")
+    else:
+        print(f"Training dataset composition:")
+        print(f"  Paths: {paths_size} (no replication)")
+        print(f"  Edges: {edges_size}")
+        print(f"  Total: {paths_size + edges_size} samples")
 
     # Auto-detect device
     device, device_type, gpu_id = detect_device(default_config)
@@ -845,37 +1024,84 @@ def train(config=None):
     paths_data = paths_data.reshape(paths_size, paths_seq_length)
     edges_data = edges_data.reshape(edges_size, edges_seq_length)
     val_data = val_data.reshape(VAL_DATASET_SIZE, val_seq_length)
-    
-    
-    dataset_reserved_memory = determine_dataset_in_device_size(device, device_type, paths_data, edges_data, val_data)
-    
+
+    # If interleaving, we will combine datasets later, but need to consider this for memory
+    combined_data = None
+    combined_size = 0
+    if default_config['interleave_dataset']:
+        # Balance datasets by upsampling the smaller one to match the larger one
+        max_size = max(paths_size, edges_size)
+        
+        if paths_size < max_size:
+            print(f"Balancing: Upsampling paths from {paths_size} to {max_size}")
+            indices = np.random.choice(paths_size, max_size, replace=True)
+            paths_data_balanced = paths_data[indices]
+        else:
+            paths_data_balanced = paths_data
+            
+        if edges_size < max_size:
+            print(f"Balancing: Upsampling edges from {edges_size} to {max_size}")
+            indices = np.random.choice(edges_size, max_size, replace=True)
+            edges_data_balanced = edges_data[indices]
+        else:
+            edges_data_balanced = edges_data
+
+        # Concatenate paths and edges
+        combined_data = np.concatenate((paths_data_balanced, edges_data_balanced), axis=0)
+        combined_size = combined_data.shape[0]
+        # Shuffle the combined data initially
+        np.random.shuffle(combined_data)
+        
+        # Calculate memory for combined dataset (pass empty array for edges to reuse function)
+        dataset_reserved_memory = determine_dataset_in_device_size(device, device_type, combined_data, np.array([]), val_data)
+        
+        # Target batch size is the combined size
+        target_bs_ref = combined_size
+    else:
+        dataset_reserved_memory = determine_dataset_in_device_size(device, device_type, paths_data, edges_data, val_data)
+        target_bs_ref = edges_size
+
     train_batch_size = calculate_optimal_batch_size_for_training(
         model, meta['block_size'], meta['randomize_vocab_size'], device, dtype,
         default_config['gradient_accumulation_steps'],
-        reserved_memory=dataset_reserved_memory
+        reserved_memory=dataset_reserved_memory,
+        target_batch_size=target_bs_ref
     )
     
     # Calculate training iteration parameters
     VAL_DATASET_SIZE = meta['VAL_DATASET_SIZE']
     
-    # Calculate iterations per epoch for edges and paths
-    edge_iterations_per_epoch = default_config['edge_iterations_per_epoch']
-    path_iterations_per_epoch = default_config['path_iterations_per_epoch']
-    
-    # Calculate batches per dataset
-    edge_batches_per_iteration = int(np.ceil(edges_size / (train_batch_size * default_config['gradient_accumulation_steps'])))
-    path_batches_per_iteration = int(np.ceil(paths_size / (train_batch_size * default_config['gradient_accumulation_steps'])))
-    
-    print(f"\n=== Training Schedule ===")
-    print(f"Edge batches per iteration: {edge_batches_per_iteration}")
-    print(f"Path batches per iteration: {path_batches_per_iteration}")
-    print(f"Edge iterations per epoch: {edge_iterations_per_epoch}")
-    print(f"Path iterations per epoch: {path_iterations_per_epoch}")
-    print(f"=========================\n")
+    if default_config['interleave_dataset']:
+        # In interleaved mode, epoch is 1 pass over combined dataset
+        batches_per_epoch = int(np.ceil(combined_size / (train_batch_size * default_config['gradient_accumulation_steps'])))
+        max_iters = default_config['epochs'] * batches_per_epoch
+        
+        print(f"\n=== Training Schedule (Interleaved) ===")
+        print(f"Total samples: {combined_size}")
+        print(f"Batches per epoch: {batches_per_epoch}")
+        print(f"Total iterations: {max_iters}")
+        print(f"=========================\n")
+        
+    else:
+        # Calculate iterations per epoch for edges and paths
+        edge_iterations_per_epoch = default_config['edge_iterations_per_epoch']
+        path_iterations_per_epoch = default_config['path_iterations_per_epoch']
+        
+        # Calculate batches per dataset
+        edge_batches_per_iteration = int(np.ceil(edges_size / (train_batch_size * default_config['gradient_accumulation_steps'])))
+        path_batches_per_iteration = int(np.ceil(paths_size / (train_batch_size * default_config['gradient_accumulation_steps'])))
+        
+        print(f"\n=== Training Schedule ===")
+        print(f"Edge batches per iteration: {edge_batches_per_iteration}")
+        print(f"Path batches per iteration: {path_batches_per_iteration}")
+        print(f"Edge iterations per epoch: {edge_iterations_per_epoch}")
+        print(f"Path iterations per epoch: {path_iterations_per_epoch}")
+        print(f"=========================\n")
 
-    # One epoch = A edge iterations + B path iterations
-    batches_per_epoch = edge_iterations_per_epoch * edge_batches_per_iteration + path_iterations_per_epoch * path_batches_per_iteration
-    max_iters = default_config['epochs'] * batches_per_epoch
+        # One epoch = A edge iterations + B path iterations
+        batches_per_epoch = edge_iterations_per_epoch * edge_batches_per_iteration + path_iterations_per_epoch * path_batches_per_iteration
+        max_iters = default_config['epochs'] * batches_per_epoch
+
     meta['max_iters'] = max_iters
     meta['batches_per_epoch'] = batches_per_epoch
     
@@ -908,8 +1134,12 @@ def train(config=None):
     
     # Compile model
     if default_config['compile']:
-        print("compiling the model... (takes a ~minute)")
-        model = torch.compile(model)
+        if device_type == 'mps':
+            print("WARNING: Disabling torch.compile on MPS due to known instability (Inductor backend issues).")
+            default_config['compile'] = False
+        else:
+            print("compiling the model... (takes a ~minute)")
+            model = torch.compile(model)
     
     # Initialize wandb (skip if already initialized by sweep agent)
     if default_config['wandb_log'] and wandb.run is None:
@@ -951,8 +1181,18 @@ def train(config=None):
     assert paths_seq_length == edges_seq_length, f"Sequence length mismatch: paths={paths_seq_length}, edges={edges_seq_length}"
     
     # Create tensors and load to GPU if pre-calculated decision indicates they fit
-    paths_data_tensor = torch.from_numpy(paths_data.astype(np.int64))
-    edges_data_tensor = torch.from_numpy(edges_data.astype(np.int64))
+    # Create tensors and load to GPU if pre-calculated decision indicates they fit
+    # If interleaving, combined_data is already prepared
+    if default_config['interleave_dataset']:
+        paths_data_tensor = None # Unused in interleaved mode
+        edges_data_tensor = None # Unused in interleaved mode
+        combined_data_tensor = torch.from_numpy(combined_data.astype(np.int64))
+        print(f"Created balanced interleaved dataset tensor with shape {combined_data_tensor.shape}")
+    else:
+        paths_data_tensor = torch.from_numpy(paths_data.astype(np.int64))
+        edges_data_tensor = torch.from_numpy(edges_data.astype(np.int64))
+        combined_data_tensor = None
+    
     val_data_tensor = torch.from_numpy(val_data.astype(np.int64))
     
     datasets_on_gpu = False
@@ -962,8 +1202,11 @@ def train(config=None):
             print(f"\n=== Loading Datasets to GPU ===")
             print(f"Reserved memory: {dataset_reserved_memory / 1e9:.3f} GB")
             print("✓ Loading datasets to GPU for faster training")
-            paths_data_tensor = paths_data_tensor.pin_memory().to(device, non_blocking=True)
-            edges_data_tensor = edges_data_tensor.pin_memory().to(device, non_blocking=True)
+            if default_config['interleave_dataset']:
+                combined_data_tensor = combined_data_tensor.pin_memory().to(device, non_blocking=True)
+            else:
+                paths_data_tensor = paths_data_tensor.pin_memory().to(device, non_blocking=True)
+                edges_data_tensor = edges_data_tensor.pin_memory().to(device, non_blocking=True)
             val_data_tensor = val_data_tensor.pin_memory().to(device, non_blocking=True)
             datasets_on_gpu = True
             print(f"===================================\n")
@@ -975,8 +1218,11 @@ def train(config=None):
     else:
         # For non-CUDA devices, always keep on CPU or move to device as appropriate
         if device_type != 'cpu':
-            paths_data_tensor = paths_data_tensor.to(device)
-            edges_data_tensor = edges_data_tensor.to(device)
+            if default_config['interleave_dataset']:
+                combined_data_tensor = combined_data_tensor.to(device)
+            else:
+                paths_data_tensor = paths_data_tensor.to(device)
+                edges_data_tensor = edges_data_tensor.to(device)
             val_data_tensor = val_data_tensor.to(device)
             datasets_on_gpu = True
         else:
@@ -987,17 +1233,24 @@ def train(config=None):
     val_data_np = val_data
     
     # Initialize epoch indices for sampling without replacement
-    paths_epoch_indices = np.arange(paths_size)
-    edges_epoch_indices = np.arange(edges_size)
+    if default_config['interleave_dataset']:
+        paths_epoch_indices = None
+        edges_epoch_indices = None 
+        combined_epoch_indices = np.arange(combined_size)
+    else:
+        paths_epoch_indices = np.arange(paths_size)
+        edges_epoch_indices = np.arange(edges_size)
+        
     val_epoch_indices = np.arange(VAL_DATASET_SIZE)
     paths_batch_idx = 0
     edges_batch_idx = 0
+    combined_batch_idx = 0
     val_batch_idx = 0
     
     # DONE
     def get_batch(dataset):
         """Sample a batch from the edge dataset"""
-        nonlocal edges_batch_idx, edges_epoch_indices, paths_batch_idx, paths_epoch_indices, val_batch_idx, val_epoch_indices
+        nonlocal edges_batch_idx, edges_epoch_indices, paths_batch_idx, paths_epoch_indices, val_batch_idx, val_epoch_indices, combined_batch_idx, combined_epoch_indices
 
         if dataset == 'edges':
             batch_idx = edges_batch_idx
@@ -1009,6 +1262,11 @@ def train(config=None):
             epoch_indices = paths_epoch_indices
             dataset_size = paths_size
             dataset_tensors = paths_data_tensor
+        elif dataset == 'combined':
+            batch_idx = combined_batch_idx
+            epoch_indices = combined_epoch_indices
+            dataset_size = combined_size
+            dataset_tensors = combined_data_tensor
         elif dataset == 'val':
             batch_idx = val_batch_idx
             epoch_indices = val_epoch_indices
@@ -1033,6 +1291,8 @@ def train(config=None):
             edges_batch_idx = batch_idx
         elif dataset == 'paths':
             paths_batch_idx = batch_idx
+        elif dataset == 'combined':
+            combined_batch_idx = batch_idx
         elif dataset == 'val':
             val_batch_idx = batch_idx
         else:
@@ -1044,7 +1304,7 @@ def train(config=None):
             sequences = dataset_tensors[batch_seq_indices]
         else:
             sequences = dataset_tensors[batch_seq_indices]
-            if device_type == 'cuda':
+            if device_type in ['cuda', 'mps']:
                 sequences = sequences.to(device, non_blocking=True)
         
         # Pad or truncate to block_size if needed
@@ -1060,52 +1320,81 @@ def train(config=None):
         # Mask PAD tokens in targets
         if pad_token_id is not None:
             y[y == pad_token_id] = -1
+
+        # Mask PAUSE tokens in targets
+        if pause_token_id is not None:
+            y[y == pause_token_id] = -1
         
         return x, y
     
     @torch.no_grad()
-    def estimate_loss_on_val(print_samples=False):
-        """Estimate loss on validation split"""
-        # Reset validation batch state for reproducible evaluation
-        # This ensures each evaluation starts from the beginning
-        nonlocal val_batch_idx, val_epoch_indices
-        val_batch_idx = 0
-        np.random.shuffle(val_epoch_indices)
-        
+    def estimate_metrics(split, print_samples=False):
+        """Estimate loss and metrics on validation or training split"""
         out = {}
         model.eval()
         
-        val_token_losses = {i: [] for i in range(1, graph_length + 1)}
-        losses = torch.zeros(eval_iters)
+        # Determine data and size
+        if split == 'val':
+            nonlocal val_batch_idx, val_epoch_indices
+            # Reset validation batch state for reproducible evaluation
+            val_batch_idx = 0
+            np.random.shuffle(val_epoch_indices)
+            num_iters = eval_iters
+            data_source = val_data
+            data_size = VAL_DATASET_SIZE
+        else: # train
+            # For training, we sample randomly from paths_data
+            # We use a limited number of iterations similar to validation
+            num_iters = eval_iters
+            data_source = paths_data
+            data_size = paths_size
+            
+        token_losses = {i: [] for i in range(1, graph_length + 1)}
+        batch_losses = torch.zeros(num_iters)
         
-        for k in range(eval_iters):
-            X, Y = get_batch('val')
+        for k in range(num_iters):
+            if split == 'val':
+                X, Y = get_batch('val')
+            else:
+                # Manual sampling for training paths to safely handle interleaved case
+                # and ensures we only evaluate on paths
+                idx = np.random.randint(0, data_size, train_batch_size)
+                batch = torch.from_numpy(data_source[idx].astype(np.int64)).to(device)
+                X = batch[:, :-1].contiguous()
+                Y = batch[:, 1:].contiguous()
+                if pad_token_id is not None: Y[Y == pad_token_id] = -1
+                if pause_token_id is not None: Y[Y == pause_token_id] = -1
+
             with ctx:
                 logits, loss = model(X, Y, label_smoothing=default_config['label_smoothing'])
-            losses[k] = loss.item()
+            batch_losses[k] = loss.item()
             
             per_token_losses_in_batch = compute_per_token_loss_with_teacher_forcing(meta, logits, X, Y, range(1, graph_length + 1), task_type='path')
             for token_pos, (token_loss_sum, batch_size_local) in per_token_losses_in_batch.items():
                 if not math.isnan(token_loss_sum):
-                    val_token_losses[token_pos].append((token_loss_sum, batch_size_local))
+                    token_losses[token_pos].append((token_loss_sum, batch_size_local))
         
-        out['val'] = losses.mean()
+        out[f'{split}'] = batch_losses.mean()
         
-        if val_token_losses[1]:
-            out['val_per_token'] = {
+        if token_losses[1]:
+            out[f'{split}_per_token'] = {
                 token_pos: (
                     sum(loss_sum * batch_size for loss_sum, batch_size in losses_list) / 
                     sum(batch_size for _, batch_size in losses_list)
                 ) if losses_list else float('nan')
-                for token_pos, losses_list in val_token_losses.items()
+                for token_pos, losses_list in token_losses.items()
             }
-        else:
-            raise ValueError("Error at line 1070")
         
-        # Compute per-token accuracy
-        num_samples_for_accuracy = min(100, VAL_DATASET_SIZE)
-        val_per_token_accuracy = compute_per_token_accuracy_autoregressive(ctx, model, meta, val_data, num_samples_for_accuracy, device, print_samples)
-        out['val_per_token_accuracy'] = val_per_token_accuracy
+        # Compute per-token accuracy (autoregressive)
+        # Use small number of samples for speed
+        num_samples_for_accuracy = min(100, data_size)
+        per_token_accuracy, generated_text = compute_per_token_accuracy_autoregressive(
+            ctx, model, meta, data_source, num_samples_for_accuracy, device, print_samples
+        )
+        out[f'{split}_per_token_accuracy'] = per_token_accuracy
+        
+        if print_samples and split == 'val':
+            out['generated_text'] = generated_text
         
         model.train()
         return out
@@ -1114,105 +1403,152 @@ def train(config=None):
     t0 = time.time()
     
     # Track which phase we're in (edge or path)
-    current_phase = 'edge'  # Start with edges
-    phase_iteration_count = 0
-    
-    # Initialize with first batch
-    if current_phase == 'edge':
-        X, Y = get_batch('edges')
-    else:
-        X, Y = get_batch('paths')
-    
-    while True:
-        # Set learning rate
-        lr = get_lr(iter_num, warmup_iters, lr_decay_iters, default_config) if default_config['decay_lr'] else default_config['learning_rate']
-
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
+    if default_config['interleave_dataset']:
+        current_phase = 'combined'
+        X, Y = get_batch('combined')
+    else:   
+        current_phase = 'edge'  # Start with edges
+        phase_iteration_count = 0
         
-        # Evaluate
-        if iter_num % default_config['eval_interval'] == 0:
-            print_samples = iter_num % default_config['print_eval_interval'] == 0
-            evaluate(estimate_loss_on_val, default_config, meta, iter_num, lr, ctx, device, model, val_data_np, paths_data_np, print_samples)
-        
-        if iter_num == 0 and default_config['eval_only']:
-            break
-        
-        # Forward backward update with batch prefetching for better GPU utilization
-        cur_batch_size = ( edge_batches_per_iteration if current_phase == 'edge' else path_batches_per_iteration)   
-        steps = min(default_config['gradient_accumulation_steps'], cur_batch_size) 
-        for micro_step in range(steps):
-            with ctx:
-                _, loss = model(X, Y, label_smoothing=default_config['label_smoothing'])
-                loss = loss / steps
-            
-            # Prefetch next batch while backward pass runs (overlap I/O with compute)
-            if micro_step < steps - 1:
-                if current_phase == 'edge':
-                    X_next, Y_next = get_batch('edges')
-                else:
-                    X_next, Y_next = get_batch('paths')
-            
-            scaler.scale(loss).backward()
-            
-            # Move prefetched batch to current (if not last step)
-            if micro_step < steps - 1:
-                X, Y = X_next, Y_next
-        
-        # Determine next batch based on interleaving schedule
-        # Check if we've completed the current phase's iterations
-        if current_phase == 'edge':
-            phase_iteration_count += 1
-            if phase_iteration_count >= edge_iterations_per_epoch * edge_batches_per_iteration:
-                # Switch to path phase
-                current_phase = 'path'
-                phase_iteration_count = 0
-                # Reset batch indices for new phase
-                paths_batch_idx = 0
-        else:  # path phase
-            phase_iteration_count += 1
-            if phase_iteration_count >= path_iterations_per_epoch * path_batches_per_iteration:
-                # Switch back to edge phase (new epoch)
-                current_phase = 'edge'
-                phase_iteration_count = 0
-                # Reset batch indices for new phase
-                edges_batch_idx = 0
-        
-        # Get batch for next iteration
+        # Initialize with first batch
         if current_phase == 'edge':
             X, Y = get_batch('edges')
         else:
             X, Y = get_batch('paths')
-        
-        # Clip gradients
-        if default_config['grad_clip'] != 0.0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), default_config['grad_clip'])
-        
-        scaler.step(optimizer)
-        scaler.update()
-        optimizer.zero_grad(set_to_none=True)
-        
-        # Timing and logging
-        t1 = time.time()
-        dt = t1 - t0
-        t0 = t1
-        if iter_num % default_config['log_interval'] == 0:
-            lossf = loss.item() * steps
-            phase_label = "[EDGE]" if current_phase == 'edge' else "[PATH]"
-            print(f"iter {iter_num}: {phase_label} loss {lossf:.4f}, time {dt*1000:.2f}ms")
-            wandb.log({
-                'train/loss/overall': lossf,
-                'dt': dt
-            })
-        
-        iter_num += 1
-        
-        if iter_num > max_iters:
-            break
+    
+    # Live display for evaluation examples
+    layout = Layout()
+    layout.split_column(
+        Layout(name="metrics", size=14), # Fixed size for metrics table
+        Layout(name="evaluation"),
+        Layout(name="training")
+    )
+    layout["metrics"].update(Panel("Waiting for first evaluation...", title="Validation Metrics", border_style="magenta"))
+    layout["evaluation"].update(Panel("Waiting for first evaluation...", title="Evaluation Examples", border_style="blue"))
+    layout["training"].update(Panel("Waiting for first training batch...", title="Training Slice (10 samples)", border_style="green"))
+
+    with Live(layout, console=console, refresh_per_second=4) as live:
+        while True:
+            # Set learning rate
+            lr = get_lr(iter_num, warmup_iters, lr_decay_iters, default_config) if default_config['decay_lr'] else default_config['learning_rate']
+
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = lr
+            
+            # Evaluate
+            if iter_num % default_config['eval_interval'] == 0:
+                print_samples = iter_num % default_config['print_eval_interval'] == 0
+                evaluate(estimate_metrics, default_config, meta, iter_num, lr, ctx, device, model, val_data_np, paths_data_np, print_samples, eval_layout_component=layout["evaluation"], metrics_layout_component=layout["metrics"])
+            
+            if iter_num == 0 and default_config['eval_only']:
+                break
+            
+            # Forward backward update with batch prefetching for better GPU utilization
+            if default_config['interleave_dataset']:
+                cur_batch_size = 1 # Not really used in this loop structure for steps calc 
+                # For combined, we don't have "batches per iteration" concept in the same way
+                # We just iterate
+                # But steps likely refers to gradient accumulation steps
+                pass
+            else:
+                cur_batch_size = ( edge_batches_per_iteration if current_phase == 'edge' else path_batches_per_iteration)   
+                
+            steps = min(default_config['gradient_accumulation_steps'], cur_batch_size) if not default_config['interleave_dataset'] else default_config['gradient_accumulation_steps']
+
+            for micro_step in range(steps):
+                with ctx:
+                    _, loss = model(X, Y, label_smoothing=default_config['label_smoothing'])
+                    loss = loss / steps
+                
+                # Prefetch next batch while backward pass runs (overlap I/O with compute)
+                if micro_step < steps - 1:
+                    if default_config['interleave_dataset']:
+                        X_next, Y_next = get_batch('combined')
+                    else: 
+                        if current_phase == 'edge':
+                            X_next, Y_next = get_batch('edges')
+                        else:
+                            X_next, Y_next = get_batch('paths')
+                
+                scaler.scale(loss).backward()
+                
+                # Move prefetched batch to current (if not last step)
+                if micro_step < steps - 1:
+                    X, Y = X_next, Y_next
+            
+            # Determine next batch based on interleaving schedule
+            if not default_config['interleave_dataset']:
+                # Check if we've completed the current phase's iterations
+                if current_phase == 'edge':
+                    phase_iteration_count += 1
+                    if phase_iteration_count >= edge_iterations_per_epoch * edge_batches_per_iteration:
+                        # Switch to path phase
+                        current_phase = 'path'
+                        phase_iteration_count = 0
+                        # Reset batch indices for new phase
+                        paths_batch_idx = 0
+                else:  # path phase
+                    phase_iteration_count += 1
+                    if phase_iteration_count >= path_iterations_per_epoch * path_batches_per_iteration:
+                        # Switch back to edge phase (new epoch)
+                        current_phase = 'edge'
+                        phase_iteration_count = 0
+                        # Reset batch indices for new phase
+                        edges_batch_idx = 0
+            
+            # Get batch for next iteration
+            if default_config['interleave_dataset']:
+                X, Y = get_batch('combined')
+            else:
+                if current_phase == 'edge':
+                    X, Y = get_batch('edges')
+                else:
+                    X, Y = get_batch('paths')
+            
+            # Clip gradients
+            if default_config['grad_clip'] != 0.0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), default_config['grad_clip'])
+            
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+            
+            # Timing and logging
+            t1 = time.time()
+            dt = t1 - t0
+            t0 = t1
+            current_epoch = iter_num / meta['batches_per_epoch']
+            if iter_num % default_config['log_interval'] == 0:
+                lossf = loss.item() * steps
+                if default_config['interleave_dataset']:
+                    phase_label = "[COMBINED]"
+                else:
+                    phase_label = "[EDGE]" if current_phase == 'edge' else "[PATH]"
+                console.print(f"iter {iter_num}: {phase_label} loss {lossf:.4f}, time {dt*1000:.2f}ms")
+                if default_config['wandb_log']:
+                    wandb.log({
+                        'train/loss/overall': lossf,
+                        'dt': dt,
+                        'iter': iter_num,
+                        "epoch": round(current_epoch, 4),
+                    })
+                
+                # Update training slice panel
+                # Reconstruct full sequence for visualization: X + last token of Y
+                # Note: Y has masking (-1) applied, so if the last token is masked, it won't show, 
+                # but for path tasks the last token (LEAF) is not masked.
+                full_batch = torch.cat([X, Y[:, -1:]], dim=1)
+                training_slice_str = format_training_slice(full_batch, itos, meta, num_samples=10)
+                layout["training"].update(Panel(training_slice_str, title=f"Training Slice (Iter {iter_num})", border_style="green"))
+            
+            iter_num += 1
+            
+            if iter_num > max_iters:
+                break
     
     # Cleanup and finalization
-    print("Finalizing training run...")
+    console.print("Finalizing training run...")
     
     # Clear GPU memory before finishing
     if device_type == 'cuda':
@@ -1220,7 +1556,7 @@ def train(config=None):
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
         except Exception as e:
-            print(f"Warning during GPU cleanup: {e}")
+            console.print(f"Warning during GPU cleanup: {e}")
     
     # Only call wandb.finish() if we initialized wandb ourselves (not in sweep mode)
     # In sweep mode, the agent handles finishing the run
@@ -1231,7 +1567,7 @@ def train(config=None):
             wandb.finish()
         # In sweep mode, don't call finish - let the agent handle it
     
-    print("Training complete!")
+    console.print("Training complete!")
 
 
 def sweep_train():
@@ -1252,7 +1588,11 @@ def sweep_train():
 
 
 if __name__ == '__main__':
-    # Running standalone - use command-line args and configurator.py
-    print("Running in standalone mode")
-    train(config=None)
+    # Check if we're running in a wandb sweep
+    if os.environ.get('WANDB_SWEEP_ID'):
+        sweep_train()
+    else:
+        # Running standalone - use command-line args and configurator.py
+        print("Running in standalone mode")
+        train(config=None)
 

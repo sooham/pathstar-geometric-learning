@@ -21,8 +21,11 @@ Usage:
     python run_sweep.py --sweep_config sweep_config.yaml --create_only
     
     # 2. Launch agents (auto-distributes grid search runs)
+    # GPU:
     CUDA_VISIBLE_DEVICES=0 python run_sweep.py --sweep_id <sweep_id> --sweep_config sweep_config.yaml --num_gpus 2 --gpu_id 0
-    CUDA_VISIBLE_DEVICES=1 python run_sweep.py --sweep_id <sweep_id> --sweep_config sweep_config.yaml --num_gpus 2 --gpu_id 1
+    
+    # CPU (ensure config has device: cpu):
+    python run_sweep.py --sweep_id <sweep_id> --sweep_config sweep_config_minimal.yaml --num_gpus 4 --gpu_id 0
 """
 
 import argparse
@@ -115,16 +118,16 @@ def main():
                         help='Existing sweep ID to join (for multi-GPU)')
     parser.add_argument('--count', type=int, default=None,
                         help='Number of runs to execute (default: auto-calculate for grid search, or run until stopped)')
-    parser.add_argument('--project', type=str, default='pathstar_sweep_dataset',
+    parser.add_argument('--project', type=str, default=None,
                         help='Wandb project name')
     parser.add_argument('--entity', type=str, default=None,
                         help='Wandb entity (username or team name)')
     parser.add_argument('--create_only', action='store_true',
                         help='Only create sweep and print ID, do not run agent')
     parser.add_argument('--gpu_id', type=str, default=None,
-                        help='GPU ID to use (will set CUDA_VISIBLE_DEVICES)')
+                        help='GPU/Worker ID to use (will set CUDA_VISIBLE_DEVICES). Use for load balancing.')
     parser.add_argument('--num_gpus', type=int, default=1,
-                        help='Total number of GPUs running agents (for auto-distributing grid search runs)')
+                        help='Total number of workers/GPUs running agents (for auto-distributing grid search runs)')
     args = parser.parse_args()
     
     # Set GPU if specified
@@ -136,39 +139,50 @@ def main():
     cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', 'not set')
     print(f"CUDA_VISIBLE_DEVICES: {cuda_visible}")
     
-    # Variable to store sweep config for auto-counting
+    # Load sweep config if provided
     sweep_config = None
+    if args.sweep_config:
+        print(f"Loading sweep configuration from: {args.sweep_config}")
+        with open(args.sweep_config, 'r') as f:
+            sweep_config = yaml.safe_load(f)
+
+    # Determine project name
+    project = args.project
+    if project is None:
+        if sweep_config:
+            # Check for top-level project
+            if 'project' in sweep_config:
+                project = sweep_config['project']
+            # Check for wandb_project in parameters
+            elif 'parameters' in sweep_config and 'wandb_project' in sweep_config['parameters']:
+                 # Handle value structure
+                 val = sweep_config['parameters']['wandb_project']
+                 if isinstance(val, dict) and 'value' in val:
+                     project = val['value']
+        
+        if project is None:
+            project = 'pathstar_sweep_dataset'
     
     # Either create new sweep or join existing one
     if args.sweep_id:
         # Join existing sweep
         sweep_id = args.sweep_id
         print(f"Joining existing sweep: {sweep_id}")
-        print(f"Project: {args.project}")
+        print(f"Project: {project}")
         
         # If sweep_id doesn't contain '/', it's just the ID without entity/project
         # We need to ensure we pass the project parameter to wandb.agent()
         if '/' not in sweep_id:
-            print(f"Note: Sweep ID format is bare ID. Will use project parameter: {args.project}")
+            print(f"Note: Sweep ID format is bare ID. Will use project parameter: {project}")
         
-        # Try to load sweep config if provided (for auto-counting)
-        if args.sweep_config and args.count is None:
-            print(f"Loading sweep config for auto-count calculation: {args.sweep_config}")
-            with open(args.sweep_config, 'r') as f:
-                sweep_config = yaml.safe_load(f)
     else:
         # Create new sweep
-        if args.sweep_config is None:
+        if sweep_config is None:
             parser.error("--sweep_config is required when creating a new sweep")
         
-        # Load sweep configuration
-        print(f"Loading sweep configuration from: {args.sweep_config}")
-        with open(args.sweep_config, 'r') as f:
-            sweep_config = yaml.safe_load(f)
-        
         # Set project
-        sweep_config['project'] = args.project
-        print(f"Using project: {args.project}")
+        sweep_config['project'] = project
+        print(f"Using project: {project}")
         
         # Initialize sweep
         print(f"\nInitializing sweep with configuration:")
@@ -189,17 +203,17 @@ def main():
                     total_runs *= count
                 print(f"  Total grid search runs: {total_runs}")
         
-        sweep_id = wandb.sweep(sweep_config, project=args.project)
+        sweep_id = wandb.sweep(sweep_config, project=project)
         
         # Extract bare sweep ID if it's in full format (entity/project/sweep_id)
         bare_sweep_id = sweep_id.split('/')[-1] if '/' in sweep_id else sweep_id
         
         print(f"\nSweep created! ID: {bare_sweep_id}")
         print(f"Full sweep path: {sweep_id}")
-        print(f"View sweep at: https://wandb.ai/{sweep_id.replace(bare_sweep_id, 'sweeps/' + bare_sweep_id) if '/' in sweep_id else f'<your-entity>/{args.project}/sweeps/{sweep_id}'}")
+        print(f"View sweep at: https://wandb.ai/{sweep_id.replace(bare_sweep_id, 'sweeps/' + bare_sweep_id) if '/' in sweep_id else f'<your-entity>/{project}/sweeps/{sweep_id}'}")
         print(f"\nTo run agents on multiple GPUs, use:")
-        print(f"  GPU 0: CUDA_VISIBLE_DEVICES=0 python run_sweep.py --sweep_id {sweep_id} --project {args.project} --count <N>")
-        print(f"  GPU 1: CUDA_VISIBLE_DEVICES=1 python run_sweep.py --sweep_id {sweep_id} --project {args.project} --count <N>")
+        print(f"  GPU 0: CUDA_VISIBLE_DEVICES=0 python run_sweep.py --sweep_id {sweep_id} --project {project} --count <N>")
+        print(f"  GPU 1: CUDA_VISIBLE_DEVICES=1 python run_sweep.py --sweep_id {sweep_id} --project {project} --count <N>")
         
         if args.create_only:
             print("\n--create_only specified. Exiting without running agent.")
@@ -233,7 +247,7 @@ def main():
     agent_kwargs = {
         'sweep_id': sweep_id,
         'function': sweep_train,
-        'project': args.project
+        'project': project
     }
     
     # Add entity if provided
@@ -243,7 +257,7 @@ def main():
     if run_count:
         print(f"\nStarting sweep agent (will run {run_count} experiments)...")
         print(f"  Sweep ID: {sweep_id}")
-        print(f"  Project: {args.project}")
+        print(f"  Project: {project}")
         if args.entity:
             print(f"  Entity: {args.entity}")
         agent_kwargs['count'] = run_count
@@ -251,7 +265,7 @@ def main():
     else:
         print(f"\nStarting sweep agent (will run until stopped)...")
         print(f"  Sweep ID: {sweep_id}")
-        print(f"  Project: {args.project}")
+        print(f"  Project: {project}")
         if args.entity:
             print(f"  Entity: {args.entity}")
         wandb.agent(**agent_kwargs)
@@ -261,4 +275,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

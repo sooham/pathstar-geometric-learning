@@ -9,7 +9,7 @@ metric:
 parameters:
   # Dataset parameters - small fixed values for quick iteration
   graph_d:
-    values: [1000]
+    values: [100]
   graph_l:
     value: 5
   graph_vocab_size:
@@ -17,23 +17,27 @@ parameters:
   graph_holdout_percentage:
     value: 0.2
   num_pause_tokens:
-    values: [1]
+    values: [5, 10, 1, 0]
   use_undirected:
     value: true
   use_directional_tokens:
-    value: true
+    values: [true, false]
   use_task_tokens:
     value: false
   dropout_embd:
     value: 0
+  weight_tying:
+    value: true
+  interleave_dataset:
+    value: true
   
   # Model architecture parameters - sweep these
   n_layer:
-    values: [5]
+    values: [1]
   n_head:
     values: [8]
   n_embd:
-    values: [64]
+    values: [32]
   dropout:
     values: [0]
     
@@ -44,7 +48,7 @@ parameters:
   learning_rate:
     value: 1e-3
   label_smoothing:
-    value: 0.1
+    value: 0
   weight_decay:
     value: 0.01
   beta1:
@@ -62,17 +66,29 @@ parameters:
   lr_decay_frac:
     value: 0.80
   min_lr:
-    value: 1e-6
+    value: 1e-5
   
   # Fixed training parameters
   epochs:
-    value: 1000  # Shorter for quick testing
+    value: 70000  # Shorter for quick testing
+  edge_iterations_per_epoch: # 800 edges total
+    value: 10
+  path_iterations_per_epoch: # 800 paths total
+    value: 10
   gradient_accumulation_steps:
-    value: 8  # Reduced from 4 for fewer optimizer steps, better GPU utilization
+    value: 1  # Reduced from 4 for fewer optimizer steps, better GPU utilization
   compile:
     value: true
   eval_interval:
-    value: 100  # Increased from 50 to reduce evaluation overhead
+    value: 300  # Increased from 50 to reduce evaluation overhead
   log_interval:
-    value: 10  # Increased from 10 to reduce print overhead
+    value: 50  # Increased from 10 to reduce print overhead
+  print_eval_interval:
+    value: 300
+  
+  wandb_project:
+    value: mats_pathstar_minimal_combined
+  # System
+  device:
+    value: mps
 
