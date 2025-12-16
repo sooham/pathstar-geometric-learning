@@ -2,7 +2,8 @@
 """
 Visualize path-star graph structure in ASCII art
 """
-from generate_pathstar import InContextPathStar, InWeightsPathStar
+from pathstar import InWeightsPathStar
+from save import InContextPathStar
 
 
 def visualize_pathstar_structure(d, l):
@@ -61,7 +62,8 @@ def visualize_pathstar_structure(d, l):
         print(f"  Leaf {leaf:2d}: {' -> '.join(map(str, path))}")
 
 
-def visualize_incontext_example(d, l):
+
+def visualize_incontext_example(d, l, num_pause_tokens=2):
     """
     Show an in-context learning example
     """
@@ -72,7 +74,7 @@ def visualize_incontext_example(d, l):
     gen = InContextPathStar(d=d, l=l, vocab_size=100)
     example = gen.generate_training_example(
         use_directional_tokens=False,
-        num_pause_tokens=2
+        num_pause_tokens=num_pause_tokens
     )
     
     print(f"\nGraph Configuration: d={d}, l={l}")
@@ -91,7 +93,7 @@ def visualize_incontext_example(d, l):
     
     print(f"\nPrefix (input to model):")
     print(f"  Length: {len(example['prefix'])} tokens")
-    print(f"  Format: [adjacency_list, PAUSE, PAUSE, root, goal]")
+    print(f"  Format: [adjacency_list, PAUSE x {num_pause_tokens}, root, goal]")
     print(f"  First 15 tokens: {example['prefix'][:15]}")
     print(f"  Last 5 tokens: {example['prefix'][-5:]}")
     
@@ -107,7 +109,7 @@ def visualize_incontext_example(d, l):
     print(f"  ✓ Path length matches l: {len(example['target']) == l}")
 
 
-def visualize_inweights_example(d, l):
+def visualize_inweights_example(d, l, num_pause_tokens=2):
     """
     Show an in-weights learning example
     """
@@ -122,20 +124,26 @@ def visualize_inweights_example(d, l):
     print(f"Leaf nodes: {gen.v_leaf}")
     
     # Generate some training sequences
-    sequences = gen.generate_path_prediction_training_set(
-        size=5,
-        pause_token=999,
-        num_pause_tokens=2
+    # Using internal method _generate_path_prediction_training_set
+    # Note: Using split='train' to get training leaves
+    # Note: Using use_task_tokens=False to match old visualization visualization format (leaf first)
+    # Ensure size does not exceed d (available paths)
+    sample_size = min(5, d)
+    sequences = gen._generate_path_prediction_training_set(
+        size=sample_size,
+        split='train',
+        num_pause_tokens=num_pause_tokens,
+        use_task_tokens=False
     )
     
     print(f"\nTraining Sequences:")
-    print(f"  Format: [leaf, PAUSE, PAUSE, root, n₂, ..., leaf]")
+    print(f"  Format: [leaf, PAUSE x {num_pause_tokens}, root, n₂, ..., leaf]")
     print()
     for i, seq in enumerate(sequences):
         seq_list = seq.tolist()
         leaf = seq_list[0]
-        pause = seq_list[1:3]
-        path = seq_list[3:]
+        pause = seq_list[1:1+num_pause_tokens]
+        path = seq_list[1+num_pause_tokens:]
         
         print(f"  Sequence {i+1}:")
         print(f"    Leaf: {leaf}")
@@ -145,12 +153,15 @@ def visualize_inweights_example(d, l):
         print()
 
 
-def compare_sequence_lengths():
+def compare_sequence_lengths(num_pause_tokens=2):
     """
-    Compare sequence lengths for different configurations
+    Show sequence lengths for different configurations
+    
+    Args:
+        num_pause_tokens: Number of pause tokens to assume in calculation
     """
     print("\n" + "=" * 80)
-    print("SEQUENCE LENGTH COMPARISON")
+    print(f"SEQUENCE LENGTH COMPARISON (num_pause_tokens={num_pause_tokens})")
     print("=" * 80)
     
     configs = [
@@ -171,11 +182,12 @@ def compare_sequence_lengths():
         nodes = d * (l - 1) + 1
         edges = d * (l - 1)
         
-        # InContext: adjacency_list (2 * edges) + pause (2) + query (2) + target (l)
-        incontext_len = 2 * edges + 2 + 2 + l
+        # InContext: adjacency_list (2 * edges) + pause (num_pause_tokens) + query (2) + target (l)
+        incontext_len = 2 * edges + num_pause_tokens + 2 + l
         
-        # InWeights: leaf (1) + pause (2) + path (l)
-        inweights_len = 1 + 2 + l
+        # InWeights: leaf (1) + pause (num_pause_tokens) + path (l)
+        # Assumes no task prefix
+        inweights_len = 1 + num_pause_tokens + l
         
         print("{:>4d} {:>4d} {:>6d} {:>6d} {:>15d} {:>15d}".format(
             d, l, nodes, edges, incontext_len, inweights_len
@@ -194,12 +206,15 @@ if __name__ == "__main__":
     
     visualize_pathstar_structure(d=5, l=3)
     
+    # Global setting for number of pause tokens
+    NUM_PAUSE_TOKENS = 2
+    
     # Show example tasks
-    visualize_incontext_example(d=3, l=4)
-    visualize_inweights_example(d=3, l=4)
+    visualize_incontext_example(d=3, l=4, num_pause_tokens=NUM_PAUSE_TOKENS)
+    visualize_inweights_example(d=3, l=4, num_pause_tokens=NUM_PAUSE_TOKENS)
     
     # Compare sequence lengths
-    compare_sequence_lengths()
+    compare_sequence_lengths(num_pause_tokens=NUM_PAUSE_TOKENS)
     
     print("\n" + "=" * 80)
     print("Visualization complete!")

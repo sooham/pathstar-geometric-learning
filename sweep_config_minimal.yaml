@@ -24,6 +24,8 @@ parameters:
     value: true
   use_task_tokens:
     value: false
+  dropout_embd:
+    value: 0
   
   # Model architecture parameters - sweep these
   n_layer:
@@ -34,6 +36,7 @@ parameters:
     values: [64]
   dropout:
     values: [0]
+    
   bias:
     value: false
   
