@@ -79,13 +79,13 @@ parameters:
   compile:
     value: true
   eval_interval:
-    value: 300  # Increased from 50 to reduce evaluation overhead
+    value: 500  # Increased from 50 to reduce evaluation overhead
   log_interval:
-    value: 50  # Increased from 10 to reduce print overhead
+    value: 150  # Increased from 10 to reduce print overhead
   print_eval_interval:
-    value: 300
+    value: 500
   vis_interval:
-    value: 50
+    value: 150
   debug_masking:
     value: false
   
