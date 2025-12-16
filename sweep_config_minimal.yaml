@@ -86,10 +86,9 @@ parameters:
     value: 300
   vis_interval:
     value: 50
+  debug_masking:
+    value: false
   
   wandb_project:
     value: mats_pathstar_minimal_combined_sweep
-  # System
-  device:
-    value: mps
 

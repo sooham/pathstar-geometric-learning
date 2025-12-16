@@ -59,6 +59,10 @@ def get_default_config():
         
         # Visualization
         'vis_interval': 100, # Interval to update training slice visualization
+        # Debugging
+        'debug_masking': False,          # If True, show target masks applied to Y
+        'debug_masking_samples': 2,      # How many batch rows to show
+        'debug_masking_max_len': 32,     # Max tokens to show per row
         
         # Dataset generation parameters
         'graph_d': 1000,
@@ -1291,6 +1295,10 @@ def train(config=None):
     else:
         pause_token_id = meta.get('pause_token')
         pad_token_id = meta.get('pad_token')
+
+    # Whether sequences include explicit task prefix tokens (PATH/EDGE).
+    # This is required to reliably apply task-aware masking in the combined (interleaved) dataset.
+    use_task_tokens = meta.get('use_task_tokens', True)
     
     if pause_token_id is not None or pad_token_id is not None:
         print(f"Loaded special tokens: PAUSE={pause_token_id}, PAD={pad_token_id}")
@@ -1454,10 +1462,118 @@ def train(config=None):
     
     # DONE
     # Updated get_batch to use pre-processed tensors and handle dtype casting
+
+    last_mask_debug_str = None
+
+    def _format_mask_debug(x, y_before, y_after, dataset_label):
+        """Return a compact debug string showing which Y positions are kept."""
+        try:
+            max_samples = int(default_config.get('debug_masking_samples', 2))
+            max_len = int(default_config.get('debug_masking_max_len', 32))
+        except Exception:
+            max_samples, max_len = 2, 32
+
+        def tok_str(t):
+            if t == -1:
+                return "<MASK>"
+            # itos keys might be str or int depending on meta serialization
+            return str(itos.get(int(t), t))
+
+        x_cpu = x.detach().cpu()
+        yb_cpu = y_before.detach().cpu()
+        ya_cpu = y_after.detach().cpu()
+
+        b = min(x_cpu.size(0), max_samples)
+        lines = [f"Mask debug ({dataset_label})  keep=1 where Y_after!=-1"]
+        for i in range(b):
+            x_row = x_cpu[i].tolist()[:max_len]
+            yb_row = yb_cpu[i].tolist()[:max_len]
+            ya_row = ya_cpu[i].tolist()[:max_len]
+            keep = [1 if t != -1 else 0 for t in ya_row]
+            kept_count = sum(keep)
+            lines.append(f"- sample {i}: kept {kept_count}/{len(keep)}")
+            lines.append("  X : " + " ".join(tok_str(t) for t in x_row))
+            lines.append("  Yb: " + " ".join(tok_str(t) for t in yb_row))
+            lines.append("  m : " + " ".join(str(k) for k in keep))
+            lines.append("  Ya: " + " ".join(tok_str(t) for t in ya_row))
+        return "\n".join(lines)
+
+    def apply_task_specific_target_mask(x, y, dataset):
+        """
+        Apply task-specific masking to targets (Y) using -1 as ignore_index.
+
+        Correct masking behavior:
+        - Edge task: only compute loss on the final endpoint token v.
+          Sequence: [<EDGE>, <GT/LT (optional)>, u, v, <PAD>...]
+          Targets Y: [<GT/LT (optional)>, u, v, <PAD>...]
+          Mask: ignore everything except the v position.
+        - Path task: ignore targets predicting <PAUSE> (handled elsewhere) and also ignore the
+          first leaf target when <PATH> task prefix token is used.
+          Sequence: [<PATH>, leaf, <PAUSE>x n, root, n2, ..., nℓ]
+          Targets Y:   [leaf, <PAUSE>x n, root, n2, ..., nℓ]
+          Mask: ignore leaf target and all <PAUSE> targets; keep loss from root onward.
+        - Combined: apply per-sample based on task/direction tokens.
+        """
+        # y is (B, T) where T == x.size(1)
+        use_task_tokens = meta.get('use_task_tokens', True)
+        use_directional_tokens = meta.get('use_directional_tokens', True)
+
+        special = meta.get('special_tokens', {}) or {}
+        EDGE = special.get('EDGE')
+        PATH = special.get('PATH')
+        GT = special.get('GT')
+        LT = special.get('LT')
+
+        def mask_edges(y_in):
+            # v is at Y index: (1 if directional token present else 0)
+            d = 1 if use_directional_tokens else 0
+            v_idx = d
+            y_out = torch.full_like(y_in, -1)
+            if 0 <= v_idx < y_in.size(1):
+                y_out[:, v_idx] = y_in[:, v_idx]
+            return y_out
+
+        def mask_paths(x_in, y_in):
+            y_out = y_in.clone()
+            # If PATH task token exists, the first target token is the leaf; ignore it.
+            if use_task_tokens:
+                path_rows = (x_in[:, 0] == PATH)
+                y_out[path_rows, 0] = -1 # ignore the first targent token leaf
+            # no task token, first token in y is PAUSE or the root which is already masked correctly
+            return y_out
+
+        if dataset == 'edges':
+            return mask_edges(y)
+        if dataset == 'paths':
+            return mask_paths(x, y)
+        if dataset == 'combined':
+            # Need to determine per-sample task type.
+            if use_task_tokens:
+                if EDGE is None or PATH is None:
+                    raise ValueError("Combined dataset requires EDGE and PATH tokens in metadata when use_task_tokens=True")
+                is_edge = (x[:, 0] == EDGE)
+                is_path = (x[:, 0] == PATH)
+            else:
+                # Without task tokens, we can only disambiguate if directional tokens are present.
+                if not use_directional_tokens:
+                    raise ValueError("Cannot interleave edges/paths without task tokens or directional tokens (ambiguous sequences).")
+                is_edge = (x[:, 0] == GT) | (x[:, 0] == LT)
+                is_path = ~is_edge
+
+            y_out = y.clone()
+            if is_edge.any():
+                y_out[is_edge] = mask_edges(y_out[is_edge])
+            if is_path.any():
+                y_out[is_path] = mask_paths(x[is_path], y_out[is_path])
+            return y_out
+
+        return y
+
     def get_batch(dataset):
         """Sample a batch from the edge dataset"""
         nonlocal edges_batch_idx, edges_epoch_indices, paths_batch_idx, paths_epoch_indices, val_batch_idx, val_epoch_indices, combined_batch_idx, combined_epoch_indices
         nonlocal paths_epoch_completed, edges_epoch_completed, combined_epoch_completed, val_epoch_completed
+        nonlocal last_mask_debug_str
 
         if dataset == 'edges':
             batch_idx = edges_batch_idx
@@ -1546,6 +1662,14 @@ def train(config=None):
             y = sequences[:, 1:].clone() # Clone needed for masking
             if pad_token_id is not None: y[y == pad_token_id] = -1
             if pause_token_id is not None: y[y == pause_token_id] = -1
+            # Validation set contains only path sequences; apply path-specific masking.
+            if default_config.get('debug_masking') and (iter_num % default_config.get('log_interval', 100) == 0):
+                y_before = y.clone()
+                y_after = apply_task_specific_target_mask(x, y, 'paths')
+                last_mask_debug_str = _format_mask_debug(x, y_before, y_after, "val(paths)")
+                y = y_after
+            else:
+                y = apply_task_specific_target_mask(x, y, 'paths')
             return x, y
         
         # Standard training batch retrieval
@@ -1564,6 +1688,15 @@ def train(config=None):
         # Casting here is cheap (on small batch) compared to storing full 64-bit dataset
         x = x.to(torch.long)
         y = y.to(torch.long)
+
+        # Apply task-specific masking (edge/path/combined).
+        if default_config.get('debug_masking') and (iter_num % default_config.get('log_interval', 100) == 0):
+            y_before = y.clone()
+            y_after = apply_task_specific_target_mask(x, y, dataset)
+            last_mask_debug_str = _format_mask_debug(x, y_before, y_after, dataset)
+            y = y_after
+        else:
+            y = apply_task_specific_target_mask(x, y, dataset)
         
         return x, y
     
@@ -1604,6 +1737,8 @@ def train(config=None):
                 Y = batch[:, 1:].contiguous()
                 if pad_token_id is not None: Y[Y == pad_token_id] = -1
                 if pause_token_id is not None: Y[Y == pause_token_id] = -1
+                # Training metrics here are for paths; apply path-specific masking.
+                Y = apply_task_specific_target_mask(X, Y, 'paths')
 
             with ctx:
                 logits, loss = model(X, Y, label_smoothing=default_config['label_smoothing'])
@@ -1661,11 +1796,14 @@ def train(config=None):
     layout.split_column(
         Layout(name="metrics", size=14), # Fixed size for metrics table
         Layout(name="evaluation"),
-        Layout(name="training")
+        Layout(name="training"),
+        Layout(name="mask", size=10) if default_config.get('debug_masking') else Layout(name="mask", size=0)
     )
     layout["metrics"].update(Panel("Waiting for first evaluation...", title="Validation Metrics", border_style="magenta"))
     layout["evaluation"].update(Panel("Waiting for first evaluation...", title="Evaluation Examples", border_style="blue"))
     layout["training"].update(Panel("Waiting for first training batch...", title="Training Slice (10 samples)", border_style="green"))
+    if default_config.get('debug_masking'):
+        layout["mask"].update(Panel("Waiting for first mask debug...", title="Mask Debug", border_style="yellow"))
 
     with Live(layout, console=console, refresh_per_second=4) as live:
         while True:
@@ -1814,6 +1952,8 @@ def train(config=None):
                     full_batch = torch.cat([X, Y[:, -1:]], dim=1)
                     training_slice_str = format_training_slice(full_batch, itos, meta, num_samples=10)
                     layout["training"].update(Panel(training_slice_str, title=f"Training Slice (Iter {iter_num})", border_style="green"))
+                    if default_config.get('debug_masking') and last_mask_debug_str is not None:
+                        layout["mask"].update(Panel(last_mask_debug_str, title=f"Mask Debug (Iter {iter_num})", border_style="yellow"))
             
             iter_num += 1
             
