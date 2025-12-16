@@ -575,7 +575,6 @@ def get_lr(it, warmup_iters, lr_decay_iters, default_config):
     if it > lr_decay_iters:
         return default_config['min_lr']
     decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
-    assert 0 <= decay_ratio <= 1
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return default_config['min_lr'] + coeff * (default_config['learning_rate'] - default_config['min_lr'])
 

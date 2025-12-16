@@ -150,7 +150,7 @@ class GPT(nn.Module):
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
-    def _create_sinusoidal_embeddings(self, max_len, d_model):
+    def _create_sinusoidal_embeddings(self, max_len, d_model, base=100):
         """
         Create sinusoidal position embeddings.
         Args:
@@ -161,7 +161,7 @@ class GPT(nn.Module):
         """
         assert d_model % 2 == 0, "d_model must be even for sinusoidal embeddings"
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(base) / d_model))
         pe = torch.zeros(max_len, d_model)
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
