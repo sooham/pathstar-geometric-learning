@@ -1527,7 +1527,7 @@ def train(config=None):
         def mask_edges(y_in):
             # v is at Y index: (1 if directional token present else 0)
             d = 1 if use_directional_tokens else 0
-            v_idx = d
+            v_idx = d + 1
             y_out = torch.full_like(y_in, -1)
             if 0 <= v_idx < y_in.size(1):
                 y_out[:, v_idx] = y_in[:, v_idx]
@@ -1793,12 +1793,19 @@ def train(config=None):
     
     # Live display for evaluation examples
     layout = Layout()
-    layout.split_column(
-        Layout(name="metrics", size=14), # Fixed size for metrics table
-        Layout(name="evaluation"),
-        Layout(name="training"),
-        Layout(name="mask", size=10) if default_config.get('debug_masking') else Layout(name="mask", size=0)
-    )
+    if default_config.get('debug_masking'):
+        layout.split_column(
+            Layout(name="metrics", size=14), # Fixed size for metrics table
+            Layout(name="evaluation"),
+            Layout(name="training"),
+            Layout(name="mask", size=10),
+        )
+    else:
+        layout.split_column(
+            Layout(name="metrics", size=14), # Fixed size for metrics table
+            Layout(name="evaluation"),
+            Layout(name="training"),
+        )
     layout["metrics"].update(Panel("Waiting for first evaluation...", title="Validation Metrics", border_style="magenta"))
     layout["evaluation"].update(Panel("Waiting for first evaluation...", title="Evaluation Examples", border_style="blue"))
     layout["training"].update(Panel("Waiting for first training batch...", title="Training Slice (10 samples)", border_style="green"))
