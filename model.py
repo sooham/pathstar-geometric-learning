@@ -120,6 +120,7 @@ class GPTConfig:
     embd_dropout: float = 0.0  # Dropout applied after embedding layer (tok_emb + pos_emb)
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     weight_tying: bool = False
+    base: float = 100.0
 
 class GPT(nn.Module):
 
@@ -139,7 +140,8 @@ class GPT(nn.Module):
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
         # Create sinusoidal position embeddings
-        self.register_buffer("pos_emb", self._create_sinusoidal_embeddings(config.block_size, config.n_embd))
+        base = config.base if config.base else 10_000
+        self.register_buffer("pos_emb", self._create_sinusoidal_embeddings(config.block_size, config.n_embd, base=base))
 
         # init all weights
         self.apply(self._init_weights)

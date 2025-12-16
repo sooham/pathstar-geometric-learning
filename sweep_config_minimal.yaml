@@ -42,6 +42,8 @@ parameters:
     values: [0]
   bias:
     value: true
+  base:
+    values: [100]
   
   # Training hyperparameters - sweep learning rate
   learning_rate:
