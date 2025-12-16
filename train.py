@@ -198,12 +198,36 @@ def compute_per_token_loss_with_teacher_forcing(meta, logits, input, targets, to
 
 def get_rich_token_str(token, itos, meta):
     """Helper to format a token with rich coloring based on training/validation splitting"""
+    # Ensure dictionary lookups work with numpy scalar types
+    token = int(token)
     token_str = itos.get(token, str(token))
-    # meta['token_colors'] maps token_id -> ANSI code
-    # We check for the specific ANSI codes used in train.py
+
+    # meta['token_colors'] maps token_id -> ANSI escape code string
     ansi_color = meta.get('token_colors', {}).get(token, '')
-    if '\033[91m' in ansi_color: return f"[bold red]{token_str}[/]"
-    if '\033[92m' in ansi_color: return f"[bold green]{token_str}[/]"
+    if not ansi_color:
+        return token_str
+
+    # Handle 256-color ANSI foreground codes like "\x1b[38;5;226m"
+    if ansi_color.startswith('\x1b[38;5;') and ansi_color.endswith('m'):
+        # Extract the color number between the prefix and suffix
+        color_num_str = ansi_color[7:-1]  # Skip '\x1b[38;5;' (7 chars) and 'm' (1 char)
+        try:
+            n = int(color_num_str)
+            return f"[color({n})]{token_str}[/]"
+        except ValueError:
+            return token_str
+
+    # Handle basic bright ANSI colors like "\x1b[91m"
+    if ansi_color.startswith('\x1b[') and ansi_color.endswith('m'):
+        code_str = ansi_color[2:-1]  # Skip '\x1b[' (2 chars) and 'm' (1 char)
+        try:
+            code = int(code_str)
+            basic = {91: "red", 92: "green", 93: "yellow", 94: "blue", 95: "magenta", 96: "cyan"}
+            if code in basic:
+                return f"[bold {basic[code]}]{token_str}[/]"
+        except ValueError:
+            return token_str
+
     return token_str
 
 def format_training_slice(sequences, itos, meta, num_samples=10):
@@ -399,10 +423,6 @@ def compute_per_token_accuracy_autoregressive(ctx, model, meta, val_data_batch, 
     ground_truths_array = np.stack(ground_truths)
     if print_samples:
         itos = meta['itos']
-        # Rich colors
-        RICH_RED = "bold red"
-        RICH_GREEN = "bold green"
-        RICH_DEFAULT = "default"
         
         # We need to map the raw tokens to which set they belong to for coloring
         # We can implement a helper or reuse the logic. 
@@ -416,21 +436,6 @@ def compute_per_token_accuracy_autoregressive(ctx, model, meta, val_data_batch, 
         
         lines = []
         lines.append("=== Generated vs Ground Truth ===")
-
-        # Helper to get rich style
-        def get_rich_style(token, token_str):
-            # Check if token is in pure_train or pure_val sets
-            # meta['token_colors'] has the ANSI codes. 
-            # We can try to infer or just use the ANSI codes if we wrap in Text.from_ansi
-            
-            # Re-using the logic from meta['token_colors'] but adapting for Rich would be cleaner
-            # but for now let's rely on Text.from_ansi if we can, or just manual coloring.
-            
-            # Let's inspect meta['token_colors'] again. It maps token_id -> ANSI code string.
-            ansi_color = meta.get('token_colors', {}).get(token, '')
-            if '\033[91m' in ansi_color: return "[bold red]" + token_str + "[/]"
-            if '\033[92m' in ansi_color: return "[bold green]" + token_str + "[/]"
-            return token_str
 
         for sample_idx in range(len(generated_tokens_batch)):
             
@@ -1025,6 +1030,119 @@ def determine_dataset_in_device_size(device, device_type, paths_data, edges_data
         return dataset_reserved_memory
     return 0
 
+def compute_token_colors(paths_data, val_data, meta):
+    """Compute ANSI color codes for tokens based on their depth and train/val split"""
+    train_tokens = set(np.unique(paths_data))
+    val_tokens = set(np.unique(val_data))
+    
+    # Extract metadata for coloring
+    root_vertex = meta['root_vertex']
+    special_tokens = set(meta['special_tokens'].values())
+    use_task_tokens = meta['use_task_tokens']
+    
+    # Build a mapping from each token to its distance from root
+    token_to_depth = {}
+    
+    # Reshape data to get sequences (paths_data is a flat memmap, need to reshape)
+    # Calculate sequence length from metadata
+    block_size = meta['block_size']
+    seq_length = block_size + 1  # block_size is context + targets - 1, so full sequence is block_size + 1
+    
+    # Reshape paths_data and val_data into sequences
+    paths_sequences = paths_data.reshape(-1, seq_length)
+    val_sequences = val_data.reshape(-1, seq_length)
+    
+    # Process training paths to determine depth
+    for path_seq in paths_sequences:
+        # Skip special tokens and find the actual path
+        path_tokens = [t for t in path_seq[1+(1 if use_task_tokens else 0):] if t not in special_tokens]
+        if len(path_tokens) > 0:
+            # First token after special tokens should be leaf, last should be root
+            for i, token in enumerate(path_tokens):
+                # Distance from root: 0 for root, increases towards leaf
+                depth = len(path_tokens) - 1 - i
+                token_int = int(token)  # Convert to Python int
+                if token_int not in token_to_depth:
+                    token_to_depth[token_int] = depth
+    
+    # Process validation paths
+    for path_seq in val_sequences:
+        path_tokens = [t for t in path_seq[1+(1 if use_task_tokens else 0):] if t not in special_tokens]
+        if len(path_tokens) > 0:
+            for i, token in enumerate(path_tokens):
+                depth = len(path_tokens) - 1 - i
+                token_int = int(token)  # Convert to Python int
+                if token_int not in token_to_depth:
+                    token_to_depth[token_int] = depth
+    
+    # Determine max depth for normalization
+    max_depth = max(token_to_depth.values()) if token_to_depth else 1
+    
+    # ANSI color codes - extended palette for finer gradients
+    # Training path colors (RED at leaf -> YELLOW at root)
+    RED = '\033[91m'           # Bright red
+    ORANGE_RED = '\033[38;5;202m'  # Orange-red
+    ORANGE = '\033[38;5;208m'      # Orange
+    YELLOW_ORANGE = '\033[38;5;214m'  # Yellow-orange
+    
+    # Validation path colors (GREEN at leaf -> YELLOW at root)
+    GREEN = '\033[92m'         # Bright green
+    LIME = '\033[38;5;154m'    # Lime green
+    YELLOW_GREEN = '\033[38;5;190m'  # Yellow-green
+    LIGHT_YELLOW = '\033[38;5;226m'  # Light yellow
+    
+    YELLOW = '\033[93m'        # Yellow
+    RESET = '\033[0m'
+    
+    token_colors = {}
+    
+    # Convert train_tokens and val_tokens to Python ints
+    train_tokens_int = {int(t) for t in train_tokens}
+    val_tokens_int = {int(t) for t in val_tokens}
+    
+    # Color each token based on its role and depth with fine-grained blending
+    for token in train_tokens_int | val_tokens_int:
+        # Skip special tokens (no color)
+        if token in special_tokens:
+            continue
+        
+        # Root is always yellow (both train and val)
+        if token == root_vertex:
+            token_colors[token] = YELLOW
+        else:
+            depth = token_to_depth.get(token, 0)
+            # Normalize depth: 0.0 at root, 1.0 at leaf
+            normalized_depth = 1.0 - (depth / max_depth if max_depth > 0 else 0.0)
+            
+            # Determine if this token appears in validation paths
+            is_val_token = token in val_tokens_int
+            
+            # Fine-grained color blending based on depth
+            # normalized_depth ranges from 0.0 (root) to 1.0 (leaf)
+            
+            if is_val_token:
+                # Validation: GREEN (at leaf) -> YELLOW (at root)
+                if normalized_depth >= 0.875:
+                    token_colors[token] = GREEN  # Leaf - bright green
+                elif normalized_depth >= 0.625:
+                    token_colors[token] = LIME  # Lime green
+                elif normalized_depth >= 0.375:
+                    token_colors[token] = YELLOW_GREEN  # Yellow-green
+                elif normalized_depth >= 0.125:
+                    token_colors[token] = LIGHT_YELLOW  # Light yellow
+            else:
+                # Training: RED (at leaf) -> YELLOW (at root)
+                if normalized_depth >= 0.875:
+                    token_colors[token] = RED  # Leaf - bright red
+                elif normalized_depth >= 0.625:
+                    token_colors[token] = ORANGE_RED  # Orange-red
+                elif normalized_depth >= 0.375:
+                    token_colors[token] = ORANGE  # Orange
+                elif normalized_depth >= 0.125:
+                    token_colors[token] = YELLOW_ORANGE  # Yellow-orange
+    
+    return token_colors, RESET
+
 def train(config=None):
     """
     Main training function that can be called standalone or by wandb sweep.
@@ -1079,33 +1197,12 @@ def train(config=None):
     )
     
     meta, paths_data, edges_data, val_data = gen.load_dataset()
-
-    # Precompute token colors for visualization
-    # Tokens exclusively in training set -> RED
-    # Tokens exclusively in validation set -> GREEN
-    # Shared tokens (Root, Special) -> No color
     print("Precomputing token colors...")
-    train_tokens = set(np.unique(paths_data))
-    val_tokens = set(np.unique(val_data))
-    
-    pure_train_tokens = train_tokens - val_tokens
-    pure_val_tokens = val_tokens - train_tokens
-    
-    token_colors = {}
-    RED = '\033[91m'
-    GREEN = '\033[92m'
-    RESET = '\033[0m'
-    
-    for t in pure_train_tokens:
-        token_colors[t] = RED
-    for t in pure_val_tokens:
-        token_colors[t] = GREEN
+    token_colors, RESET = compute_token_colors(paths_data, val_data, meta)
     
     meta['token_colors'] = token_colors
     meta['RESET_COLOR'] = RESET
-
     meta['randomize_vocab_size'] = gen.randomize_vocab_size
-    
     # Extract graph parameters from metadata
     graph_length = meta['l']
     graph_spokes = meta['d']
