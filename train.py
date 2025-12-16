@@ -57,6 +57,9 @@ def get_default_config():
         'wandb_project': 'pathstar_interleave',
         'wandb_run_name': None,  # Will be auto-generated
         
+        # Visualization
+        'vis_interval': 100, # Interval to update training slice visualization
+        
         # Dataset generation parameters
         'graph_d': 1000,
         'graph_l': 5,
@@ -223,9 +226,17 @@ def format_training_slice(sequences, itos, meta, num_samples=10):
         
     return "\n".join(lines)
 
-def create_metrics_table(metrics, graph_length, iter_num, epoch, lr):
+def create_metrics_table(metrics, graph_length, iter_num, epoch, lr, tokens_per_sec=None, batch_size=None, edge_memorization_pct=None):
     """Create a Rich Table for per-token metrics (Train vs Val)"""
-    table = Table(title=f"Per-Token Metrics (Iter {iter_num}, Epoch {epoch:.2f}, LR {lr:.2e})", show_header=True, header_style="bold magenta")
+    title = f"Per-Token Metrics (Iter {iter_num}, Epoch {epoch:.2f}, LR {lr:.2e}"
+    if batch_size is not None:
+        title += f", BS {batch_size}"
+    if tokens_per_sec is not None:
+        title += f", {tokens_per_sec:.2e} tok/s"
+    if edge_memorization_pct is not None:
+        title += f", Edge Mem: {edge_memorization_pct:.1f}%"
+    title += ")"
+    table = Table(title=title, show_header=True, header_style="bold magenta")
     table.add_column("Pos", style="cyan", justify="center")
     table.add_column("Train Loss", style="red", justify="right")
     table.add_column("Val Loss", style="red", justify="right")
@@ -245,6 +256,105 @@ def create_metrics_table(metrics, graph_length, iter_num, epoch, lr):
         )
             
     return table
+
+def evaluate_edge_memorization(ctx, model, meta, edges_data_np, device, batch_size=512):
+    """
+    Evaluate the percentage of edges memorized by the model.
+    
+    Args:
+        ctx: autocast context
+        model: the model to evaluate
+        edges_data_np: numpy array of edge sequences (shape: [num_edges, seq_length])
+        device: device to run evaluation on
+        batch_size: batch size for evaluation
+    
+    Returns:
+        edge_memorization_pct: percentage of edges where final token is correctly predicted
+    """
+    model.eval()
+    
+    num_edges = len(edges_data_np)
+    num_batches = int(np.ceil(num_edges / batch_size))
+    
+    correct_predictions = 0
+    total_predictions = 0
+    
+    # Debug: Print first batch details
+    print(f"\n=== Edge Memorization Evaluation Debug ===")
+    print(f"Total edges: {num_edges}")
+    print(f"Batch size: {batch_size}")
+    print(f"Number of batches: {num_batches}")
+    print(f"use_task_tokens: {meta.get('use_task_tokens', False)}")
+    print(f"use_directional_tokens: {meta.get('use_directional_tokens', False)}")
+    
+    for batch_idx in range(num_batches):
+        start_idx = batch_idx * batch_size
+        end_idx = min(start_idx + batch_size, num_edges)
+        
+        # Get batch of edge sequences
+        batch = torch.from_numpy(edges_data_np[start_idx:end_idx].astype(np.int64)).to(device)
+        
+        # Split into input (X) and target (Y)
+        # For edges, we want to predict the token after the (1 if use_task_tokens else 0) + (1 if use_direction_tokens else 0 ))
+        pos = (1 if meta['use_task_tokens'] else 0) + (1 if meta['use_directional_tokens'] else 0) + 1
+        X = batch[:, :pos]  # All tokens except the last
+        Y_true = batch[:, pos]  # The final token (target edge)
+        
+        # # Debug: Print first batch details
+        # if batch_idx == 0:
+        #     print(f"\nFirst batch details:")
+        #     print(f"Position index (pos): {pos}")
+        #     print(f"Batch shape: {batch.shape}")
+        #     print(f"X shape (input): {X.shape}")
+        #     print(f"Y_true shape (target): {Y_true.shape}")
+        #     print(f"\nFirst 3 edge sequences in batch:")
+        #     for i in range(min(3, len(batch))):
+        #         print(f"  Edge {i}: {batch[i].cpu().numpy()}")
+        #         print(f"    Input (X): {X[i].cpu().numpy()}")
+        #         print(f"    Target (Y_true): {Y_true[i].item()}")
+        
+        with ctx:
+            with torch.no_grad():
+                # Get model predictions
+                logits, _ = model(X, None)  # No targets needed for inference
+                
+                # Get predictions for the last position (final token)
+                final_logits = logits[:, -1, :]  # Shape: [batch_size, vocab_size]
+                predictions = torch.argmax(final_logits, dim=-1)  # Shape: [batch_size]
+                
+                # # Debug: Print first batch predictions
+                # if batch_idx == 0:
+                #     print(f"\nModel outputs for first batch:")
+                #     print(f"Logits shape: {logits.shape}")
+                #     print(f"Final logits shape: {final_logits.shape}")
+                #     print(f"Predictions shape: {predictions.shape}")
+                #     print(f"\nFirst 3 predictions vs targets:")
+                #     for i in range(min(3, len(predictions))):
+                #         pred = predictions[i].item()
+                #         target = Y_true[i].item()
+                #         correct = "✓" if pred == target else "✗"
+                #         print(f"  Edge {i}: Predicted={pred}, Target={target} {correct}")
+                #         # Show top-5 logits for first sample
+                #         if i == 0:
+                #             top5_logits, top5_indices = torch.topk(final_logits[i], k=min(5, final_logits.shape[-1]))
+                #             print(f"    Top-5 predictions: {top5_indices.cpu().numpy()} with logits {top5_logits.cpu().numpy()}")
+                
+                # Count correct predictions
+                correct = (predictions == Y_true).sum().item()
+                correct_predictions += correct
+                total_predictions += len(Y_true)
+    
+    model.train()
+    
+    # Calculate percentage
+    edge_memorization_pct = (correct_predictions / total_predictions) * 100.0 if total_predictions > 0 else 0.0
+    
+    # print(f"\n=== Edge Memorization Results ===")
+    # print(f"Correct predictions: {correct_predictions}/{total_predictions}")
+    # print(f"Edge memorization: {edge_memorization_pct:.2f}%")
+    # print(f"=====================================\n")
+    
+    return edge_memorization_pct
 
 def compute_per_token_accuracy_autoregressive(ctx, model, meta, val_data_batch, num_samples, device_local, print_samples=False):
     """Compute per-token accuracy using autoregressive generation"""
@@ -649,10 +759,9 @@ def calculate_optimal_batch_size_for_training(model, block_size, vocab_size, dev
     device_type = device if isinstance(device, str) else device.type
     if device_type != 'cuda':
         if target_batch_size is not None:
-            # For CPU, we default to the dataset size (or close to it) if provided, 
-            # to align with "one iteration means a complete iteration of that dataset".
-            # We maintain a minimum of 2000 for efficiency on very small datasets.
-            return max(2000, target_batch_size)
+            # For CPU/MPS, cap batch size to dataset size to avoid batch_size > dataset_size
+            # We maintain a minimum of 500 for efficiency on very small datasets.
+            return min(2000, target_batch_size)
         return 2000  # Default for non-CUDA
     
     # Get GPU memory info
@@ -730,6 +839,10 @@ def calculate_optimal_batch_size_for_training(model, block_size, vocab_size, dev
     # Apply reasonable bounds
     max_batch_size = max(500, min(max_microbatch_size, 5000))
     
+    # Cap to target_batch_size if provided (avoid batch_size > dataset_size)
+    if target_batch_size is not None:
+        max_batch_size = min(max_batch_size, target_batch_size)
+    
     # Diagnostic output
     print(f"\n=== Memory-Based Batch Size Calculation ===")
     print(f"GPU: {props.name}")
@@ -754,7 +867,7 @@ def calculate_optimal_batch_size_for_training(model, block_size, vocab_size, dev
     return max_batch_size
 
 # GOOD
-def evaluate(estimate_metrics, config, meta, iter_num, lr, ctx, device, model, val_data_np, paths_data_np, print_samples=False, eval_layout_component=None, metrics_layout_component=None):
+def evaluate(estimate_metrics, config, meta, iter_num, lr, ctx, device, model, val_data_np, paths_data_np, edges_data_np, print_samples=False, eval_layout_component=None, metrics_layout_component=None, tokens_per_sec=None, batch_size=None):
     # Compute metrics for both splits
     val_metrics = estimate_metrics('val', print_samples)
     train_metrics = estimate_metrics('train', False) # Don't print train samples here
@@ -773,29 +886,32 @@ def evaluate(estimate_metrics, config, meta, iter_num, lr, ctx, device, model, v
     val_avg_accuracy = evaluate_samples(device, ctx, model,  meta, val_data_np, VAL_DATASET_SIZE, 'val', num_samples=min(VAL_DATASET_SIZE, autoregressive_eval_samples))
     train_avg_accuracy = evaluate_samples(device, ctx, model, meta, paths_data_np, PATHS_DATASET_SIZE, 'train', num_samples=min(PATHS_DATASET_SIZE, autoregressive_eval_samples))
     
+    # Evaluate edge memorization
+    edge_memorization_pct = evaluate_edge_memorization(ctx, model, meta, edges_data_np, device, batch_size=512)
+    
     # Update Live display if new samples were generated
     if 'generated_text' in losses and losses['generated_text'] and eval_layout_component:
         eval_layout_component.update(Panel(losses['generated_text'], title="Evaluation Examples", border_style="blue"))
 
     # Update metrics display
     if metrics_layout_component:
-        metrics_table = create_metrics_table(losses, graph_length, iter_num, current_epoch, lr)
+        metrics_table = create_metrics_table(losses, graph_length, iter_num, current_epoch, lr, tokens_per_sec, batch_size, edge_memorization_pct)
         metrics_layout_component.update(Panel(Align.center(metrics_table), title="Validation Metrics", border_style="magenta"))
 
-    # PRINTING
-    console.print(f"step {iter_num}: epoch {current_epoch:.2f}, val loss {losses['val']:.4f}, train loss {losses['train']:.4f}")
+    # # PRINTING
+    # console.print(f"step {iter_num}: epoch {current_epoch:.2f}, val loss {losses['val']:.4f}, train loss {losses['train']:.4f}")
     
     if 'val_per_token' in losses:
-        console.print("  Val per-token losses:")
+        # console.print("  Val per-token losses:")
         per_token_str = ", ".join([f"tok{i}: {losses['val_per_token'].get(i, float('nan')):.4f}" 
                                 for i in range(1, min(graph_length + 1, 10))])
-        console.print(f"    {per_token_str}")
+        # console.print(f"    {per_token_str}")
     
     if 'val_per_token_accuracy' in losses:
-        console.print("  Val per-token accuracies (autoregressive):")
+        # console.print("  Val per-token accuracies (autoregressive):")
         per_token_acc_str = ", ".join([f"tok{i}: {losses['val_per_token_accuracy'].get(i, float('nan'))*100:.1f}%" 
                                     for i in range(1, min(graph_length + 1, 10))])
-        console.print(f"    {per_token_acc_str}")
+        # console.print(f"    {per_token_acc_str}")
     
     
     if config['wandb_log']:
@@ -805,10 +921,11 @@ def evaluate(estimate_metrics, config, meta, iter_num, lr, ctx, device, model, v
             'warmup_iters': meta['warmup_iters'],
             "epoch": round(current_epoch, 4),
             "val/loss/overall": losses['val'],
-            "train/loss/overall": losses['train'],
+            "train/loss/eval": losses['train'],
             "lr": lr,
             "gen/val_paths_avg_accuracy": val_avg_accuracy,
-            "gen/train_paths_avg_accuracy": train_avg_accuracy
+            "gen/train_paths_avg_accuracy": train_avg_accuracy,
+            "edge_memorization_pct": edge_memorization_pct
         }
         
         if 'val_per_token' in losses:
@@ -1180,20 +1297,62 @@ def train(config=None):
     
     assert paths_seq_length == edges_seq_length, f"Sequence length mismatch: paths={paths_seq_length}, edges={edges_seq_length}"
     
-    # Create tensors and load to GPU if pre-calculated decision indicates they fit
+    # DETERMINE OPTIMAL STORAGE DTYPE
+    # We use int32 or int16 for storage to save memory/bandwidth, but cast to Long (int64) for model input
+    # This is safe because we only cast at the last moment
+    max_vocab_idx = max(meta_vocab_size, max([x for x in meta['special_tokens'].values() if isinstance(x, int)] + [0]))
+    if max_vocab_idx < 32767:
+        storage_dtype = torch.int16
+        print(f"Optimizing memory: Using int16 for dataset storage (max token: {max_vocab_idx})")
+    elif max_vocab_idx < 2147483647:
+        storage_dtype = torch.int32
+        print(f"Optimizing memory: Using int32 for dataset storage (max token: {max_vocab_idx})")
+    else:
+        storage_dtype = torch.int64
+        print(f"Using standard int64 for dataset storage (max token: {max_vocab_idx})")
+        
+    # Pre-process datasets: Create X (inputs) and Y (targets) tensors with optimized dtype
+    # We apply masking to Y statically here to avoid doing it in the inner loop
+    
+    def preprocess_dataset(data_np):
+        # Convert to tensor with optimized dtype
+        data_inv = torch.from_numpy(data_np.astype(np.int64)) # Load as int64 first safely
+        
+        # Split into X and Y
+        # X: 0 to L-1
+        # Y: 1 to L
+        X = data_inv[:, :-1].to(storage_dtype)
+        Y = data_inv[:, 1:].clone() # Keep as int64 temporarily for masking if needed, or mask then cast
+        
+        # Apply masking to Y
+        if pad_token_id is not None:
+            Y[Y == pad_token_id] = -1
+        if pause_token_id is not None:
+            Y[Y == pause_token_id] = -1
+            
+        # Now cast Y to storage dtype. 
+        # Note: -1 (mask) in int16/int32 is preserved as -1 (signed)
+        Y = Y.to(storage_dtype)
+        
+        return X, Y
+
     # Create tensors and load to GPU if pre-calculated decision indicates they fit
     # If interleaving, combined_data is already prepared
     if default_config['interleave_dataset']:
-        paths_data_tensor = None # Unused in interleaved mode
-        edges_data_tensor = None # Unused in interleaved mode
-        combined_data_tensor = torch.from_numpy(combined_data.astype(np.int64))
-        print(f"Created balanced interleaved dataset tensor with shape {combined_data_tensor.shape}")
+        paths_X, paths_Y = None, None
+        edges_X, edges_Y = None, None
+        print("Pre-processing combined dataset...")
+        combined_X, combined_Y = preprocess_dataset(combined_data)
+        print(f"Created pre-processed combined tensors: X={combined_X.shape}, Y={combined_Y.shape}, dtype={storage_dtype}")
     else:
-        paths_data_tensor = torch.from_numpy(paths_data.astype(np.int64))
-        edges_data_tensor = torch.from_numpy(edges_data.astype(np.int64))
-        combined_data_tensor = None
+        print("Pre-processing separate datasets...")
+        paths_X, paths_Y = preprocess_dataset(paths_data)
+        edges_X, edges_Y = preprocess_dataset(edges_data)
+        combined_X, combined_Y = None, None
+        print(f"Created pre-processed path tensors: X={paths_X.shape}, Y={paths_Y.shape}")
     
-    val_data_tensor = torch.from_numpy(val_data.astype(np.int64))
+    # Store validation data with optimized dtype too (though less critical)
+    val_data_tensor = torch.from_numpy(val_data.astype(np.int64)).to(storage_dtype)
     
     datasets_on_gpu = False
     if device_type == 'cuda':
@@ -1203,26 +1362,43 @@ def train(config=None):
             print(f"Reserved memory: {dataset_reserved_memory / 1e9:.3f} GB")
             print("✓ Loading datasets to GPU for faster training")
             if default_config['interleave_dataset']:
-                combined_data_tensor = combined_data_tensor.pin_memory().to(device, non_blocking=True)
+                combined_X = combined_X.pin_memory().to(device, non_blocking=True)
+                combined_Y = combined_Y.pin_memory().to(device, non_blocking=True)
             else:
-                paths_data_tensor = paths_data_tensor.pin_memory().to(device, non_blocking=True)
-                edges_data_tensor = edges_data_tensor.pin_memory().to(device, non_blocking=True)
+                paths_X = paths_X.pin_memory().to(device, non_blocking=True)
+                paths_Y = paths_Y.pin_memory().to(device, non_blocking=True)
+                edges_X = edges_X.pin_memory().to(device, non_blocking=True)
+                edges_Y = edges_Y.pin_memory().to(device, non_blocking=True)
             val_data_tensor = val_data_tensor.pin_memory().to(device, non_blocking=True)
             datasets_on_gpu = True
             print(f"===================================\n")
         else:
             print(f"\n=== Dataset Loading Decision ===")
             print("✗ Datasets will stay on CPU (will transfer batches on-demand)")
+            # Should we pin memory on CPU? Yes, always good for transfer
+            if default_config['interleave_dataset']:
+                combined_X = combined_X.pin_memory()
+                combined_Y = combined_Y.pin_memory()
+            else:
+                paths_X = paths_X.pin_memory()
+                paths_Y = paths_Y.pin_memory()
+                edges_X = edges_X.pin_memory()
+                edges_Y = edges_Y.pin_memory()
             print(f"===================================\n")
             datasets_on_gpu = False
     else:
         # For non-CUDA devices, always keep on CPU or move to device as appropriate
+        # On MPS, memory is unified, so .to(device) is practically zero-copy for large tensors?
+        # Actually explicitly moving to mps device is good if it fits.
         if device_type != 'cpu':
             if default_config['interleave_dataset']:
-                combined_data_tensor = combined_data_tensor.to(device)
+                combined_X = combined_X.to(device)
+                combined_Y = combined_Y.to(device)
             else:
-                paths_data_tensor = paths_data_tensor.to(device)
-                edges_data_tensor = edges_data_tensor.to(device)
+                paths_X = paths_X.to(device)
+                paths_Y = paths_Y.to(device)
+                edges_X = edges_X.to(device)
+                edges_Y = edges_Y.to(device)
             val_data_tensor = val_data_tensor.to(device)
             datasets_on_gpu = True
         else:
@@ -1230,6 +1406,7 @@ def train(config=None):
     
     # Keep NumPy versions for evaluate_samples (will optimize separately)
     paths_data_np = paths_data
+    edges_data_np = edges_data
     val_data_np = val_data
     
     # Initialize epoch indices for sampling without replacement
@@ -1237,46 +1414,78 @@ def train(config=None):
         paths_epoch_indices = None
         edges_epoch_indices = None 
         combined_epoch_indices = np.arange(combined_size)
+        # Perform initial shuffle once
+        np.random.shuffle(combined_epoch_indices)
     else:
         paths_epoch_indices = np.arange(paths_size)
         edges_epoch_indices = np.arange(edges_size)
+        # Perform initial shuffle once for each dataset
+        np.random.shuffle(paths_epoch_indices)
+        np.random.shuffle(edges_epoch_indices)
         
     val_epoch_indices = np.arange(VAL_DATASET_SIZE)
+    # Perform initial shuffle for validation
+    np.random.shuffle(val_epoch_indices)
+    
     paths_batch_idx = 0
     edges_batch_idx = 0
     combined_batch_idx = 0
     val_batch_idx = 0
     
+    # Track whether we've completed at least one full pass through each dataset
+    # This is used to determine shuffling strategy
+    paths_epoch_completed = False
+    edges_epoch_completed = False
+    combined_epoch_completed = False
+    val_epoch_completed = False
+    
     # DONE
+    # Updated get_batch to use pre-processed tensors and handle dtype casting
     def get_batch(dataset):
         """Sample a batch from the edge dataset"""
         nonlocal edges_batch_idx, edges_epoch_indices, paths_batch_idx, paths_epoch_indices, val_batch_idx, val_epoch_indices, combined_batch_idx, combined_epoch_indices
+        nonlocal paths_epoch_completed, edges_epoch_completed, combined_epoch_completed, val_epoch_completed
 
         if dataset == 'edges':
             batch_idx = edges_batch_idx
             epoch_indices = edges_epoch_indices
             dataset_size = edges_size
-            dataset_tensors = edges_data_tensor
+            X_source = edges_X
+            Y_source = edges_Y
+            epoch_completed = edges_epoch_completed
         elif dataset == 'paths':
             batch_idx = paths_batch_idx
             epoch_indices = paths_epoch_indices
             dataset_size = paths_size
-            dataset_tensors = paths_data_tensor
+            X_source = paths_X
+            Y_source = paths_Y
+            epoch_completed = paths_epoch_completed
         elif dataset == 'combined':
             batch_idx = combined_batch_idx
             epoch_indices = combined_epoch_indices
             dataset_size = combined_size
-            dataset_tensors = combined_data_tensor
+            X_source = combined_X
+            Y_source = combined_Y
+            epoch_completed = combined_epoch_completed
         elif dataset == 'val':
+            # Validation logic remains largely same but we need to handle X/Y/Masking dynamically or pre-process it too.
+            # For simplicity, we'll keep dynamic slicing for val since it's infrequent
+            # But let's use the optimized storage tensor
             batch_idx = val_batch_idx
             epoch_indices = val_epoch_indices
             dataset_size = VAL_DATASET_SIZE
+            X_source = None # Special case
+            Y_source = None
             dataset_tensors = val_data_tensor
+            epoch_completed = val_epoch_completed
         else:
             raise ValueError("This should not happen")
         
-        # Check if we need to shuffle for new epoch
-        if batch_idx == 0:
+        # Smart shuffling strategy:
+        # - Only shuffle at epoch boundaries (when batch_idx == 0 AND we've completed at least one epoch)
+        # - This prevents constant reshuffling when batch_size >= dataset_size
+        # - For dataset_size >> batch_size, this shuffles once per epoch (proper behavior)
+        if batch_idx == 0 and epoch_completed:
             np.random.shuffle(epoch_indices)
         
         # Get batch indices
@@ -1285,45 +1494,63 @@ def train(config=None):
         batch_seq_indices = epoch_indices[start_idx:end_idx]
         
         # Update batch index for next call
-        batch_idx = (batch_idx + 1) if end_idx < dataset_size else 0
+        # If we've exhausted the dataset, wrap to 0 and mark epoch as completed
+        if end_idx >= dataset_size:
+            batch_idx = 0
+            epoch_completed = True
+        else:
+            batch_idx = batch_idx + 1
 
         if dataset == 'edges':
             edges_batch_idx = batch_idx
+            edges_epoch_completed = epoch_completed
         elif dataset == 'paths':
             paths_batch_idx = batch_idx
+            paths_epoch_completed = epoch_completed
         elif dataset == 'combined':
             combined_batch_idx = batch_idx
+            combined_epoch_completed = epoch_completed
         elif dataset == 'val':
             val_batch_idx = batch_idx
+            val_epoch_completed = epoch_completed
         else:
             raise ValueError("This should not happen")
 
+
+        if dataset == 'val':
+            # Special handling for validation (dynamic)
+            if datasets_on_gpu:
+                sequences = dataset_tensors[batch_seq_indices]
+            else:
+                sequences = dataset_tensors[batch_seq_indices]
+                if device_type in ['cuda', 'mps']:
+                    sequences = sequences.to(device, non_blocking=True)
+            
+            # Cast to Long for model input (important for embedding)
+            sequences = sequences.to(torch.long)
+            
+            x = sequences[:, :-1]
+            y = sequences[:, 1:].clone() # Clone needed for masking
+            if pad_token_id is not None: y[y == pad_token_id] = -1
+            if pause_token_id is not None: y[y == pause_token_id] = -1
+            return x, y
         
+        # Standard training batch retrieval
         # Extract sequences (from GPU if available, otherwise from CPU and transfer)
         if datasets_on_gpu:
-            sequences = dataset_tensors[batch_seq_indices]
+            x = X_source[batch_seq_indices]
+            y = Y_source[batch_seq_indices]
         else:
-            sequences = dataset_tensors[batch_seq_indices]
+            x = X_source[batch_seq_indices]
+            y = Y_source[batch_seq_indices]
             if device_type in ['cuda', 'mps']:
-                sequences = sequences.to(device, non_blocking=True)
+                x = x.to(device, non_blocking=True)
+                y = y.to(device, non_blocking=True)
         
-        # Pad or truncate to block_size if needed
-        if edges_seq_length < meta['block_size']:
-            raise ValueError(f"Sequence length ({edges_seq_length}) is less than block_size ({meta['block_size']}). This should not happen.")
-        elif edges_seq_length > meta['block_size']:
-            raise ValueError(f"Sequence length ({edges_seq_length}) exceeds block_size ({meta['block_size']}). This should not happen.")
-        
-        # Create input (x) and target (y) by shifting
-        x = sequences[:, :-1].clone()
-        y = sequences[:, 1:].clone()
-        
-        # Mask PAD tokens in targets
-        if pad_token_id is not None:
-            y[y == pad_token_id] = -1
-
-        # Mask PAUSE tokens in targets
-        if pause_token_id is not None:
-            y[y == pause_token_id] = -1
+        # FINAL MILE CASTING: Ensure compatibility with GPU kernels (e.g. Embedding)
+        # Casting here is cheap (on small batch) compared to storing full 64-bit dataset
+        x = x.to(torch.long)
+        y = y.to(torch.long)
         
         return x, y
     
@@ -1438,7 +1665,16 @@ def train(config=None):
             # Evaluate
             if iter_num % default_config['eval_interval'] == 0:
                 print_samples = iter_num % default_config['print_eval_interval'] == 0
-                evaluate(estimate_metrics, default_config, meta, iter_num, lr, ctx, device, model, val_data_np, paths_data_np, print_samples, eval_layout_component=layout["evaluation"], metrics_layout_component=layout["metrics"])
+                # Calculate tokens_per_sec for display if available
+                current_tokens_per_sec = None
+                if 'dt' in locals() and dt > 0:
+                     # Re-calculate or use stored value. We need 'steps' and 'block_size'
+                     # 'steps' is defined below but used from previous iter effectively? 
+                     # Actually 'steps' is defined in the loop. For iter_num > 0 it should be available.
+                     if 'steps' in locals():
+                         current_tokens_per_sec = (train_batch_size * steps * meta['block_size']) / dt
+                
+                evaluate(estimate_metrics, default_config, meta, iter_num, lr, ctx, device, model, val_data_np, paths_data_np, edges_data_np, print_samples, eval_layout_component=layout["evaluation"], metrics_layout_component=layout["metrics"], tokens_per_sec=current_tokens_per_sec, batch_size=train_batch_size)
             
             if iter_num == 0 and default_config['eval_only']:
                 break
@@ -1521,26 +1757,30 @@ def train(config=None):
             current_epoch = iter_num / meta['batches_per_epoch']
             if iter_num % default_config['log_interval'] == 0:
                 lossf = loss.item() * steps
+                tokens_per_sec = (X.numel() * steps) / dt
                 if default_config['interleave_dataset']:
                     phase_label = "[COMBINED]"
                 else:
                     phase_label = "[EDGE]" if current_phase == 'edge' else "[PATH]"
-                console.print(f"iter {iter_num}: {phase_label} loss {lossf:.4f}, time {dt*1000:.2f}ms")
+                # console.print(f"iter {iter_num}: {phase_label} loss {lossf:.4f}, time {dt*1000:.2f}ms, tok/sec {tokens_per_sec:.2f}")
                 if default_config['wandb_log']:
                     wandb.log({
                         'train/loss/overall': lossf,
                         'dt': dt,
                         'iter': iter_num,
                         "epoch": round(current_epoch, 4),
+                        'tokens_per_sec': tokens_per_sec,
                     })
                 
                 # Update training slice panel
-                # Reconstruct full sequence for visualization: X + last token of Y
-                # Note: Y has masking (-1) applied, so if the last token is masked, it won't show, 
-                # but for path tasks the last token (LEAF) is not masked.
-                full_batch = torch.cat([X, Y[:, -1:]], dim=1)
-                training_slice_str = format_training_slice(full_batch, itos, meta, num_samples=10)
-                layout["training"].update(Panel(training_slice_str, title=f"Training Slice (Iter {iter_num})", border_style="green"))
+                # Only update every vis_interval to save sync/formatting time
+                if iter_num % default_config['vis_interval'] == 0:
+                    # Reconstruct full sequence for visualization: X + last token of Y
+                    # Note: Y has masking (-1) applied, so if the last token is masked, it won't show, 
+                    # but for path tasks the last token (LEAF) is not masked.
+                    full_batch = torch.cat([X, Y[:, -1:]], dim=1)
+                    training_slice_str = format_training_slice(full_batch, itos, meta, num_samples=10)
+                    layout["training"].update(Panel(training_slice_str, title=f"Training Slice (Iter {iter_num})", border_style="green"))
             
             iter_num += 1
             

@@ -9,7 +9,7 @@ metric:
 parameters:
   # Dataset parameters - small fixed values for quick iteration
   graph_d:
-    values: [100]
+    values: [1000,100]
   graph_l:
     value: 5
   graph_vocab_size:
@@ -17,15 +17,13 @@ parameters:
   graph_holdout_percentage:
     value: 0.2
   num_pause_tokens:
-    values: [5, 10, 1, 0]
+    values: [5]
   use_undirected:
     value: true
   use_directional_tokens:
-    values: [true, false]
+    values: [true]
   use_task_tokens:
-    value: false
-  dropout_embd:
-    value: 0
+    values: [true]
   weight_tying:
     value: true
   interleave_dataset:
@@ -37,12 +35,13 @@ parameters:
   n_head:
     values: [8]
   n_embd:
-    values: [32]
+    values: [64,128]
   dropout:
     values: [0]
-    
+  dropout_embd:
+    values: [0]
   bias:
-    value: false
+    value: true
   
   # Training hyperparameters - sweep learning rate
   learning_rate:
@@ -56,7 +55,7 @@ parameters:
   beta2:
     value: 0.95
   grad_clip:
-    value: 1.0
+    value: 0.0
   
   # Learning rate schedule
   decay_lr:
@@ -70,7 +69,7 @@ parameters:
   
   # Fixed training parameters
   epochs:
-    value: 70000  # Shorter for quick testing
+    value: 100_000  # Shorter for quick testing
   edge_iterations_per_epoch: # 800 edges total
     value: 10
   path_iterations_per_epoch: # 800 paths total
@@ -85,9 +84,11 @@ parameters:
     value: 50  # Increased from 10 to reduce print overhead
   print_eval_interval:
     value: 300
+  vis_interval:
+    value: 50
   
   wandb_project:
-    value: mats_pathstar_minimal_combined
+    value: mats_pathstar_minimal_combined_sweep
   # System
   device:
     value: mps

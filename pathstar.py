@@ -534,7 +534,7 @@ class InWeightsPathStar:
             'use_task_tokens': use_task_tokens,
             'edge_context_length': edge_context_length,
             'path_context_length': path_context_length,
-            'block_size': path_seq_len,  # Use actual sequence length (path_context_length + l), not just context length
+            'block_size': path_seq_len - 1,  # Use actual sequence length (path_context_length + l), not just context length TODO: if you want EOS or to use full context, you need to remove the -1.
             'num_train_path_samples': num_train_path_samples,
             'num_val_path_samples': num_val_path_samples,
             'total_edge_size': num_edge_samples
