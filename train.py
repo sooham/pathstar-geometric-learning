@@ -64,7 +64,8 @@ def get_default_config():
         'n_layer': 3,
         'n_head': 8,
         'n_embd': 96,
-        'dropout': 0.0,
+        'dropout': 0.0,  # Dropout for attention, MLP, and residual connections
+        'embd_dropout': 0.0,  # Dropout for embedding layer output
         'bias': False,
         
         # Optimization
@@ -344,6 +345,11 @@ def set_wandb_name(config):
             dir_label = "undir_" if config["use_undirected"] else "dir_"
             tt_label = "tt_" if config['use_task_tokens'] else 'nott_'
             dt_label = 'dt_' if config['use_directional_tokens'] else 'nodt_'
+            # Include both dropout values if they differ, otherwise just one
+            if config['dropout'] == config['embd_dropout']:
+                dropout_label = f"D{config['dropout']}_"
+            else:
+                dropout_label = f"D{config['dropout']}_ED{config['embd_dropout']}_"
             custom_name = (
                 f"{utc_time}_"
                 f"G{config['graph_d']},"
@@ -351,7 +357,7 @@ def set_wandb_name(config):
                 f"L{config['n_layer']}_"
                 f"E{config['n_embd']}_"
                 f"H{config['n_head']}_"
-                f"D{config['dropout']}_"
+                f"{dropout_label}"
                 f"p{config['num_pause_tokens']}_"
                 f"{dir_label}"
                 f"{tt_label}"
@@ -434,7 +440,8 @@ def initalize_model(device, meta, config, checkpoint_filename):
         block_size=meta['block_size'],
         bias=config['bias'],
         vocab_size=None,
-        dropout=config['dropout']
+        dropout=config['dropout'],
+        embd_dropout=config['embd_dropout']
     )
     checkpoint = None
     iter_num = 0
@@ -451,8 +458,9 @@ def initalize_model(device, meta, config, checkpoint_filename):
         ckpt_path = os.path.join(config['out_dir'], checkpoint_filename)
         checkpoint = torch.load(ckpt_path, map_location=device)
         checkpoint_model_args = checkpoint['model_args']
-        for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-            model_args[k] = checkpoint_model_args[k]
+        for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size', 'dropout', 'embd_dropout']:
+            if k in checkpoint_model_args:
+                model_args[k] = checkpoint_model_args[k]
         gptconf = GPTConfig(**model_args)
         model = GPT(gptconf)
         state_dict = checkpoint['model']
