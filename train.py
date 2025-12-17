@@ -79,9 +79,17 @@ def get_default_config():
         
         # Training parameters
         'gradient_accumulation_steps': 1,
+        # If set, this caps the memory-based auto batch size.
+        # This is the per-step microbatch size; effective batch size is
+        #   batch_size * gradient_accumulation_steps.
+        # Keep this <= the auto-computed value to avoid OOM.
+        'batch_size': None,
         'edge_iterations_per_epoch': 10,  # Number of iterations on edges per epoch
         'path_iterations_per_epoch': 10,  # Number of iterations on paths per epoch
         'epochs': 1000,
+        # Evaluation batch sizes (kept separate from training batch_size)
+        'eval_batch_size': 512,
+        'edge_eval_batch_size': 512,
         
         # Model architecture
         'n_layer': 3,
@@ -932,11 +940,22 @@ def evaluate(estimate_metrics, config, meta, iter_num, lr, ctx, device, model, v
     # Use fewer samples during sweeps for faster evaluation
     is_sweep_mode = wandb.run is not None and hasattr(wandb.run, 'sweep_id') and wandb.run.sweep_id is not None
     autoregressive_eval_samples = 20 if is_sweep_mode else 100
-    val_avg_accuracy = evaluate_samples(device, ctx, model,  meta, val_data_np, VAL_DATASET_SIZE, 'val', num_samples=min(VAL_DATASET_SIZE, autoregressive_eval_samples))
-    train_avg_accuracy = evaluate_samples(device, ctx, model, meta, paths_data_np, PATHS_DATASET_SIZE, 'train', num_samples=min(PATHS_DATASET_SIZE, autoregressive_eval_samples))
+    val_avg_accuracy = evaluate_samples(
+        device, ctx, model, meta, val_data_np, VAL_DATASET_SIZE, 'val',
+        num_samples=min(VAL_DATASET_SIZE, autoregressive_eval_samples),
+        eval_batch_size=int(config.get('eval_batch_size', 512)),
+    )
+    train_avg_accuracy = evaluate_samples(
+        device, ctx, model, meta, paths_data_np, PATHS_DATASET_SIZE, 'train',
+        num_samples=min(PATHS_DATASET_SIZE, autoregressive_eval_samples),
+        eval_batch_size=int(config.get('eval_batch_size', 512)),
+    )
     
     # Evaluate edge memorization
-    edge_memorization_pct = evaluate_edge_memorization(ctx, model, meta, edges_data_np, device, batch_size=512)
+    edge_memorization_pct = evaluate_edge_memorization(
+        ctx, model, meta, edges_data_np, device,
+        batch_size=int(config.get('edge_eval_batch_size', 512)),
+    )
     
     # Update Live display if new samples were generated
     if 'generated_text' in losses and losses['generated_text'] and eval_layout_component:
@@ -1351,6 +1370,31 @@ def train(config=None):
         reserved_memory=dataset_reserved_memory,
         target_batch_size=target_bs_ref
     )
+
+    # Optional user cap on training microbatch size (safer than overriding upward).
+    # If you want a smaller batch to fit memory or to change optimization dynamics,
+    # set `batch_size` in configurator.py or a wandb sweep config.
+    user_batch_size = default_config.get('batch_size', None)
+    if user_batch_size is not None:
+        try:
+            user_batch_size = int(user_batch_size)
+        except (TypeError, ValueError):
+            print(f"WARNING: Ignoring invalid batch_size={user_batch_size!r}; expected an int.")
+        else:
+            if user_batch_size <= 0:
+                print(f"WARNING: Ignoring invalid batch_size={user_batch_size}; must be > 0.")
+            else:
+                if user_batch_size > train_batch_size:
+                    print(
+                        f"NOTE: batch_size cap {user_batch_size} > auto batch_size {train_batch_size}; "
+                        f"keeping auto batch_size to avoid OOM."
+                    )
+                else:
+                    train_batch_size = user_batch_size
+                print(
+                    f"Training microbatch size: {train_batch_size} "
+                    f"(effective: {train_batch_size * default_config['gradient_accumulation_steps']})"
+                )
     
     # Calculate training iteration parameters
     VAL_DATASET_SIZE = meta['VAL_DATASET_SIZE']
