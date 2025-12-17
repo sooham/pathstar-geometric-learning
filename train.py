@@ -111,7 +111,8 @@ def get_default_config():
         'gpu_id': None,
         'experiment_name': None,
         # seed
-        'seed': 1337
+        'seed': 1337,
+        'predict_direction_for_edge_task': True
     }
 
 # TODO: check this 
@@ -324,11 +325,22 @@ def evaluate_edge_memorization(ctx, model, meta, edges_data_np, device, batch_si
         # Get batch of edge sequences
         batch = torch.from_numpy(edges_data_np[start_idx:end_idx].astype(np.int64)).to(device)
         
-        # Split into input (X) and target (Y)
-        # For edges, we want to predict the token after the (1 if use_task_tokens else 0) + (1 if use_direction_tokens else 0 ))
-        pos = (1 if meta['use_task_tokens'] else 0) + (1 if meta['use_directional_tokens'] else 0) + 1
-        X = batch[:, :pos]  # All tokens except the last
-        Y_true = batch[:, pos]  # The final token (target edge)
+        # Split into input (X) and target (Y_true).
+        # Two EDGE task layouts exist:
+        # - predict_direction_for_edge_task=False (predict v):
+        #     [EDGE] [GT/LT] u v ...
+        #     => input length = (task) + (dir) + 1, target index = that length
+        # - predict_direction_for_edge_task=True (predict direction):
+        #     [EDGE] u v [GT/LT] ...
+        #     => input length = (task) + 2, target index = that length
+        predict_dir = bool(meta.get('predict_direction_for_edge_task', False))
+        if predict_dir:
+            pos = (1 if meta.get('use_task_tokens', False) else 0) + 2
+        else:
+            pos = (1 if meta.get('use_task_tokens', False) else 0) + (1 if meta.get('use_directional_tokens', False) else 0) + 1
+
+        X = batch[:, :pos]
+        Y_true = batch[:, pos]
         
         # # Debug: Print first batch details
         # if batch_idx == 0:
@@ -600,6 +612,7 @@ def set_wandb_name(config):
             dir_label = "undir_" if config["use_undirected"] else "dir_"
             tt_label = "tt_" if config['use_task_tokens'] else 'nott_'
             dt_label = 'dt_' if config['use_directional_tokens'] else 'nodt_'
+            ped_or_pet_label = 'ped_' if config['predict_direction_for_edge_task'] else 'pet_'
             # Include both dropout values if they differ, otherwise just one
             if config['dropout'] == config['embd_dropout']:
                 dropout_label = f"D{config['dropout']}_"
@@ -609,6 +622,7 @@ def set_wandb_name(config):
                 f"{utc_time}_"
                 f"G{config['graph_d']},"
                 f"{config['graph_l']}_"
+                f"{ped_or_pet_label}"
                 f"L{config['n_layer']}_"
                 f"E{config['n_embd']}_"
                 f"H{config['n_head']}_"
@@ -1193,6 +1207,7 @@ def train(config=None):
         use_undirected=default_config['use_undirected'],
         use_directional_tokens=default_config['use_directional_tokens'],
         use_task_tokens=default_config['use_task_tokens'],
+        predict_direction_for_edge_task=default_config['predict_direction_for_edge_task']
     )
     
     meta, paths_data, edges_data, val_data = gen.load_dataset()
@@ -1394,7 +1409,6 @@ def train(config=None):
 
     # Whether sequences include explicit task prefix tokens (PATH/EDGE).
     # This is required to reliably apply task-aware masking in the combined (interleaved) dataset.
-    use_task_tokens = meta.get('use_task_tokens', True)
     
     if pause_token_id is not None or pad_token_id is not None:
         print(f"Loaded special tokens: PAUSE={pause_token_id}, PAD={pad_token_id}")
@@ -1621,12 +1635,24 @@ def train(config=None):
         LT = special.get('LT')
 
         def mask_edges(y_in):
-            # v is at Y index: (1 if directional token present else 0)
-            d = 1 if use_directional_tokens else 0
-            v_idx = d + 1
+            # Edge task: keep loss on exactly one supervised token.
+            # - predict_direction_for_edge_task=False: predict v (final endpoint)
+            #   x: [EDGE] [GT/LT] u v ...
+            #   y:     [GT/LT] u v ...
+            #   keep y index (dir? + 1)
+            # - predict_direction_for_edge_task=True: predict direction
+            #   x: [EDGE] u v [GT/LT] ...
+            #   y:     u v [GT/LT] ...
+            #   keep y index 2
+            predict_dir = bool(meta.get('predict_direction_for_edge_task', False))
+            if predict_dir:
+                target_idx = 2
+            else:
+                d = 1 if use_directional_tokens else 0
+                target_idx = d + 1
             y_out = torch.full_like(y_in, -1)
-            if 0 <= v_idx < y_in.size(1):
-                y_out[:, v_idx] = y_in[:, v_idx]
+            if 0 <= target_idx < y_in.size(1):
+                y_out[:, target_idx] = y_in[:, target_idx]
             return y_out
 
         def mask_paths(x_in, y_in):
@@ -1653,6 +1679,10 @@ def train(config=None):
                 # Without task tokens, we can only disambiguate if directional tokens are present.
                 if not use_directional_tokens:
                     raise ValueError("Cannot interleave edges/paths without task tokens or directional tokens (ambiguous sequences).")
+                # Note: if predict_direction_for_edge_task=True, EDGE sequences begin with 'u' not GT/LT,
+                # so disambiguation is impossible without task tokens.
+                if bool(meta.get('predict_direction_for_edge_task', False)):
+                    raise ValueError("Cannot interleave edges/paths without task tokens when predict_direction_for_edge_task=True (ambiguous sequences).")
                 is_edge = (x[:, 0] == GT) | (x[:, 0] == LT)
                 is_path = ~is_edge
 

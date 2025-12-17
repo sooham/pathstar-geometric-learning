@@ -25,17 +25,19 @@ parameters:
   use_task_tokens:
     values: [true]
   weight_tying:
-    value: true
+    values: [true, false]
   interleave_dataset:
     value: true
+  predict_direction_for_edge_task:
+    values: [true, false]
   
   # Model architecture parameters - sweep these
   n_layer:
-    values: [1]
+    values: [1,3]
   n_head:
     values: [8]
   n_embd:
-    values: [64,128]
+    values: [32,64]
   dropout:
     values: [0]
   dropout_embd:
@@ -71,7 +73,7 @@ parameters:
   
   # Fixed training parameters
   epochs:
-    value: 100_000  # Shorter for quick testing
+    value: 10_000  # Shorter for quick testing
   edge_iterations_per_epoch: # 800 edges total
     value: 10
   path_iterations_per_epoch: # 800 paths total
@@ -81,16 +83,16 @@ parameters:
   compile:
     value: true
   eval_interval:
-    value: 500  # Increased from 50 to reduce evaluation overhead
+    value: 100  # Increased from 50 to reduce evaluation overhead
   log_interval:
-    value: 150  # Increased from 10 to reduce print overhead
+    value: 100  # Increased from 10 to reduce print overhead
   print_eval_interval:
-    value: 500
+    value: 200
   vis_interval:
     value: 150
   debug_masking:
     value: false
   
   wandb_project:
-    value: mats_pathstar_minimal_combined_sweep
+    value: mats_pathstar_minimal_predict_edge_direction
 
