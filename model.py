@@ -49,9 +49,14 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x):
+    def forward(self, x, output_attentions=False):
         """
         Input x: (batch_size, sequence_length, n_embd)
+        Args:
+            output_attentions: if True, also return attention weights (disables flash attention)
+        Returns:
+            y: output tensor
+            attn_weights: attention weights (B, nh, T, T) if output_attentions=True, else None
         """
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -61,22 +66,34 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
+        attn_weights = None
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        if self.flash:
+        if self.flash and not output_attentions:
             # efficient attention using Flash Attention CUDA kernels
             # TODO: look into custom attention masks via attn_mask
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         else:
-            # manual implementation of attention
+            # manual implementation of attention (required when output_attentions=True)
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            # Create causal mask on the fly if we don't have bias buffer
+            if hasattr(self, 'bias'):
+                att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            else:
+                # Create causal mask for flash attention path
+                causal_mask = torch.triu(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1)
+                att = att.masked_fill(causal_mask, float('-inf'))
             att = F.softmax(att, dim=-1)
+            if output_attentions:
+                attn_weights = att.detach()  # Save before dropout
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side (B, T, nh*hs=C)
 
         # output projection
         y = self.resid_dropout(self.c_proj(y)) # (B, T, nh*hs=C) the output 
+        
+        if output_attentions:
+            return y, attn_weights
         return y
 
 class MLP(nn.Module):
@@ -104,10 +121,16 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
-        return x
+    def forward(self, x, output_attentions=False):
+        if output_attentions:
+            attn_out, attn_weights = self.attn(self.ln_1(x), output_attentions=True)
+            x = x + attn_out
+            x = x + self.mlp(self.ln_2(x))
+            return x, attn_weights
+        else:
+            x = x + self.attn(self.ln_1(x))
+            x = x + self.mlp(self.ln_2(x))
+            return x
 
 @dataclass
 class GPTConfig:
@@ -227,6 +250,34 @@ class GPT(nn.Module):
             loss = None
 
         return logits, loss
+
+    def get_attention_maps(self, idx):
+        """
+        Extract attention maps from all layers for visualization.
+        
+        Args:
+            idx: input token indices of shape (batch_size, sequence_length)
+            
+        Returns:
+            attention_maps: list of attention weights, one per layer
+                           Each has shape (batch_size, n_head, seq_len, seq_len)
+        """
+        device = idx.device
+        b, t = idx.size()
+        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+        pos = torch.arange(0, t, dtype=torch.long, device=device)
+
+        # forward through embeddings
+        tok_emb = self.transformer.wte(idx)
+        pos_emb = self.pos_emb[pos]
+        x = tok_emb + pos_emb  # No dropout during attention extraction
+        
+        attention_maps = []
+        for block in self.transformer.h:
+            x, attn_weights = block(x, output_attentions=True)
+            attention_maps.append(attn_weights)
+        
+        return attention_maps
 
     def crop_block_size(self, block_size):
         # TODO: not really an use for this right now, maybe deal with this later

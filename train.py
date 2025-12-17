@@ -63,7 +63,7 @@ def get_default_config():
         'wandb_run_name': None,  # Will be auto-generated
         
         # Visualization
-        'live_display': False,  # If True, show Rich Live display with training slices, metrics, etc.
+        'live_display': True,  # If True, show Rich Live display with training slices, metrics, etc.
         'vis_interval': 100, # Interval to update training slice visualization
         'log_attention_maps': False,  # If True, log attention map heatmaps to wandb
         'attention_map_interval': 500,  # How often to log attention maps (iterations)
