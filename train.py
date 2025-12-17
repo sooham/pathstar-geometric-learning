@@ -328,7 +328,8 @@ def evaluate_edge_memorization(ctx, model, meta, edges_data_np, device, batch_si
         # Split into input (X) and target (Y_true).
         # Two EDGE task layouts exist:
         # - predict_direction_for_edge_task=False (predict v):
-        #     [EDGE] [GT/LT] u v ...
+        #     [EDGE] u [GT/LT] v ...
+        #     (or without task token: u [GT/LT] v)
         #     => input length = (task) + (dir) + 1, target index = that length
         # - predict_direction_for_edge_task=True (predict direction):
         #     [EDGE] u v [GT/LT] ...
@@ -1615,10 +1616,15 @@ def train(config=None):
         Apply task-specific masking to targets (Y) using -1 as ignore_index.
 
         Correct masking behavior:
-        - Edge task: only compute loss on the final endpoint token v.
-          Sequence: [<EDGE>, <GT/LT (optional)>, u, v, <PAD>...]
-          Targets Y: [<GT/LT (optional)>, u, v, <PAD>...]
-          Mask: ignore everything except the v position.
+        - Edge task: only compute loss on the final supervised token.
+          If predict_direction_for_edge_task=False (predict endpoint v):
+            Sequence: [<EDGE>, u, <GT/LT (optional)>, v, <PAD>...]
+            Targets Y: [u, <GT/LT (optional)>, v, <PAD>...]
+            Mask: ignore everything except the v position.
+          If predict_direction_for_edge_task=True (predict direction):
+            Sequence: [<EDGE>, u, v, <GT/LT>, <PAD>...]
+            Targets Y: [u, v, <GT/LT>, <PAD>...]
+            Mask: ignore everything except the direction position.
         - Path task: ignore targets predicting <PAUSE> (handled elsewhere) and also ignore the
           first leaf target when <PATH> task prefix token is used.
           Sequence: [<PATH>, leaf, <PAUSE>x n, root, n2, ..., nℓ]
@@ -1639,9 +1645,9 @@ def train(config=None):
         def mask_edges(y_in):
             # Edge task: keep loss on exactly one supervised token.
             # - predict_direction_for_edge_task=False: predict v (final endpoint)
-            #   x: [EDGE] [GT/LT] u v ...
-            #   y:     [GT/LT] u v ...
-            #   keep y index (dir? + 1)
+            #   x: [EDGE] u [GT/LT] v ...
+            #   y:     u [GT/LT] v ...
+            #   keep y index (dir? + 1)  == 2 when directional tokens are used
             # - predict_direction_for_edge_task=True: predict direction
             #   x: [EDGE] u v [GT/LT] ...
             #   y:     u v [GT/LT] ...
@@ -1681,11 +1687,17 @@ def train(config=None):
                 # Without task tokens, we can only disambiguate if directional tokens are present.
                 if not use_directional_tokens:
                     raise ValueError("Cannot interleave edges/paths without task tokens or directional tokens (ambiguous sequences).")
-                # Note: if predict_direction_for_edge_task=True, EDGE sequences begin with 'u' not GT/LT,
-                # so disambiguation is impossible without task tokens.
+                # Note: if predict_direction_for_edge_task=True, EDGE sequences do not contain GT/LT in X
+                # (direction is the supervised token), so disambiguation is impossible without task tokens.
                 if bool(meta.get('predict_direction_for_edge_task', False)):
                     raise ValueError("Cannot interleave edges/paths without task tokens when predict_direction_for_edge_task=True (ambiguous sequences).")
+                # For predict_direction_for_edge_task=False, EDGE examples include GT/LT inside X.
+                # Support both historical layouts:
+                #   - [GT/LT, u, v, ...]  (direction first)
+                #   - [u, GT/LT, v, ...]  (u first)
                 is_edge = (x[:, 0] == GT) | (x[:, 0] == LT)
+                if x.size(1) >= 2:
+                    is_edge = is_edge | (x[:, 1] == GT) | (x[:, 1] == LT)
                 is_path = ~is_edge
 
             y_out = y.clone()

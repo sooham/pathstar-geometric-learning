@@ -51,11 +51,26 @@ import math
 # okay so this is actually consistent
 # but chainable [PATH] x_leaf [PAUSE] x_root GT x_root+1 GT x_root+2 ... GT x_leaf-1 GT x_leaf
 
-# idea 2.
+# idea 2. (TRYING THIS - NOT WORKING WELL)
 # we do [EDGE] x_leaf x_leaf-1 LT
 # or    [EDGE] x_leaf-1 x_leaf GT
 # here we are predicting the direction which is an easier problem
 # no dependency betwene x_leaf-1 and x_leaf, but prediction needs to be determinable by embeddings
+
+# idea 3. In larger batchsizes, all the paths need to have their edges related data too 
+# otherwise the gradient updates are not stable for embeddings
+
+# idea 4. consoldiate the LT and GT  (not great)
+# into one token
+# we do [EDGE] x_leaf LT x_leaf-1 
+# and   [EDGE] x_leaf-1 GT x_leaf  (remove this)
+
+# idea 5. GT and LT are tokens that are not related semantically
+# do [EDGE] x_leaf LT x_leaf-1 LT x_leaf-2 
+# do [EDGE] x_leaf LT x_leaf-1 GT x_leaf
+
+
+
 
 class InWeightsPathStar:
     def __init__(self, d=5, l=5, randomize_vocab_size=None, holdout_percentage=0.0):
@@ -259,7 +274,9 @@ class InWeightsPathStar:
             undirected: If True, also include reverse edges (y -> x) in the sampling pool
             use_directional_tokens: If true uses GT and LT tokens to show direction
             use_task_tokens: If true uses EDGE token to show the task
-            predict_direction_for_edge_task: If True the format is [EDGE] u v direction , otherwise it is [EDGE] direction u v
+            predict_direction_for_edge_task:
+                - If True (predict direction), the format is [EDGE] u v direction
+                - If False (predict endpoint), the format is [EDGE] u direction v
         Returns:
             edges: shape (size, 2+A+B) where A == 1 if use_directional_tokens is true and B == 1 if use_task_tokens is true, otherwise 0 
         """
@@ -271,7 +288,7 @@ class InWeightsPathStar:
                 if predict_direction_for_edge_task:
                     edges.append([u, v, self.SPECIAL_TOKENS['GT']]) # GT means  away from root
                 else:
-                    edges.append([self.SPECIAL_TOKENS['GT'], u, v]) # GT means  away from root
+                    edges.append([u, self.SPECIAL_TOKENS['GT'], v]) # GT means  away from root
             else:
                 edges.append([u, v])
 
@@ -280,7 +297,7 @@ class InWeightsPathStar:
                     if predict_direction_for_edge_task:
                         edges.append([v, u, self.SPECIAL_TOKENS['LT']]) # LT means toward root
                     else:
-                        edges.append([self.SPECIAL_TOKENS['LT'], v, u]) # LT means  toward root
+                        edges.append([v, self.SPECIAL_TOKENS['LT'], u]) # LT means  toward root
                 else:
                     edges.append([v, u])
 
@@ -304,7 +321,9 @@ class InWeightsPathStar:
         
         # Return as torch tensor
         edges =  torch.tensor(sampled_edges, dtype=torch.long)
-        # Convert edge pairs to sequences: [<EDGE>,<optional direction token>, x, y] or [<optional direction token>, x, y]
+        # Convert edge pairs to sequences:
+        # - predict_direction_for_edge_task=False: [<EDGE>, u, <optional GT/LT>, v] or [u, <optional GT/LT>, v]
+        # - predict_direction_for_edge_task=True:  [<EDGE>, u, v, <GT/LT>] or [u, v, <GT/LT>]
         if use_task_tokens:
             edge_task_tokens = torch.full((size, 1), self.SPECIAL_TOKENS['EDGE'], dtype=torch.long)
             edge_sequences = torch.cat([edge_task_tokens, edges], dim=1)
@@ -571,7 +590,7 @@ class InWeightsPathStar:
         # Calculate context lengths
         # edge_context_length: number of tokens provided to predict the supervised target on EDGE task.
         # - predict_direction_for_edge_task=True:  [EDGE] u v -> predict direction, so context is (task) + 2
-        # - predict_direction_for_edge_task=False: [EDGE] dir u -> predict v, so context is (task) + (dir) + 1
+        # - predict_direction_for_edge_task=False: [EDGE] u (dir) -> predict v, so context is (task) + (dir) + 1
         if predict_direction_for_edge_task:
             edge_context_length = (1 if use_task_tokens else 0) + 2
         else:
@@ -605,6 +624,10 @@ class InWeightsPathStar:
             'use_undirected': use_undirected,
             'use_directional_tokens': use_directional_tokens,
             'use_task_tokens': use_task_tokens,
+            # Layout note (important for consumers like train.py tests / disambiguation):
+            # - predict_direction_for_edge_task=False: [EDGE] u (GT/LT) v
+            # - predict_direction_for_edge_task=True:  [EDGE] u v (GT/LT)
+            'edge_task_layout': 'u_dir_v' if (use_directional_tokens and not predict_direction_for_edge_task) else ('u_v_dir' if (use_directional_tokens and predict_direction_for_edge_task) else 'u_v'),
             'edge_context_length': edge_context_length,
             'path_context_length': path_context_length,
             'block_size': path_seq_len - 1,  # Use actual sequence length (path_context_length + l), not just context length TODO: if you want EOS or to use full context, you need to remove the -1.
@@ -661,7 +684,10 @@ class InWeightsPathStar:
         task_token_suffix = "_tt" if use_task_tokens else "_nott"
         predict_edge_or_direction = "_ped" if predict_direction_for_edge_task else "_pet"
         randomize = (f"_v{self.randomize_vocab_size}" if self.randomize_vocab_size else "")
-        self.dir_name = f'inweights_pathstar{randomize}{predict_edge_or_direction}_d{self.d}_l{self.l}_p{num_pause_tokens}_{"un" if use_undirected else ""}directed_{"dt" if use_directional_tokens else ""}{task_token_suffix}'
+        # IMPORTANT: bump dataset name when sequence layout changes to avoid silently loading stale .bin files.
+        # edge_layout_v2 corresponds to EDGE endpoint prediction layout: [EDGE] u (GT/LT) v
+        edge_layout_suffix = "_elv2"
+        self.dir_name = f'inweights_pathstar{randomize}{predict_edge_or_direction}{edge_layout_suffix}_d{self.d}_l{self.l}_p{num_pause_tokens}_{"un" if use_undirected else ""}directed_{"dt" if use_directional_tokens else ""}{task_token_suffix}'
         return self.dir_name
 
     def _check_dataset_exists(self):
@@ -701,6 +727,8 @@ class InWeightsPathStar:
             meta.get('use_directional_tokens') == self.use_directional_tokens and
             meta.get('use_task_tokens', True) == self.use_task_tokens and  # Default to True for backward compatibility
             meta.get('predict_direction_for_edge_task', True) == self.predict_direction_for_edge_task and  # Default True for backward compatibility
+            # If missing, assume legacy layout; regenerated datasets will include edge_task_layout.
+            meta.get('edge_task_layout', None) in (None, 'u_dir_v', 'u_v_dir', 'u_v') and
             abs(meta.get('holdout_percentage', 0.0) - self.holdout_percentage) < 1e-6  # Float comparison
         )
         

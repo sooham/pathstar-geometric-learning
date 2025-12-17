@@ -154,7 +154,8 @@ class TestInWeightsPathStar(unittest.TestCase):
         )
         self.assertEqual(edges_case_2.shape, (20, 3))
         expected_set_2 = {
-            (self.TOK_GT, u, v) for (u, v) in expected_set_1
+            # Edge format (no task token, predict endpoint): [u, GT/LT, v]
+            (u, self.TOK_GT, v) for (u, v) in expected_set_1
         }
         self.assertEqual(set(map(tuple, edges_case_2.tolist())), expected_set_2)
 
@@ -173,11 +174,12 @@ class TestInWeightsPathStar(unittest.TestCase):
         edges_case_4 = self.gen._generate_edge_memorization_training_set(
             size=40, undirected=True, use_directional_tokens=True, use_task_tokens=True
         )
-        self.assertEqual(edges_case_4.shape, (40, 4))  # EDGE + direction + u + v
+        self.assertEqual(edges_case_4.shape, (40, 4))  # EDGE + u + direction + v
         expected_set_4 = set()
         for (u, v) in expected_set_1:
-            expected_set_4.add((self.TOK_EDGE, self.TOK_GT, u, v))
-            expected_set_4.add((self.TOK_EDGE, self.TOK_LT, v, u))
+            # Edge format (task token, predict endpoint): [EDGE, u, GT/LT, v]
+            expected_set_4.add((self.TOK_EDGE, u, self.TOK_GT, v))
+            expected_set_4.add((self.TOK_EDGE, v, self.TOK_LT, u))
         self.assertEqual(set(map(tuple, edges_case_4.tolist())), expected_set_4)
 
     @patch('random.sample', side_effect=lambda pop, k: sorted(pop)[:k])  # Deterministic sample
