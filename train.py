@@ -30,7 +30,7 @@ from model import GPTConfig, GPT
 from pathstar import InWeightsPathStar
 
 # Rich imports
-from rich.console import Console
+from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
 from rich.text import Text
@@ -271,7 +271,7 @@ def format_training_slice(sequences, itos, meta, num_samples=10):
         
     return "\n".join(lines)
 
-def create_metrics_table(metrics, graph_length, iter_num, epoch, lr, tokens_per_sec=None, batch_size=None, edge_memorization_pct=None, train_dataset_size=None, eval_dataset_size=None):
+def create_metrics_table(metrics, graph_length, iter_num, epoch, lr, tokens_per_sec=None, batch_size=None, edge_memorization_pct=None, train_dataset_size=None, eval_dataset_size=None, embedding_geometry=None):
     """Create a Rich Table for per-token metrics (Train vs Val)"""
     title = f"Per-Token Metrics (Iter {iter_num}, Epoch {epoch:.2f}, LR {lr:.2e}"
     if batch_size is not None:
@@ -315,7 +315,64 @@ def create_metrics_table(metrics, graph_length, iter_num, epoch, lr, tokens_per_
             f"{t_acc*100:.1f}%", f"{v_acc*100:.1f}%"
         )
         last_display = i
-            
+    
+    return table
+
+
+def create_embedding_geometry_table(embedding_geometry, l):
+    """Create a Rich Table for embedding geometry cosine similarities"""
+    if embedding_geometry is None:
+        return None
+    
+    train_sims = embedding_geometry.get('train_similarities', {})
+    val_sims = embedding_geometry.get('val_similarities', {})
+    random_baseline = embedding_geometry.get('random_baseline', 0)
+    
+    table = Table(title=f"Embedding Cosine Similarity by Distance (baseline: {random_baseline:.4f})", 
+                  show_header=True, header_style="bold cyan")
+    table.add_column("Dist", style="cyan", justify="center", width=5)
+    table.add_column("Train", justify="center", width=10)
+    table.add_column("Val", justify="center", width=10)
+    table.add_column("Status", justify="left", width=12)
+    
+    # Get all distances, show up to l (path length)
+    all_distances = sorted(set(train_sims.keys()) | set(val_sims.keys()))
+    display_distances = [d for d in all_distances if d <= l]
+    
+    for dist in display_distances:
+        t_sims = train_sims.get(dist, [])
+        v_sims = val_sims.get(dist, [])
+        
+        t_mean = np.mean(t_sims) if t_sims else float('nan')
+        v_mean = np.mean(v_sims) if v_sims else float('nan')
+        
+        # Format with color coding
+        def format_sim(val, baseline):
+            if np.isnan(val):
+                return "-"
+            if val > baseline + 0.1:
+                return f"[green]{val:.4f}[/green]"
+            elif val < baseline - 0.1:
+                return f"[red]{val:.4f}[/red]"
+            else:
+                return f"[yellow]{val:.4f}[/yellow]"
+        
+        t_str = format_sim(t_mean, random_baseline)
+        v_str = format_sim(v_mean, random_baseline)
+        
+        # Status indicator
+        if dist == 0:
+            status = "✓ self" if abs(t_mean - 1.0) < 0.01 else "✗ self!"
+        elif dist == 1:
+            if t_mean > random_baseline + 0.1:
+                status = "✓ adjacent"
+            else:
+                status = "[red]✗ no struct[/red]"
+        else:
+            status = ""
+        
+        table.add_row(str(dist), t_str, v_str, status)
+    
     return table
 
 def evaluate_edge_memorization(ctx, model, meta, edges_data_np, device, batch_size=512):
@@ -1241,8 +1298,19 @@ def evaluate(estimate_metrics, config, meta, iter_num, lr, ctx, device, model, v
             edge_memorization_pct,
             train_dataset_size=train_dataset_size,
             eval_dataset_size=eval_dataset_size,
+            embedding_geometry=embedding_geometry_results,
         )
-        metrics_layout_component.update(Panel(Align.center(metrics_table), title="Validation Metrics", border_style="magenta"))
+        
+        # Create embedding geometry table if available
+        emb_table = create_embedding_geometry_table(embedding_geometry_results, meta['l']) if embedding_geometry_results else None
+        
+        # Combine tables using Group
+        if emb_table:
+            combined = Group(metrics_table, Text(""), emb_table)
+        else:
+            combined = metrics_table
+        
+        metrics_layout_component.update(Panel(Align.center(combined), title="Validation Metrics", border_style="magenta"))
 
     # # PRINTING
     # console.print(f"step {iter_num}: epoch {current_epoch:.2f}, val loss {losses['val']:.4f}, train loss {losses['train']:.4f}")
