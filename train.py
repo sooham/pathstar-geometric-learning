@@ -277,7 +277,20 @@ def create_metrics_table(metrics, graph_length, iter_num, epoch, lr, tokens_per_
     table.add_column("Train Acc", style="green", justify="right")
     table.add_column("Val Acc", style="green", justify="right")
     
-    for i in range(1, graph_length + 1):
+    # The live metrics panel has a fixed height in the UI; for long sequences the table will be
+    # visually truncated. To make it obvious we still compute all tokens, we display:
+    # - positions 1..9
+    # - an ellipsis row (if needed)
+    # - the final position (graph_length)
+    if graph_length <= 10:
+        display_positions = list(range(1, graph_length + 1))
+    else:
+        display_positions = list(range(1, 10)) + [graph_length]
+
+    last_display = None
+    for i in display_positions:
+        if last_display is not None and i - last_display > 1:
+            table.add_row("…", "…", "…", "…", "…")
         t_loss = metrics.get('train_per_token', {}).get(i, float('nan'))
         v_loss = metrics.get('val_per_token', {}).get(i, float('nan'))
         t_acc = metrics.get('train_per_token_accuracy', {}).get(i, float('nan'))
@@ -288,6 +301,7 @@ def create_metrics_table(metrics, graph_length, iter_num, epoch, lr, tokens_per_
             f"{t_loss:.4f}", f"{v_loss:.4f}",
             f"{t_acc*100:.1f}%", f"{v_acc*100:.1f}%"
         )
+        last_display = i
             
     return table
 
@@ -949,14 +963,26 @@ def evaluate(estimate_metrics, config, meta, iter_num, lr, ctx, device, model, v
     
     if 'val_per_token' in losses:
         # console.print("  Val per-token losses:")
-        per_token_str = ", ".join([f"tok{i}: {losses['val_per_token'].get(i, float('nan')):.4f}" 
-                                for i in range(1, min(graph_length + 1, 10))])
+        if graph_length <= 9:
+            per_token_str = ", ".join([f"tok{i}: {losses['val_per_token'].get(i, float('nan')):.4f}"
+                                       for i in range(1, graph_length + 1)])
+        else:
+            head = ", ".join([f"tok{i}: {losses['val_per_token'].get(i, float('nan')):.4f}"
+                              for i in range(1, 10)])
+            tail = f"tok{graph_length}: {losses['val_per_token'].get(graph_length, float('nan')):.4f}"
+            per_token_str = f"{head}, …, {tail}"
         # console.print(f"    {per_token_str}")
     
     if 'val_per_token_accuracy' in losses:
         # console.print("  Val per-token accuracies (autoregressive):")
-        per_token_acc_str = ", ".join([f"tok{i}: {losses['val_per_token_accuracy'].get(i, float('nan'))*100:.1f}%" 
-                                    for i in range(1, min(graph_length + 1, 10))])
+        if graph_length <= 9:
+            per_token_acc_str = ", ".join([f"tok{i}: {losses['val_per_token_accuracy'].get(i, float('nan'))*100:.1f}%"
+                                           for i in range(1, graph_length + 1)])
+        else:
+            head = ", ".join([f"tok{i}: {losses['val_per_token_accuracy'].get(i, float('nan'))*100:.1f}%"
+                              for i in range(1, 10)])
+            tail = f"tok{graph_length}: {losses['val_per_token_accuracy'].get(graph_length, float('nan'))*100:.1f}%"
+            per_token_acc_str = f"{head}, …, {tail}"
         # console.print(f"    {per_token_acc_str}")
     
     
