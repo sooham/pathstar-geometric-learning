@@ -63,6 +63,7 @@ def get_default_config():
         'wandb_run_name': None,  # Will be auto-generated
         
         # Visualization
+        'live_display': False,  # If True, show Rich Live display with training slices, metrics, etc.
         'vis_interval': 100, # Interval to update training slice visualization
         # Debugging
         'debug_masking': False,          # If True, show target masks applied to Y
@@ -1410,7 +1411,7 @@ def evaluate(estimate_metrics, config, meta, iter_num, lr, ctx, device, model, v
         total_norm = total_norm ** 0.5
         log_dict['model/weight_norm'] = total_norm
         
-        wandb.log(log_dict)
+        wandb.log(log_dict, step=iter_num)
     
     # During sweeps, only save best checkpoint to reduce I/O overhead
     # In standalone mode, save based on always_save_checkpoint config
@@ -1645,11 +1646,17 @@ def train(config=None):
     )
     
     meta, paths_data, edges_data, val_data = gen.load_dataset()
-    print("Precomputing token colors...")
-    token_colors, RESET = compute_token_colors(paths_data, val_data, meta)
     
-    meta['token_colors'] = token_colors
-    meta['RESET_COLOR'] = RESET
+    # Only compute token colors if live display is enabled (saves compute)
+    if default_config['live_display']:
+        print("Precomputing token colors...")
+        token_colors, RESET = compute_token_colors(paths_data, val_data, meta)
+        meta['token_colors'] = token_colors
+        meta['RESET_COLOR'] = RESET
+    else:
+        meta['token_colors'] = {}
+        meta['RESET_COLOR'] = ''
+    
     meta['randomize_vocab_size'] = gen.randomize_vocab_size
     # Extract graph parameters from metadata
     # graph_length is used for PATH task token-level metrics, so account for GT-interleaving.
@@ -2388,28 +2395,35 @@ def train(config=None):
         else:
             X, Y = get_batch('paths')
     
-    # Live display for evaluation examples
-    layout = Layout()
-    if default_config.get('debug_masking'):
-        layout.split_column(
-            Layout(name="metrics", size=14), # Fixed size for metrics table
-            Layout(name="evaluation"),
-            Layout(name="training"),
-            Layout(name="mask", size=10),
-        )
+    # Live display for evaluation examples (optional - controlled by live_display config)
+    use_live_display = default_config.get('live_display', True)
+    
+    if use_live_display:
+        layout = Layout()
+        if default_config.get('debug_masking'):
+            layout.split_column(
+                Layout(name="metrics", size=14), # Fixed size for metrics table
+                Layout(name="evaluation"),
+                Layout(name="training"),
+                Layout(name="mask", size=10),
+            )
+        else:
+            layout.split_column(
+                Layout(name="metrics", size=14), # Fixed size for metrics table
+                Layout(name="evaluation"),
+                Layout(name="training"),
+            )
+        layout["metrics"].update(Panel("Waiting for first evaluation...", title="Validation Metrics", border_style="magenta"))
+        layout["evaluation"].update(Panel("Waiting for first evaluation...", title="Evaluation Examples", border_style="blue"))
+        layout["training"].update(Panel("Waiting for first training batch...", title="Training Slice (10 samples)", border_style="green"))
+        if default_config.get('debug_masking'):
+            layout["mask"].update(Panel("Waiting for first mask debug...", title="Mask Debug", border_style="yellow"))
+        live_context = Live(layout, console=console, refresh_per_second=4)
     else:
-        layout.split_column(
-            Layout(name="metrics", size=14), # Fixed size for metrics table
-            Layout(name="evaluation"),
-            Layout(name="training"),
-        )
-    layout["metrics"].update(Panel("Waiting for first evaluation...", title="Validation Metrics", border_style="magenta"))
-    layout["evaluation"].update(Panel("Waiting for first evaluation...", title="Evaluation Examples", border_style="blue"))
-    layout["training"].update(Panel("Waiting for first training batch...", title="Training Slice (10 samples)", border_style="green"))
-    if default_config.get('debug_masking'):
-        layout["mask"].update(Panel("Waiting for first mask debug...", title="Mask Debug", border_style="yellow"))
+        layout = None
+        live_context = nullcontext()
 
-    with Live(layout, console=console, refresh_per_second=4) as live:
+    with live_context:
         while True:
             # Set learning rate
             lr = get_lr(iter_num, warmup_iters, lr_decay_iters, default_config) if default_config['decay_lr'] else default_config['learning_rate']
@@ -2443,8 +2457,8 @@ def train(config=None):
                     paths_data_np,
                     edges_data_np,
                     print_samples,
-                    eval_layout_component=layout["evaluation"],
-                    metrics_layout_component=layout["metrics"],
+                    eval_layout_component=layout["evaluation"] if use_live_display else None,
+                    metrics_layout_component=layout["metrics"] if use_live_display else None,
                     tokens_per_sec=current_tokens_per_sec,
                     batch_size=train_batch_size,
                     train_dataset_size=train_total_dataset_size,
@@ -2545,11 +2559,11 @@ def train(config=None):
                         'iter': iter_num,
                         "epoch": round(current_epoch, 4),
                         'tokens_per_sec': tokens_per_sec,
-                    })
+                    }, step=iter_num)
                 
-                # Update training slice panel
+                # Update training slice panel (only if live display is enabled)
                 # Only update every vis_interval to save sync/formatting time
-                if iter_num % default_config['vis_interval'] == 0:
+                if use_live_display and iter_num % default_config['vis_interval'] == 0:
                     # Reconstruct full sequence for visualization: X + last token of Y
                     # Note: Y has masking (-1) applied, so if the last token is masked, it won't show, 
                     # but for path tasks the last token (LEAF) is not masked.
