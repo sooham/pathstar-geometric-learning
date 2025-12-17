@@ -11,6 +11,8 @@ $ wandb agent <sweep_id>
 """
 
 from datetime import datetime
+from collections import defaultdict
+import random
 import wandb
 import os
 import time
@@ -20,6 +22,9 @@ from contextlib import nullcontext
 import numpy as np
 import torch
 import torch.nn.functional as F
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend for server environments
+import matplotlib.pyplot as plt
 
 from model import GPTConfig, GPT
 from pathstar import InWeightsPathStar
@@ -350,15 +355,6 @@ def evaluate_edge_memorization(ctx, model, meta, edges_data_np, device, batch_si
         # Get batch of edge sequences
         batch = torch.from_numpy(edges_data_np[start_idx:end_idx].astype(np.int64)).to(device)
         
-        # Split into input (X) and target (Y_true).
-        # Two EDGE task layouts exist:
-        # - predict_direction_for_edge_task=False (predict v):
-        #     [EDGE] u [GT/LT] v ...
-        #     (or without task token: u [GT/LT] v)
-        #     => input length = (task) + (dir) + 1, target index = that length
-        # - predict_direction_for_edge_task=True (predict direction):
-        #     [EDGE] u v [GT/LT] ...
-        #     => input length = (task) + 2, target index = that length
         predict_dir = bool(meta.get('predict_direction_for_edge_task', False))
         if predict_dir:
             pos = (1 if meta.get('use_task_tokens', False) else 0) + 2
@@ -367,19 +363,6 @@ def evaluate_edge_memorization(ctx, model, meta, edges_data_np, device, batch_si
 
         X = batch[:, :pos]
         Y_true = batch[:, pos]
-        
-        # # Debug: Print first batch details
-        # if batch_idx == 0:
-        #     print(f"\nFirst batch details:")
-        #     print(f"Position index (pos): {pos}")
-        #     print(f"Batch shape: {batch.shape}")
-        #     print(f"X shape (input): {X.shape}")
-        #     print(f"Y_true shape (target): {Y_true.shape}")
-        #     print(f"\nFirst 3 edge sequences in batch:")
-        #     for i in range(min(3, len(batch))):
-        #         print(f"  Edge {i}: {batch[i].cpu().numpy()}")
-        #         print(f"    Input (X): {X[i].cpu().numpy()}")
-        #         print(f"    Target (Y_true): {Y_true[i].item()}")
         
         with ctx:
             with torch.no_grad():
@@ -390,22 +373,6 @@ def evaluate_edge_memorization(ctx, model, meta, edges_data_np, device, batch_si
                 final_logits = logits[:, -1, :]  # Shape: [batch_size, vocab_size]
                 predictions = torch.argmax(final_logits, dim=-1)  # Shape: [batch_size]
                 
-                # # Debug: Print first batch predictions
-                # if batch_idx == 0:
-                #     print(f"\nModel outputs for first batch:")
-                #     print(f"Logits shape: {logits.shape}")
-                #     print(f"Final logits shape: {final_logits.shape}")
-                #     print(f"Predictions shape: {predictions.shape}")
-                #     print(f"\nFirst 3 predictions vs targets:")
-                #     for i in range(min(3, len(predictions))):
-                #         pred = predictions[i].item()
-                #         target = Y_true[i].item()
-                #         correct = "✓" if pred == target else "✗"
-                #         print(f"  Edge {i}: Predicted={pred}, Target={target} {correct}")
-                #         # Show top-5 logits for first sample
-                #         if i == 0:
-                #             top5_logits, top5_indices = torch.topk(final_logits[i], k=min(5, final_logits.shape[-1]))
-                #             print(f"    Top-5 predictions: {top5_indices.cpu().numpy()} with logits {top5_logits.cpu().numpy()}")
                 
                 # Count correct predictions
                 correct = (predictions == Y_true).sum().item()
@@ -922,6 +889,295 @@ def calculate_optimal_batch_size_for_training(model, block_size, vocab_size, dev
     
     return max_batch_size
 
+
+def analyze_embedding_geometry(model, meta, paths_data_np, val_data_np, iter_num, config, out_dir='out'):
+    """
+    Analyze if path structure is reflected in embedding space.
+    
+    Computes cosine similarities between node embeddings at different graph distances
+    for both training and validation paths, using the actual path data from datasets.
+    
+    Args:
+        model: The GPT model with embeddings
+        meta: Metadata dict containing special tokens and path structure info
+        paths_data_np: NumPy array of training path sequences (from paths.bin)
+        val_data_np: NumPy array of validation path sequences (from val.bin)
+        iter_num: Current iteration number (for plot title and filename)
+        config: Training configuration dict
+        out_dir: Output directory for saving plots
+        
+    Returns:
+        dict: Statistics for train and val similarities by distance
+    """
+    model.eval()
+    E = model.transformer.wte.weight.detach().cpu()
+    
+    # Get metadata
+    l = meta['l']
+    special_tokens = meta['special_tokens']
+    num_special_tokens = len(special_tokens)
+    use_task_tokens = meta.get('use_task_tokens', True)
+    num_pause_tokens = meta.get('num_pause_tokens', 1)
+    use_task_tokens_in_path = meta.get('use_task_tokens_in_path', False)
+    
+    # Calculate sequence dimensions from meta
+    seq_len = meta['block_size'] + 1  # Full sequence length
+    PATHS_DATASET_SIZE = meta['PATHS_DATASET_SIZE']
+    VAL_DATASET_SIZE = meta['VAL_DATASET_SIZE']
+    
+    # Reshape the flat numpy arrays to (num_samples, seq_len)
+    paths_data = paths_data_np.reshape(PATHS_DATASET_SIZE, seq_len)
+    val_data = val_data_np.reshape(VAL_DATASET_SIZE, seq_len)
+    
+    def extract_path_nodes(sequence, meta):
+        """
+        Extract just the graph node tokens from a path sequence.
+        
+        Path format: [PATH?, leaf, PAUSE, ..., PAUSE, root, (GT?), n_2, (GT?), ..., leaf]
+        
+        Returns list of node tokens: [root, n_2, ..., leaf] (length = l)
+        """
+        seq = [int(x) for x in sequence]
+        
+        # Calculate where path nodes start
+        # Skip: PATH token (if present) + leaf + PAUSE tokens
+        path_start_idx = (1 if use_task_tokens else 0) + 1 + num_pause_tokens
+        
+        # Extract the path portion
+        path_portion = seq[path_start_idx:]
+        
+        # Filter out special tokens (GT, PAD, etc.) to get just node tokens
+        # Node tokens are >= num_special_tokens
+        node_tokens = [t for t in path_portion if t >= num_special_tokens]
+        
+        return node_tokens
+    
+    # Extract paths from train and val data
+    train_paths = []
+    for i in range(min(PATHS_DATASET_SIZE, 1000)):  # Limit to avoid memory issues
+        path_nodes = extract_path_nodes(paths_data[i], meta)
+        train_paths.append(path_nodes)
+    
+    val_paths = []
+    for i in range(VAL_DATASET_SIZE):
+        path_nodes = extract_path_nodes(val_data[i], meta)
+        val_paths.append(path_nodes)
+    
+    # Get all unique node tokens for similarity matrix
+    all_node_tokens = set()
+    for path in train_paths + val_paths:
+        all_node_tokens.update(path)
+    all_node_tokens = sorted(list(all_node_tokens))
+    
+    # Compute embeddings for all node tokens
+    node_embeddings = E[all_node_tokens]  # (num_nodes, n_embd)
+    
+    # Normalize for cosine similarity
+    node_embeddings_norm = F.normalize(node_embeddings, p=2, dim=1)
+    
+    # Cosine similarity matrix
+    sim_matrix = torch.mm(node_embeddings_norm, node_embeddings_norm.t())
+    
+    # Create mapping from token to index in similarity matrix
+    token_to_idx = {t: i for i, t in enumerate(all_node_tokens)}
+    
+    # Compute similarities by distance for train and val paths
+    results = {
+        'train': defaultdict(list),
+        'val': defaultdict(list),
+    }
+    
+    def compute_path_similarities(paths, result_dict):
+        """Compute pairwise similarities between nodes at different distances within paths."""
+        for path in paths:
+            # path is [root, n_1, n_2, ..., leaf] with length l
+            for i in range(len(path)):
+                for j in range(i, len(path)):
+                    dist = j - i  # Graph distance within the path
+                    token_i = path[i]
+                    token_j = path[j]
+                    
+                    if token_i in token_to_idx and token_j in token_to_idx:
+                        idx_i = token_to_idx[token_i]
+                        idx_j = token_to_idx[token_j]
+                        sim = sim_matrix[idx_i, idx_j].item()
+                        result_dict[dist].append(sim)
+    
+    compute_path_similarities(train_paths, results['train'])
+    compute_path_similarities(val_paths, results['val'])
+    
+    # Compute cross-path similarities (nodes at same position but different spokes)
+    # This measures how similar nodes at the same depth are across different paths
+    cross_path_sims_train = defaultdict(list)
+    cross_path_sims_val = defaultdict(list)
+    
+    # Sample pairs from train paths
+    for i in range(min(len(train_paths), 50)):
+        for j in range(i + 1, min(len(train_paths), 50)):
+            path_i = train_paths[i]
+            path_j = train_paths[j]
+            for pos in range(len(path_i)):
+                token_i = path_i[pos]
+                token_j = path_j[pos]
+                if token_i in token_to_idx and token_j in token_to_idx:
+                    idx_i = token_to_idx[token_i]
+                    idx_j = token_to_idx[token_j]
+                    sim = sim_matrix[idx_i, idx_j].item()
+                    cross_path_sims_train[pos].append(sim)
+    
+    # Sample pairs from val paths
+    for i in range(min(len(val_paths), 50)):
+        for j in range(i + 1, min(len(val_paths), 50)):
+            path_i = val_paths[i]
+            path_j = val_paths[j]
+            for pos in range(len(path_i)):
+                token_i = path_i[pos]
+                token_j = path_j[pos]
+                if token_i in token_to_idx and token_j in token_to_idx:
+                    idx_i = token_to_idx[token_i]
+                    idx_j = token_to_idx[token_j]
+                    sim = sim_matrix[idx_i, idx_j].item()
+                    cross_path_sims_val[pos].append(sim)
+    
+    # Compute random baseline
+    num_random_samples = min(500, len(all_node_tokens) * (len(all_node_tokens) - 1) // 2)
+    random_sims = []
+    for _ in range(num_random_samples):
+        i, j = random.sample(range(len(all_node_tokens)), 2)
+        random_sims.append(sim_matrix[i, j].item())
+    
+    # Create the plot with 2x2 layout
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    
+    # Plot 1: Train within-path similarities by distance
+    ax1 = axes[0, 0]
+    train_distances = sorted(results['train'].keys())
+    train_means = [np.mean(results['train'][d]) if results['train'][d] else 0 for d in train_distances]
+    train_stds = [np.std(results['train'][d]) if results['train'][d] else 0 for d in train_distances]
+    
+    if train_distances:
+        ax1.errorbar(train_distances, train_means, yerr=train_stds, 
+                     marker='o', capsize=5, capthick=2, linewidth=2, 
+                     color='blue', label='Train paths')
+    
+    if random_sims:
+        ax1.axhline(y=np.mean(random_sims), color='gray', linestyle='--', 
+                    label=f'Random baseline ({np.mean(random_sims):.3f})')
+    
+    ax1.set_xlabel('Graph Distance (within path)', fontsize=11)
+    ax1.set_ylabel('Cosine Similarity', fontsize=11)
+    ax1.set_title(f'Train: Within-Path Similarities (iter {iter_num})', fontsize=12)
+    ax1.legend(fontsize=9)
+    ax1.grid(True, alpha=0.3)
+    ax1.set_ylim(-0.5, 1.1)
+    
+    # Plot 2: Val within-path similarities by distance
+    ax2 = axes[0, 1]
+    val_distances = sorted(results['val'].keys())
+    val_means = [np.mean(results['val'][d]) if results['val'][d] else 0 for d in val_distances]
+    val_stds = [np.std(results['val'][d]) if results['val'][d] else 0 for d in val_distances]
+    
+    if val_distances:
+        ax2.errorbar(val_distances, val_means, yerr=val_stds,
+                     marker='s', capsize=5, capthick=2, linewidth=2,
+                     color='red', label='Val paths (holdout)')
+    
+    if random_sims:
+        ax2.axhline(y=np.mean(random_sims), color='gray', linestyle='--',
+                    label=f'Random baseline ({np.mean(random_sims):.3f})')
+    
+    ax2.set_xlabel('Graph Distance (within path)', fontsize=11)
+    ax2.set_ylabel('Cosine Similarity', fontsize=11)
+    ax2.set_title(f'Val: Within-Path Similarities (iter {iter_num})', fontsize=12)
+    ax2.legend(fontsize=9)
+    ax2.grid(True, alpha=0.3)
+    ax2.set_ylim(-0.5, 1.1)
+    
+    # Plot 3: Cross-path similarities by position (Train)
+    ax3 = axes[1, 0]
+    if cross_path_sims_train:
+        positions = sorted(cross_path_sims_train.keys())
+        cross_means = [np.mean(cross_path_sims_train[p]) for p in positions]
+        cross_stds = [np.std(cross_path_sims_train[p]) for p in positions]
+        
+        ax3.errorbar(positions, cross_means, yerr=cross_stds,
+                     marker='o', capsize=5, capthick=2, linewidth=2,
+                     color='green', label='Cross-path (same depth)')
+        
+        if random_sims:
+            ax3.axhline(y=np.mean(random_sims), color='gray', linestyle='--',
+                        label=f'Random baseline ({np.mean(random_sims):.3f})')
+    
+    ax3.set_xlabel('Position in Path (0=root, l-1=leaf)', fontsize=11)
+    ax3.set_ylabel('Cosine Similarity', fontsize=11)
+    ax3.set_title(f'Train: Cross-Path Similarities (same depth)', fontsize=12)
+    ax3.legend(fontsize=9)
+    ax3.grid(True, alpha=0.3)
+    ax3.set_ylim(-0.5, 1.1)
+    
+    # Plot 4: Cross-path similarities by position (Val)
+    ax4 = axes[1, 1]
+    if cross_path_sims_val:
+        positions = sorted(cross_path_sims_val.keys())
+        cross_means = [np.mean(cross_path_sims_val[p]) for p in positions]
+        cross_stds = [np.std(cross_path_sims_val[p]) for p in positions]
+        
+        ax4.errorbar(positions, cross_means, yerr=cross_stds,
+                     marker='s', capsize=5, capthick=2, linewidth=2,
+                     color='purple', label='Cross-path (same depth)')
+        
+        if random_sims:
+            ax4.axhline(y=np.mean(random_sims), color='gray', linestyle='--',
+                        label=f'Random baseline ({np.mean(random_sims):.3f})')
+    
+    ax4.set_xlabel('Position in Path (0=root, l-1=leaf)', fontsize=11)
+    ax4.set_ylabel('Cosine Similarity', fontsize=11)
+    ax4.set_title(f'Val: Cross-Path Similarities (same depth)', fontsize=12)
+    ax4.legend(fontsize=9)
+    ax4.grid(True, alpha=0.3)
+    ax4.set_ylim(-0.5, 1.1)
+    
+    plt.tight_layout()
+    
+    # Save to file
+    os.makedirs(out_dir, exist_ok=True)
+    plot_path = os.path.join(out_dir, f'embedding_geometry_iter_{iter_num}.png')
+    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+    
+    plt.close(fig)
+    
+    # Print summary to console
+    summary_lines = []
+    summary_lines.append(f"[bold cyan]Embedding Geometry Analysis (iter {iter_num})[/bold cyan]")
+    summary_lines.append(f"  Plot saved: {plot_path}")
+    summary_lines.append(f"  Train paths analyzed: {len(train_paths)}, Val paths: {len(val_paths)}")
+    summary_lines.append(f"  [blue]Train within-path similarities:[/blue]")
+    for dist in sorted(results['train'].keys())[:5]:  # Show first 5
+        sims = results['train'][dist]
+        if sims:
+            summary_lines.append(f"    Distance {dist}: mean={np.mean(sims):.4f}, std={np.std(sims):.4f}")
+    summary_lines.append(f"  [red]Val within-path similarities:[/red]")
+    for dist in sorted(results['val'].keys())[:5]:
+        sims = results['val'][dist]
+        if sims:
+            summary_lines.append(f"    Distance {dist}: mean={np.mean(sims):.4f}, std={np.std(sims):.4f}")
+    if random_sims:
+        summary_lines.append(f"  [dim]Random baseline: {np.mean(random_sims):.4f}[/dim]")
+    
+    console.print("\n".join(summary_lines))
+    
+    model.train()
+    
+    return {
+        'train_similarities': dict(results['train']),
+        'val_similarities': dict(results['val']),
+        'cross_path_train': dict(cross_path_sims_train),
+        'cross_path_val': dict(cross_path_sims_val),
+        'random_baseline': np.mean(random_sims) if random_sims else 0,
+        'plot_path': plot_path,
+    }
+
+
 # GOOD
 def evaluate(estimate_metrics, config, meta, iter_num, lr, ctx, device, model, val_data_np, paths_data_np, edges_data_np, print_samples=False, eval_layout_component=None, metrics_layout_component=None, tokens_per_sec=None, batch_size=None, train_dataset_size=None, eval_dataset_size=None):
     # Compute metrics for both splits
@@ -956,6 +1212,17 @@ def evaluate(estimate_metrics, config, meta, iter_num, lr, ctx, device, model, v
         ctx, model, meta, edges_data_np, device,
         batch_size=int(config.get('edge_eval_batch_size', 512)),
     )
+    
+    # Analyze embedding geometry when printing samples (every print_eval_interval)
+    embedding_geometry_results = None
+    if print_samples:
+        try:
+            embedding_geometry_results = analyze_embedding_geometry(
+                model, meta, paths_data_np, val_data_np, iter_num, config, 
+                out_dir=config.get('out_dir', 'out')
+            )
+        except Exception as e:
+            console.print(f"[yellow]Warning: Embedding geometry analysis failed: {e}[/yellow]")
     
     # Update Live display if new samples were generated
     if 'generated_text' in losses and losses['generated_text'] and eval_layout_component:
@@ -1032,6 +1299,40 @@ def evaluate(estimate_metrics, config, meta, iter_num, lr, ctx, device, model, v
                     log_dict["val/accuracy/token_final"] = losses['val_per_token_accuracy'][token_pos]
                 else:
                     log_dict[f"val/accuracy/token_{token_pos}"] = losses['val_per_token_accuracy'][token_pos]
+        
+        # Add embedding geometry metrics if available
+        if embedding_geometry_results is not None:
+            l = meta['l']
+            train_sims = embedding_geometry_results.get('train_similarities', {})
+            val_sims = embedding_geometry_results.get('val_similarities', {})
+            
+            # Self-similarity (distance = 0)
+            if 0 in train_sims and train_sims[0]:
+                log_dict['embedding_geometry/train_dist0_sim'] = np.mean(train_sims[0])
+            if 0 in val_sims and val_sims[0]:
+                log_dict['embedding_geometry/val_dist0_sim'] = np.mean(val_sims[0])
+            
+            # Adjacent nodes similarity (distance = 1)
+            if 1 in train_sims and train_sims[1]:
+                log_dict['embedding_geometry/train_dist1_sim'] = np.mean(train_sims[1])
+            if 1 in val_sims and val_sims[1]:
+                log_dict['embedding_geometry/val_dist1_sim'] = np.mean(val_sims[1])
+            
+            # Root-to-leaf similarity (distance = l-1)
+            if l-1 in train_sims and train_sims[l-1]:
+                log_dict['embedding_geometry/train_root_leaf_sim'] = np.mean(train_sims[l-1])
+            if l-1 in val_sims and val_sims[l-1]:
+                log_dict['embedding_geometry/val_root_leaf_sim'] = np.mean(val_sims[l-1])
+            
+            # Cross-path similarity at root position (should be high if root is shared)
+            cross_train = embedding_geometry_results.get('cross_path_train', {})
+            cross_val = embedding_geometry_results.get('cross_path_val', {})
+            if 0 in cross_train and cross_train[0]:
+                log_dict['embedding_geometry/train_cross_root_sim'] = np.mean(cross_train[0])
+            if 0 in cross_val and cross_val[0]:
+                log_dict['embedding_geometry/val_cross_root_sim'] = np.mean(cross_val[0])
+            
+            log_dict['embedding_geometry/random_baseline'] = embedding_geometry_results.get('random_baseline', 0)
         
         wandb.log(log_dict)
     
