@@ -1402,6 +1402,14 @@ def evaluate(estimate_metrics, config, meta, iter_num, lr, ctx, device, model, v
             
             log_dict['embedding_geometry/random_baseline'] = embedding_geometry_results.get('random_baseline', 0)
         
+        # Compute transformer weight norm (L2 norm of all parameters)
+        total_norm = 0.0
+        for p in model.parameters():
+            if p.requires_grad:
+                total_norm += p.data.norm(2).item() ** 2
+        total_norm = total_norm ** 0.5
+        log_dict['model/weight_norm'] = total_norm
+        
         wandb.log(log_dict)
     
     # During sweeps, only save best checkpoint to reduce I/O overhead
