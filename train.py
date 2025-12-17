@@ -613,6 +613,7 @@ def set_wandb_name(config):
             tt_label = "tt_" if config['use_task_tokens'] else 'nott_'
             dt_label = 'dt_' if config['use_directional_tokens'] else 'nodt_'
             ped_or_pet_label = 'ped_' if config['predict_direction_for_edge_task'] else 'pet_'
+            wt_label = 'wt_' if config['weight_tying'] else ''
             # Include both dropout values if they differ, otherwise just one
             if config['dropout'] == config['embd_dropout']:
                 dropout_label = f"D{config['dropout']}_"
@@ -631,6 +632,7 @@ def set_wandb_name(config):
                 f"{dir_label}"
                 f"{tt_label}"
                 f"{dt_label}"
+                f"{wt_label}"
                 f"{config['epochs']}"
             )
             wandb.run.name = custom_name
