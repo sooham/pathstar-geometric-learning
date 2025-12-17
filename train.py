@@ -73,6 +73,9 @@ def get_default_config():
         'use_undirected': True,
         'use_directional_tokens': False,
         'use_task_tokens': False,
+        # If True, PATH task sequences interleave GT tokens between edges:
+        #   [PATH] leaf (PAUSE)xN root GT n2 GT n3 ... GT leaf
+        'use_task_tokens_in_path': False,
         
         # Training parameters
         'gradient_accumulation_steps': 1,
@@ -412,12 +415,13 @@ def compute_per_token_accuracy_autoregressive(ctx, model, meta, val_data_batch, 
     
     contexts = []
     ground_truths = []
+    path_target_len = int(meta.get('path_target_length', meta['l']))
     
     for val_idx in sample_indices:
         full_sequence = val_data_batch[val_idx]
         context = full_sequence[:context_length]
         contexts.append(context)
-        ground_truth = full_sequence[context_length:context_length + meta['l']]
+        ground_truth = full_sequence[context_length:context_length + path_target_len]
         ground_truths.append(ground_truth)
     
     contexts_batch = torch.from_numpy(np.stack(contexts).astype(np.int64)).to(device_local)
@@ -425,7 +429,7 @@ def compute_per_token_accuracy_autoregressive(ctx, model, meta, val_data_batch, 
     model.eval()
     with torch.no_grad():
         with ctx:
-            generated_sequences = model.generate(contexts_batch, max_new_tokens=meta['l'], temperature=1.0, top_k=1)
+            generated_sequences = model.generate(contexts_batch, max_new_tokens=path_target_len, temperature=1.0, top_k=1)
             generated_tokens_batch = generated_sequences[:, context_length:].cpu().numpy()
             model_context_prediction_batch = generated_sequences[:, :context_length].cpu().numpy()
     model.train()
@@ -488,7 +492,7 @@ def compute_per_token_accuracy_autoregressive(ctx, model, meta, val_data_batch, 
     
     per_token_accuracies = {}
     
-    for token_pos in range(1, meta['l'] + 1):
+    for token_pos in range(1, path_target_len + 1):
         idx = token_pos - 1
         if idx < generated_tokens_batch.shape[1] and idx < ground_truths_array.shape[1]:
             matches = generated_tokens_batch[:, idx] == ground_truths_array[:, idx]
@@ -533,12 +537,13 @@ def evaluate_samples(device, ctx, model, meta, data, data_size, split_name, num_
         context_length = 1 + meta['num_pause_tokens']  # leaf + pause tokens
     contexts = []
     ground_truths = []
+    path_target_len = int(meta.get('path_target_length', meta['l']))
     
     for idx in sample_indices:
         full_sequence = data[idx]
         context = full_sequence[:context_length]
         contexts.append(context)
-        ground_truth = full_sequence[context_length:context_length + meta['l']]
+        ground_truth = full_sequence[context_length:context_length + path_target_len]
         ground_truths.append(ground_truth)
     
     # Generate in batches to avoid OOM
@@ -557,7 +562,7 @@ def evaluate_samples(device, ctx, model, meta, data, data_size, split_name, num_
                 contexts_batch = torch.from_numpy(np.stack(batch_contexts).astype(np.int64)).to(device)
                 
                 # Generate for this batch
-                generated_sequences = model.generate(contexts_batch, max_new_tokens=meta['l'], temperature=1.0, top_k=1)
+                generated_sequences = model.generate(contexts_batch, max_new_tokens=path_target_len, temperature=1.0, top_k=1)
                 generated_tokens_batch = generated_sequences[:, context_length:].cpu().numpy()
                 
                 all_generated_tokens.append(generated_tokens_batch)
@@ -613,6 +618,7 @@ def set_wandb_name(config):
             dir_label = "undir_" if config["use_undirected"] else "dir_"
             tt_label = "tt_" if config['use_task_tokens'] else 'nott_'
             dt_label = 'dt_' if config['use_directional_tokens'] else 'nodt_'
+            ptgt_label = 'ptgt_' if config.get('use_task_tokens_in_path', False) else ''
             ped_or_pet_label = 'ped_' if config['predict_direction_for_edge_task'] else 'pet_'
             wt_label = 'wt_' if config['weight_tying'] else ''
             # Include both dropout values if they differ, otherwise just one
@@ -633,6 +639,7 @@ def set_wandb_name(config):
                 f"{dir_label}"
                 f"{tt_label}"
                 f"{dt_label}"
+                f"{ptgt_label}"
                 f"{wt_label}"
                 f"{config['epochs']}"
             )
@@ -900,7 +907,8 @@ def evaluate(estimate_metrics, config, meta, iter_num, lr, ctx, device, model, v
     train_metrics = estimate_metrics('train', False) # Don't print train samples here
     losses = {**val_metrics, **train_metrics}
     
-    graph_length = meta['l']
+    # For PATH task token-level metrics, use the number of tokens generated after PATH context.
+    graph_length = int(meta.get('path_target_length', meta['l']))
     PATHS_DATASET_SIZE = meta['PATHS_DATASET_SIZE']
     VAL_DATASET_SIZE = meta['VAL_DATASET_SIZE']
     
@@ -1210,7 +1218,8 @@ def train(config=None):
         use_undirected=default_config['use_undirected'],
         use_directional_tokens=default_config['use_directional_tokens'],
         use_task_tokens=default_config['use_task_tokens'],
-        predict_direction_for_edge_task=default_config['predict_direction_for_edge_task']
+        predict_direction_for_edge_task=default_config['predict_direction_for_edge_task'],
+        use_task_tokens_in_path=default_config.get('use_task_tokens_in_path', False),
     )
     
     meta, paths_data, edges_data, val_data = gen.load_dataset()
@@ -1221,7 +1230,8 @@ def train(config=None):
     meta['RESET_COLOR'] = RESET
     meta['randomize_vocab_size'] = gen.randomize_vocab_size
     # Extract graph parameters from metadata
-    graph_length = meta['l']
+    # graph_length is used for PATH task token-level metrics, so account for GT-interleaving.
+    graph_length = int(meta.get('path_target_length', meta['l']))
     graph_spokes = meta['d']
     holdout_ratio = meta['holdout_percentage']
 

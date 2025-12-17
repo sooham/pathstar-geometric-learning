@@ -270,7 +270,7 @@ class TestInWeightsPathStar(unittest.TestCase):
             path_seq_len = g.l + num_pause_tokens + 1 + (1 if use_task_tokens else 0)
             
             # --- 1. Verify Directory Naming ---
-            expected_dir_name = f'inweights_pathstar_v{self.RANDOMIZE_VOCAB_SIZE}_d{self.D}_l{self.L}_p1_undirected_dt_tt'
+            expected_dir_name = f'inweights_pathstar_v{self.RANDOMIZE_VOCAB_SIZE}_ped_elv2_plplain_d{self.D}_l{self.L}_p1_undirected_dt_tt'
             self.assertTrue(output_dir.endswith(expected_dir_name))
             self.assertTrue(os.path.exists(output_dir))
             
@@ -351,7 +351,7 @@ class TestInWeightsPathStar(unittest.TestCase):
             path_seq_len = g.l + num_pause_tokens + 1  # 7 (no task token)
             
             # --- 1. Verify Directory Naming ---
-            expected_dir_name = f'inweights_pathstar_v{self.RANDOMIZE_VOCAB_SIZE}_d{self.D}_l{self.L}_p1_undirected_dt_nott'
+            expected_dir_name = f'inweights_pathstar_v{self.RANDOMIZE_VOCAB_SIZE}_ped_elv2_plplain_d{self.D}_l{self.L}_p1_undirected_dt_nott'
             self.assertTrue(output_dir.endswith(expected_dir_name))
             
             # --- 2. Load and verify metadata ---
@@ -437,7 +437,7 @@ class TestInWeightsPathStar(unittest.TestCase):
             )
             
             # Update dir_name to match what was created
-            g.dir_name = f'inweights_pathstar_v{self.RANDOMIZE_VOCAB_SIZE}_d{self.D}_l{self.L}_p1_undirected_dt_tt'
+            g.dir_name = f'inweights_pathstar_v{self.RANDOMIZE_VOCAB_SIZE}_ped_elv2_plplain_d{self.D}_l{self.L}_p1_undirected_dt_tt'
             
             # Now load it
             meta, paths_data, edges_data, val_data = g.load_dataset()
