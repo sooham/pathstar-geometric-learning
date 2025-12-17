@@ -65,6 +65,9 @@ def get_default_config():
         # Visualization
         'live_display': False,  # If True, show Rich Live display with training slices, metrics, etc.
         'vis_interval': 100, # Interval to update training slice visualization
+        'log_attention_maps': False,  # If True, log attention map heatmaps to wandb
+        'attention_map_interval': 500,  # How often to log attention maps (iterations)
+        'attention_map_samples': 3,  # Number of samples to visualize
         # Debugging
         'debug_masking': False,          # If True, show target masks applied to Y
         'debug_masking_samples': 2,      # How many batch rows to show
@@ -271,6 +274,107 @@ def format_training_slice(sequences, itos, meta, num_samples=10):
         lines.append(f"Sample {i}: {seq_str}")
         
     return "\n".join(lines)
+
+def create_attention_map_figures(model, X, itos, meta, num_samples=3):
+    """
+    Create attention map heatmaps for wandb logging.
+    
+    Args:
+        model: the GPT model
+        X: input tensor of shape (batch_size, seq_len)
+        itos: index-to-string mapping for tokens
+        meta: metadata dict
+        num_samples: number of samples to visualize
+        
+    Returns:
+        dict of wandb.Image objects keyed by layer/head
+    """
+    model.eval()
+    with torch.no_grad():
+        # Get attention maps for first num_samples
+        X_subset = X[:num_samples]
+        attention_maps = model.get_attention_maps(X_subset)
+    model.train()
+    
+    images = {}
+    n_layers = len(attention_maps)
+    n_heads = attention_maps[0].shape[1]
+    seq_len = attention_maps[0].shape[2]
+    
+    # Get token labels for axes
+    def get_token_label(token_id):
+        token_id = int(token_id)
+        if token_id in itos:
+            return str(itos[token_id])[:8]  # Truncate long labels
+        return str(token_id)
+    
+    # Create figures for each sample
+    for sample_idx in range(num_samples):
+        token_labels = [get_token_label(t) for t in X_subset[sample_idx].cpu().numpy()]
+        
+        # Option 1: Per-layer averaged across heads
+        fig_layers, axes = plt.subplots(1, n_layers, figsize=(4*n_layers, 4))
+        if n_layers == 1:
+            axes = [axes]
+        
+        for layer_idx, attn in enumerate(attention_maps):
+            # Average across heads for this sample
+            attn_avg = attn[sample_idx].mean(dim=0).cpu().numpy()  # (seq_len, seq_len)
+            
+            im = axes[layer_idx].imshow(attn_avg, cmap='viridis', aspect='auto')
+            axes[layer_idx].set_title(f'Layer {layer_idx}')
+            axes[layer_idx].set_xlabel('Key Position')
+            axes[layer_idx].set_ylabel('Query Position')
+            
+            # Add token labels if sequence is short enough
+            if seq_len <= 20:
+                axes[layer_idx].set_xticks(range(seq_len))
+                axes[layer_idx].set_xticklabels(token_labels, rotation=45, ha='right', fontsize=6)
+                axes[layer_idx].set_yticks(range(seq_len))
+                axes[layer_idx].set_yticklabels(token_labels, fontsize=6)
+            
+            plt.colorbar(im, ax=axes[layer_idx], fraction=0.046, pad=0.04)
+        
+        plt.suptitle(f'Attention Maps (Sample {sample_idx}, Head-Averaged)')
+        plt.tight_layout()
+        images[f'attention/sample_{sample_idx}_layers'] = wandb.Image(fig_layers)
+        plt.close(fig_layers)
+        
+        # Option 2: All heads for the last layer (usually most interpretable)
+        last_layer_attn = attention_maps[-1][sample_idx]  # (n_heads, seq_len, seq_len)
+        
+        # Create grid of heads
+        n_cols = min(4, n_heads)
+        n_rows = (n_heads + n_cols - 1) // n_cols
+        fig_heads, axes_heads = plt.subplots(n_rows, n_cols, figsize=(3*n_cols, 3*n_rows))
+        if n_heads == 1:
+            axes_heads = np.array([[axes_heads]])
+        axes_heads = np.atleast_2d(axes_heads)
+        
+        for head_idx in range(n_heads):
+            row, col = head_idx // n_cols, head_idx % n_cols
+            attn_head = last_layer_attn[head_idx].cpu().numpy()
+            
+            im = axes_heads[row, col].imshow(attn_head, cmap='viridis', aspect='auto')
+            axes_heads[row, col].set_title(f'Head {head_idx}', fontsize=8)
+            
+            if seq_len <= 15:
+                axes_heads[row, col].set_xticks(range(seq_len))
+                axes_heads[row, col].set_xticklabels(token_labels, rotation=45, ha='right', fontsize=5)
+                axes_heads[row, col].set_yticks(range(seq_len))
+                axes_heads[row, col].set_yticklabels(token_labels, fontsize=5)
+        
+        # Hide empty subplots
+        for idx in range(n_heads, n_rows * n_cols):
+            row, col = idx // n_cols, idx % n_cols
+            axes_heads[row, col].axis('off')
+        
+        plt.suptitle(f'Last Layer Attention Heads (Sample {sample_idx})')
+        plt.tight_layout()
+        images[f'attention/sample_{sample_idx}_last_layer_heads'] = wandb.Image(fig_heads)
+        plt.close(fig_heads)
+    
+    return images
 
 def create_metrics_table(metrics, graph_length, iter_num, epoch, lr, tokens_per_sec=None, batch_size=None, edge_memorization_pct=None, train_dataset_size=None, eval_dataset_size=None, embedding_geometry=None):
     """Create a Rich Table for per-token metrics (Train vs Val)"""
@@ -2572,6 +2676,18 @@ def train(config=None):
                     layout["training"].update(Panel(training_slice_str, title=f"Training Slice (Iter {iter_num})", border_style="green"))
                     if default_config.get('debug_masking') and last_mask_debug_str is not None:
                         layout["mask"].update(Panel(last_mask_debug_str, title=f"Mask Debug (Iter {iter_num})", border_style="yellow"))
+                
+                # Log attention maps to wandb (expensive, so use separate interval)
+                if default_config['wandb_log'] and default_config.get('log_attention_maps', False):
+                    if iter_num % default_config.get('attention_map_interval', 500) == 0:
+                        try:
+                            attn_images = create_attention_map_figures(
+                                model, X, itos, meta,
+                                num_samples=default_config.get('attention_map_samples', 3)
+                            )
+                            wandb.log(attn_images, step=iter_num)
+                        except Exception as e:
+                            console.print(f"[yellow]Warning: Failed to log attention maps: {e}[/yellow]")
             
             iter_num += 1
             
