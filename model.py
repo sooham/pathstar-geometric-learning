@@ -236,7 +236,7 @@ class GPT(nn.Module):
         
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt((2 if self.use_mlp else 1) * self.config.n_layer))
+                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt((2 if self.config.use_mlp else 1) * self.config.n_layer))
 
 
     def forward(self, idx, targets=None, label_smoothing=0.0):
