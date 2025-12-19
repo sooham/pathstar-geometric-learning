@@ -1,0 +1,112 @@
+# Minimal sweep configuration for quick testing
+# Focuses on a few key hyperparameters
+program: train.py
+method: grid
+metric:
+  name: val/loss/overall
+  goal: minimize
+
+parameters:
+  # Dataset parameters - small fixed values for quick iteration
+  graph_d:
+    values: [1000]
+  graph_l:
+    value: 5
+  graph_vocab_size:
+    value: '1max'
+  graph_holdout_percentage:
+    value: 0.2
+  num_pause_tokens:
+    values: [5] 
+  use_undirected:
+    value: true
+  use_directional_tokens:
+    values: [true]
+  use_task_tokens:
+    values: [true]
+  interleave_dataset:
+    value: true
+  predict_direction_for_edge_task:
+    values: [false]
+  use_task_tokens_in_path:
+    values: [false] # for now test this
+
+  weight_tying:
+    values: [true] # weight tying requires that the input to the unembedding matrix match the embedding of the output, so x + W_0 (attn from v) needs to be close.
+  # Model architecture parameters - sweep these
+  n_layer:
+    values: [12]
+  n_head:
+    values: [1]
+  n_embd:
+    values: [16]
+  dropout:
+    values: [0]
+  dropout_embd:
+    values: [0]
+  bias:
+    values: [false, true]
+  use_mlp:
+    values: [false, true]
+  use_layernorm:
+    values: [false, true]
+  activation:
+    values: ['RELU']
+  base:
+    values: [100]
+  
+  # Training hyperparameters - sweep learning rate
+  learning_rate:
+    value: 1e-3
+  label_smoothing:
+    value: 0
+  weight_decay:
+    values: [0]
+  beta1:
+    value: 0.9
+  beta2:
+    value: 0.95
+  grad_clip:
+    value: 0.0
+      #batch_size:
+      #value: 2000
+  
+  # Learning rate schedule
+  decay_lr:
+    value: false
+  warmup_frac:
+    value: 0.10
+  lr_decay_frac:
+    value: 0.50
+  min_lr:
+    value: 5e-4
+  
+  # Fixed training parameters
+  epochs:
+    value: 25_000  # Shorter for quick testing
+  edge_iterations_per_epoch: # 800 edges total
+    value: 10
+  path_iterations_per_epoch: # 800 paths total
+    value: 10
+  gradient_accumulation_steps:
+    value: 1  # Reduced from 4 for fewer optimizer steps, better GPU utilization
+  compile:
+    value: true
+  eval_interval:
+    value: 800  # Increased from 50 to reduce evaluation overhead
+  log_interval:
+    value: 100  # Increased from 10 to reduce print overhead
+  print_eval_interval:
+    value: 800
+  vis_interval:
+    value: 800
+  debug_masking:
+    value: false
+  log_attention_maps:
+    value: false
+  attention_map_interval:
+    value: 8000
+  
+  wandb_project:
+    value: mats_pathstar_debug_success
+
