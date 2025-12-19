@@ -35,13 +35,13 @@ parameters:
   
   # Model architecture parameters - sweep these
   n_layer:
-    values: [12]
+    values: [1,12,6]
   n_head:
     values: [1]
   n_embd:
-    values: [32,16]
+    values: [16]
   dropout:
-    values: [0.01,0]
+    values: [0]
   dropout_embd:
     values: [0]
   bias:
@@ -55,7 +55,7 @@ parameters:
   label_smoothing:
     value: 0
   weight_decay:
-    values: [0.01]
+    values: [0]
   beta1:
     value: 0.9
   beta2:
@@ -67,7 +67,7 @@ parameters:
   
   # Learning rate schedule
   decay_lr:
-    value: true
+    value: false
   warmup_frac:
     value: 0.10
   lr_decay_frac:
@@ -77,7 +77,7 @@ parameters:
   
   # Fixed training parameters
   epochs:
-    value: 100_000  # Shorter for quick testing
+    value: 25_000  # Shorter for quick testing
   edge_iterations_per_epoch: # 800 edges total
     value: 10
   path_iterations_per_epoch: # 800 paths total
@@ -102,5 +102,5 @@ parameters:
     value: 8000
   
   wandb_project:
-    value: mats_pathstar_debug_main
+    value: mats_pathstar_debug_success
 
