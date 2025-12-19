@@ -65,9 +65,11 @@ def get_default_config():
         # Visualization
         'live_display': True,  # If True, show Rich Live display with training slices, metrics, etc.
         'vis_interval': 100, # Interval to update training slice visualization
+        'show_training_slices': False,  # If True, show training batch slices in live display
         'log_attention_maps': False,  # If True, log attention map heatmaps to wandb
         'attention_map_interval': 500,  # How often to log attention maps (iterations)
         'attention_map_samples': 3,  # Number of samples to visualize
+        'analyze_embedding_geometry': False,  # If True, compute and log embedding geometry metrics during eval
         # Debugging
         'debug_masking': False,          # If True, show target masks applied to Y
         'debug_masking_samples': 2,      # How many batch rows to show
@@ -1377,7 +1379,7 @@ def evaluate(estimate_metrics, config, meta, iter_num, lr, ctx, device, model, v
     
     # Analyze embedding geometry when printing samples (every print_eval_interval)
     embedding_geometry_results = None
-    if print_samples:
+    if print_samples and config.get('analyze_embedding_geometry', False):
         try:
             embedding_geometry_results = analyze_embedding_geometry(
                 model, meta, paths_data_np, val_data_np, iter_num, config, 
@@ -2504,23 +2506,26 @@ def train(config=None):
     
     if use_live_display:
         layout = Layout()
-        if default_config.get('debug_masking'):
-            layout.split_column(
-                Layout(name="metrics", size=14), # Fixed size for metrics table
-                Layout(name="evaluation"),
-                Layout(name="training"),
-                Layout(name="mask", size=10),
-            )
-        else:
-            layout.split_column(
-                Layout(name="metrics", size=14), # Fixed size for metrics table
-                Layout(name="evaluation"),
-                Layout(name="training"),
-            )
+        show_training_slices = default_config.get('show_training_slices', False)
+        show_debug_masking = default_config.get('debug_masking', False)
+        
+        # Build layout based on enabled features
+        layout_components = [
+            Layout(name="metrics", size=14),  # Fixed size for metrics table
+            Layout(name="evaluation"),
+        ]
+        if show_training_slices:
+            layout_components.append(Layout(name="training"))
+        if show_debug_masking:
+            layout_components.append(Layout(name="mask", size=10))
+        
+        layout.split_column(*layout_components)
+        
         layout["metrics"].update(Panel("Waiting for first evaluation...", title="Validation Metrics", border_style="magenta"))
         layout["evaluation"].update(Panel("Waiting for first evaluation...", title="Evaluation Examples", border_style="blue"))
-        layout["training"].update(Panel("Waiting for first training batch...", title="Training Slice (10 samples)", border_style="green"))
-        if default_config.get('debug_masking'):
+        if show_training_slices:
+            layout["training"].update(Panel("Waiting for first training batch...", title="Training Slice (10 samples)", border_style="green"))
+        if show_debug_masking:
             layout["mask"].update(Panel("Waiting for first mask debug...", title="Mask Debug", border_style="yellow"))
         live_context = Live(layout, console=console, refresh_per_second=4)
     else:
@@ -2665,15 +2670,16 @@ def train(config=None):
                         'tokens_per_sec': tokens_per_sec,
                     }, step=iter_num)
                 
-                # Update training slice panel (only if live display is enabled)
+                # Update training slice panel (only if live display and show_training_slices are enabled)
                 # Only update every vis_interval to save sync/formatting time
                 if use_live_display and iter_num % default_config['vis_interval'] == 0:
-                    # Reconstruct full sequence for visualization: X + last token of Y
-                    # Note: Y has masking (-1) applied, so if the last token is masked, it won't show, 
-                    # but for path tasks the last token (LEAF) is not masked.
-                    full_batch = torch.cat([X, Y[:, -1:]], dim=1)
-                    training_slice_str = format_training_slice(full_batch, itos, meta, num_samples=10)
-                    layout["training"].update(Panel(training_slice_str, title=f"Training Slice (Iter {iter_num})", border_style="green"))
+                    if default_config.get('show_training_slices', False):
+                        # Reconstruct full sequence for visualization: X + last token of Y
+                        # Note: Y has masking (-1) applied, so if the last token is masked, it won't show, 
+                        # but for path tasks the last token (LEAF) is not masked.
+                        full_batch = torch.cat([X, Y[:, -1:]], dim=1)
+                        training_slice_str = format_training_slice(full_batch, itos, meta, num_samples=10)
+                        layout["training"].update(Panel(training_slice_str, title=f"Training Slice (Iter {iter_num})", border_style="green"))
                     if default_config.get('debug_masking') and last_mask_debug_str is not None:
                         layout["mask"].update(Panel(last_mask_debug_str, title=f"Mask Debug (Iter {iter_num})", border_style="yellow"))
                 
