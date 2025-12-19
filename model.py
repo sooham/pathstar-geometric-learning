@@ -101,7 +101,12 @@ class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.gelu    = nn.GELU()  # Gaussian Error Linear Unit: smooth, non-monotonic activation function
+        if config.activation == 'GELU':
+            self.activation    = nn.GELU()  # Gaussian Error Linear Unit: smooth, non-monotonic activation function
+        elif config.activation == 'RELU':
+            self.activation = nn.RELU()
+        else:
+            raise ValueError("Unsupported activation")
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
@@ -116,10 +121,21 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        if config.use_layernorm:
+            self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        else:
+            self.ln_1 = nn.Identity()
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
+
+        if config.use_layernorm:
+            self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        else:
+            self.ln_2 = nn.Identity()
+        
+        if config.use_mlp:
+            self.mlp = MLP(config)
+        else:
+            self.mlp = nn.Identity()
 
     def forward(self, x, output_attentions=False):
         if output_attentions:
@@ -139,11 +155,18 @@ class GPTConfig:
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
+    base: float = 100.0 # base for positional encodings
+
+    # regularization
     dropout: float = 0.0  # Dropout for attention, MLP, and residual connections
     embd_dropout: float = 0.0  # Dropout applied after embedding layer (tok_emb + pos_emb)
-    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     weight_tying: bool = False
-    base: float = 100.0
+
+    # ML features
+    activation: str = 'GELU'
+    use_layernorm: bool = True
+    use_mlp: bool = True
+    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
 
 class GPT(nn.Module):
 
@@ -158,7 +181,7 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             drop = nn.Dropout(config.embd_dropout),  # Dropout layer applied to the sum of token and position embeddings
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = LayerNorm(config.n_embd, bias=config.bias),
+            ln_f = LayerNorm(config.n_embd, bias=config.bias) if config.use_layernorm else nn.Identity(),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
@@ -213,7 +236,7 @@ class GPT(nn.Module):
         
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * self.config.n_layer))
+                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt((2 if self.use_mlp else 1) * self.config.n_layer))
 
 
     def forward(self, idx, targets=None, label_smoothing=0.0):
