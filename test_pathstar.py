@@ -536,6 +536,61 @@ class TestInWeightsPathStar(unittest.TestCase):
         self.assertEqual(g.pause_token, 1)
         self.assertEqual(g.pad_token, 0)
 
+    def test_12_compute_laplacian_eigen_and_fiedler(self):
+        """Tests compute_laplacian_eigen(), compute_fiedler_value(), and compute_fiedler_vector()."""
+        
+        g = self.gen
+        
+        # --- Test compute_laplacian_eigen() ---
+        eigenvalues, eigenvectors = g.compute_laplacian_eigen()
+        
+        # Verify eigenvalues array has correct length
+        self.assertEqual(len(eigenvalues), g.num_vertices)
+        
+        # Verify eigenvectors matrix has correct shape (n x n)
+        self.assertEqual(eigenvectors.shape, (g.num_vertices, g.num_vertices))
+        
+        # Verify smallest eigenvalue is approximately 0 (connected graph property)
+        self.assertAlmostEqual(eigenvalues[0], 0.0, places=10)
+        
+        # Verify eigenvalues are sorted in ascending order
+        for i in range(len(eigenvalues) - 1):
+            self.assertLessEqual(eigenvalues[i], eigenvalues[i + 1])
+        
+        # Verify Fiedler value (second-smallest) is positive (connected graph property)
+        self.assertGreater(eigenvalues[1], 0.0)
+        
+        # Verify eigenvectors are orthonormal (for symmetric matrix)
+        # V^T @ V should be identity matrix
+        identity_check = eigenvectors.T @ eigenvectors
+        np.testing.assert_array_almost_equal(identity_check, np.eye(g.num_vertices), decimal=10)
+        
+        # --- Test compute_fiedler_value() ---
+        fiedler_value = g.compute_fiedler_value()
+        
+        # Verify Fiedler value is positive
+        self.assertGreater(fiedler_value, 0.0)
+        
+        # Verify Fiedler value matches second eigenvalue from full computation
+        self.assertAlmostEqual(fiedler_value, eigenvalues[1], places=8)
+        
+        # --- Test compute_fiedler_vector() ---
+        fiedler_vector = g.compute_fiedler_vector()
+        
+        # Verify Fiedler vector has correct length
+        self.assertEqual(len(fiedler_vector), g.num_vertices)
+        
+        # Verify Fiedler vector is normalized (unit length)
+        vector_norm = np.linalg.norm(fiedler_vector)
+        self.assertAlmostEqual(vector_norm, 1.0, places=10)
+        
+        # Verify Fiedler vector matches the second eigenvector from full computation
+        # Note: eigenvectors may differ by sign, so compare absolute values or check collinearity
+        full_fiedler_vector = eigenvectors[:, 1]
+        # Check that vectors are parallel (dot product of normalized vectors should be ±1)
+        dot_product = np.abs(np.dot(fiedler_vector, full_fiedler_vector))
+        self.assertAlmostEqual(dot_product, 1.0, places=8)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -5,6 +5,9 @@ import pickle
 import numpy as np
 import argparse
 import math
+import networkx as nx
+from scipy.sparse.linalg import eigsh
+from scipy.sparse.linalg import eigsh
 
 # PATH TASK
 # <PATH> x_leaf <PAUSE> ... <PAUSE> x_root, x_1, x_2, ... , x_leaf
@@ -242,6 +245,93 @@ class InWeightsPathStar:
         else:
             lines.append(f"    {self.paths_by_leaf}")
         return "\n".join(lines)
+    
+    def compute_laplacian_eigen(self) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Compute all eigenvalues and eigenvectors of the Laplacian matrix of the PathStar graph.
+        
+        The Laplacian matrix is L = D - A, where D is the degree matrix and A is
+        the adjacency matrix.
+        
+        Returns:
+            tuple: (eigenvalues, eigenvectors) where:
+                - eigenvalues: 1D array of shape (n,) sorted in ascending order
+                - eigenvectors: 2D array of shape (n, n) where column i is the 
+                  eigenvector corresponding to eigenvalues[i]
+        """
+        
+        # Build undirected graph from adjacency list
+        G = nx.Graph()
+        G.add_nodes_from(self.vertices)
+        for u, neighbors in self.adj_list.items():
+            for v in neighbors:
+                G.add_edge(u, v)
+        
+        # Get sparse Laplacian matrix, convert to dense for full eigen computation
+        L = nx.laplacian_matrix(G).toarray()
+        eigenvalues, eigenvectors = np.linalg.eigh(L)  # eigh for symmetric matrices
+        
+        # Sort by eigenvalue (eigh returns sorted, but ensure consistency)
+        idx = np.argsort(eigenvalues)
+        return eigenvalues[idx], eigenvectors[:, idx]
+    
+    def compute_fiedler_value(self) -> float:
+        """
+        Compute the Fiedler value (algebraic connectivity) of the PathStar graph.
+        
+        The Fiedler value is the second-smallest eigenvalue of the Laplacian matrix L = D - A.
+        For a connected graph, this value is always positive.
+        
+        Uses scipy.sparse.linalg.eigsh for efficient computation on sparse symmetric matrices.
+        
+        Returns:
+            float: The Fiedler value (second-smallest Laplacian eigenvalue).
+        """
+        
+        # Build undirected graph from adjacency list
+        G = nx.Graph()
+        G.add_nodes_from(self.vertices)
+        for u, neighbors in self.adj_list.items():
+            for v in neighbors:
+                G.add_edge(u, v)
+        
+        # Get sparse Laplacian matrix
+        L = nx.laplacian_matrix(G).astype(float)
+        
+        # Compute only the 2 smallest eigenvalues using eigsh (sparse symmetric)
+        # which='SM' for smallest magnitude eigenvalues
+        eigenvalues, _ = eigsh(L, k=2, which='SM')
+        return float(np.sort(eigenvalues)[1])
+    
+    def compute_fiedler_vector(self) -> np.ndarray:
+        """
+        Compute the Fiedler vector of the PathStar graph.
+        
+        The Fiedler vector is the eigenvector corresponding to the second-smallest 
+        eigenvalue of the Laplacian matrix L = D - A.
+        
+        Uses scipy.sparse.linalg.eigsh for efficient computation on sparse symmetric matrices.
+        
+        Returns:
+            np.ndarray: The Fiedler vector (1D array of shape (n,)).
+        """
+        
+        # Build undirected graph from adjacency list
+        G = nx.Graph()
+        G.add_nodes_from(self.vertices)
+        for u, neighbors in self.adj_list.items():
+            for v in neighbors:
+                G.add_edge(u, v)
+        
+        # Get sparse Laplacian matrix
+        L = nx.laplacian_matrix(G).astype(float)
+        
+        # Compute the 2 smallest eigenvalues and eigenvectors
+        eigenvalues, eigenvectors = eigsh(L, k=2, which='SM')
+        
+        # Sort and return the eigenvector for the second-smallest eigenvalue
+        idx = np.argsort(eigenvalues)
+        return eigenvectors[:, idx[1]]
     
     def _generate_adjacency_list(self):
         """
