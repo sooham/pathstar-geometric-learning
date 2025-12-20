@@ -70,7 +70,7 @@ parameters:
     value: 'None' #'ReduceLROnPlateau'
 
   plateau_factor:
-    value: 0.9
+    value: 0.80
   plateau_patience:
     value: 20
   plateau_threshold:
@@ -79,15 +79,17 @@ parameters:
     value: 0
 
   warmup_frac:
-    value: 0.10
+    value: 0
   lr_decay_frac:
-    value: 1.00
+    value: 1
   min_lr:
     value: 0
   
   # Fixed training parameters
   epochs:
-    value: 50_000  # Shorter for quick testing
+    value: 100_000  # Shorter for quick testing
+  target_val_loss:
+    value: 0.03
   edge_iterations_per_epoch: # 16k edges total for d=1000, l=5
     value: 10
   path_iterations_per_epoch: # 1k paths total
@@ -103,7 +105,7 @@ parameters:
   print_eval_interval:
     value: 800
   vis_interval:
-    value: 800
+    value: 100
   debug_masking:
     value: false
   log_attention_maps:
