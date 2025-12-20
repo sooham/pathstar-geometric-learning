@@ -99,6 +99,8 @@ def get_default_config():
         'edge_iterations_per_epoch': 10,  # Number of iterations on edges per epoch
         'path_iterations_per_epoch': 10,  # Number of iterations on paths per epoch
         'epochs': 1000,
+        # Early termination when val loss falls below this threshold (None = disabled)
+        'target_val_loss': None,
         # Evaluation batch sizes (kept separate from training batch_size)
         'eval_batch_size': 512,
         'edge_eval_batch_size': 512,
@@ -2599,6 +2601,12 @@ def train(config=None):
                 # Update ReduceLROnPlateau scheduler if being used
                 if lr_scheduler_obj is not None:
                     lr_scheduler_obj.step(val_loss, iter_num)
+                
+                # Early termination if validation loss falls below target threshold
+                if default_config['target_val_loss'] is not None and val_loss < default_config['target_val_loss']:
+                    console.print(f"[green]Target validation loss achieved! val_loss={val_loss:.6f} < target={default_config['target_val_loss']:.6f}[/green]")
+                    console.print(f"[green]Terminating training early at iter {iter_num}[/green]")
+                    break
             
             if iter_num == 0 and default_config['eval_only']:
                 break
