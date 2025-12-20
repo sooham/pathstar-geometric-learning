@@ -1983,7 +1983,7 @@ def train(config=None):
         wandb.init(
             project=default_config['wandb_project'],
             name=default_config['wandb_run_name'],
-            config=default_config
+            config={k: v for k, v in default_config.items() if k != 'console'}
         )
     
     # Init tracking variables
