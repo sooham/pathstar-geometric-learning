@@ -28,6 +28,7 @@ import matplotlib.pyplot as plt
 
 from model import GPTConfig, GPT
 from pathstar import InWeightsPathStar
+from learning_rate_scheduler import get_lr, initialize_lr_scheduler
 
 # Rich imports
 from rich.console import Console, Group
@@ -121,10 +122,17 @@ def get_default_config():
         'grad_clip': 1.0,
         
         # Learning rate schedule
-        'decay_lr': True,
-        'warmup_frac': 0.10,
-        'lr_decay_frac': 0.99,
-        'min_lr': 6e-5,
+        # 'lr_scheduler': None, 'CosineLR', or 'ReduceLROnPlateau'
+        # None = constant learning rate (no decay)
+        'lr_scheduler': 'CosineLR',
+        'warmup_frac': 0.10,  # Fraction of max_iters for warmup (CosineLR and ReduceLROnPlateau)
+        'lr_decay_frac': 0.99,  # Fraction of max_iters for decay (CosineLR only)
+        'min_lr': 6e-5,  # Minimum learning rate
+        # ReduceLROnPlateau parameters (only used when lr_scheduler='ReduceLROnPlateau')
+        'plateau_factor': 0.5,  # Factor to reduce LR by (new_lr = lr * factor)
+        'plateau_patience': 10,  # Number of eval intervals with no improvement before reducing LR
+        'plateau_threshold': 1e-4,  # Threshold for measuring improvement (relative)
+        'plateau_cooldown': 0,  # Number of eval intervals to wait after reducing LR before resuming normal operation
         
         # System
         'device': 'auto',  # 'cuda', 'mps', 'cpu', or 'auto'
@@ -134,7 +142,10 @@ def get_default_config():
         'experiment_name': None,
         # seed
         'seed': 1337,
-        'predict_direction_for_edge_task': True
+        'predict_direction_for_edge_task': True,
+
+        # console info
+        'console': console
     }
 
 # TODO: check this 
@@ -739,16 +750,6 @@ def evaluate_samples(device, ctx, model, meta, data, data_size, split_name, num_
     
     return avg_accuracy
 
-def get_lr(it, warmup_iters, lr_decay_iters, default_config):
-    """Learning rate decay scheduler (cosine with warmup)"""
-    if it < warmup_iters:
-        return default_config['learning_rate'] * (it + 1) / (warmup_iters + 1)
-    if it > lr_decay_iters:
-        return default_config['min_lr']
-    decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-    return default_config['min_lr'] + coeff * (default_config['learning_rate'] - default_config['min_lr'])
-
 # GOOD
 def clear_gpu_memory():
     if torch.cuda.is_available():
@@ -1343,7 +1344,7 @@ def analyze_embedding_geometry(model, meta, paths_data_np, val_data_np, iter_num
 
 
 # GOOD
-def evaluate(estimate_metrics, config, meta, iter_num, lr, ctx, device, model, val_data_np, paths_data_np, edges_data_np, print_samples=False, eval_layout_component=None, metrics_layout_component=None, tokens_per_sec=None, batch_size=None, train_dataset_size=None, eval_dataset_size=None):
+def evaluate(estimate_metrics, config, meta, iter_num, lr, ctx, device, model, val_data_np, paths_data_np, edges_data_np, print_samples=False, eval_layout_component=None, metrics_layout_component=None, tokens_per_sec=None, batch_size=None, train_dataset_size=None, eval_dataset_size=None, lr_scheduler_obj=None):
     # Compute metrics for both splits
     val_metrics = estimate_metrics('val', print_samples)
     train_metrics = estimate_metrics('train', False) # Don't print train samples here
@@ -1419,8 +1420,6 @@ def evaluate(estimate_metrics, config, meta, iter_num, lr, ctx, device, model, v
         
         metrics_layout_component.update(Panel(Align.center(combined), title="Validation Metrics", border_style="magenta"))
 
-    # # PRINTING
-    # console.print(f"step {iter_num}: epoch {current_epoch:.2f}, val loss {losses['val']:.4f}, train loss {losses['train']:.4f}")
     
     if 'val_per_token' in losses:
         # console.print("  Val per-token losses:")
@@ -1537,8 +1536,14 @@ def evaluate(estimate_metrics, config, meta, iter_num, lr, ctx, device, model, v
             'best_val_loss': meta['best_val_loss'],
             'config': config,
         }
+        # Save LR scheduler state if using ReduceLROnPlateau
+        if lr_scheduler_obj is not None:
+            checkpoint_data['lr_scheduler'] = lr_scheduler_obj.state_dict()
         console.print(f"saving checkpoint to {config['out_dir']}/{meta['checkpoint_filename']}")
         torch.save(checkpoint_data, os.path.join(config['out_dir'], meta['checkpoint_filename']))
+    
+    # Return validation loss for LR schedulers like ReduceLROnPlateau
+    return losses['val']
 
 def determine_dataset_in_device_size(device, device_type, paths_data, edges_data, val_data, limit=0.1):
     # Calculate dataset memory requirements BEFORE batch size calculation
@@ -1931,6 +1936,14 @@ def train(config=None):
     meta['warmup_iters'] = warmup_iters
     meta['lr_decay_iters'] = lr_decay_iters
     
+    # Initialize LR scheduler
+    lr_scheduler_obj = initialize_lr_scheduler(
+        default_config, 
+        warmup_iters, 
+        lr_decay_iters, 
+        console=default_config.get('console')
+    )
+    
     # Skip theoretical loss calculation for separate datasets (not applicable)
     # theoretical_token_1_loss = get_theoretical_loss(meta)
     
@@ -1946,6 +1959,10 @@ def train(config=None):
     )
     if default_config['init_from'] == 'resume':
         optimizer.load_state_dict(checkpoint['optimizer'])
+        # Load LR scheduler state if available and using ReduceLROnPlateau
+        if lr_scheduler_obj is not None and 'lr_scheduler' in checkpoint:
+            lr_scheduler_obj.load_state_dict(checkpoint['lr_scheduler'])
+            console.print(f"[cyan]Loaded LR scheduler state (current_lr={lr_scheduler_obj.current_lr:.2e})[/cyan]")
     checkpoint = None
 
     meta['optimizer'] = optimizer
@@ -2534,8 +2551,8 @@ def train(config=None):
 
     with live_context:
         while True:
-            # Set learning rate
-            lr = get_lr(iter_num, warmup_iters, lr_decay_iters, default_config) if default_config['decay_lr'] else default_config['learning_rate']
+            # Set learning rate based on scheduler
+            lr = get_lr(iter_num, warmup_iters, lr_decay_iters, default_config, lr_scheduler_obj=lr_scheduler_obj)
 
             for param_group in optimizer.param_groups:
                 param_group['lr'] = lr
@@ -2553,7 +2570,7 @@ def train(config=None):
                          current_tokens_per_sec = (train_batch_size * steps * meta['block_size']) / dt
                 
                 train_total_dataset_size = combined_size if default_config['interleave_dataset'] else (paths_size + edges_size)
-                evaluate(
+                val_loss = evaluate(
                     estimate_metrics,
                     default_config,
                     meta,
@@ -2572,7 +2589,12 @@ def train(config=None):
                     batch_size=train_batch_size,
                     train_dataset_size=train_total_dataset_size,
                     eval_dataset_size=VAL_DATASET_SIZE,
+                    lr_scheduler_obj=lr_scheduler_obj,
                 )
+                
+                # Update ReduceLROnPlateau scheduler if being used
+                if lr_scheduler_obj is not None:
+                    lr_scheduler_obj.step(val_loss, iter_num)
             
             if iter_num == 0 and default_config['eval_only']:
                 break
