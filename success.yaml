@@ -32,7 +32,7 @@ parameters:
     value: true
   predict_direction_for_edge_task:
     values: [false]
-  use_directional_tokens_in_path:
+  use_task_tokens_in_path:
     values: [false] # for now test this
   
   # Model architecture parameters - sweep these
@@ -69,7 +69,7 @@ parameters:
   
   # Learning rate schedule
   lr_scheduler:
-    value: 'ReduceLROnPlateau'
+    value: 'None' #'ReduceLROnPlateau'
 
   plateau_factor:
     value: 0.80

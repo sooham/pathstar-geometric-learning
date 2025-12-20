@@ -17,6 +17,7 @@ import wandb
 import os
 import time
 import math
+import subprocess
 from contextlib import nullcontext
 
 import numpy as np
@@ -769,16 +770,32 @@ def clear_gpu_memory():
         except Exception as e:
             print(f"Warning during GPU memory clearing: {e}")
 
+def get_git_commit_id():
+    """Get the short git commit ID, or 'unknown' if not in a git repo."""
+    try:
+        result = subprocess.run(
+            ['git', 'rev-parse', '--short', 'HEAD'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return 'unknown'
+
 # GOOD
 def set_wandb_name(config):
     if config is not None:
         # Set custom run name for sweep runs
         if wandb.run is not None:
             utc_time = datetime.utcnow().strftime('%Y%m%dT%H%M%S')
+            commit_id = get_git_commit_id()
             dir_label = "Udir" if config["use_undirected"] else "Dir"
             tt_label = "Tt" if config['use_task_tokens'] else ''
             dt_label = 'Dt' if config['use_directional_tokens'] else ''
-            ptgt_label = 'Pgt' if config.get('use_directional_tokens_in_path', False) else ''
+            ptgt_label = 'Pgt' if config.get('use_task_tokens_in_path', False) else ''
             ped_or_pet_label = 'Pd' if config['predict_direction_for_edge_task'] else 'Pe'
             wt_label = 'Wt' if config['weight_tying'] else ''
             wd_label = f"Wd{config['weight_decay']}" if config['weight_decay'] > 0 else ""
@@ -795,6 +812,7 @@ def set_wandb_name(config):
 
             custom_name = (
                 f"{utc_time}_"
+                f"{commit_id}_"
                 "DSET_"
                 f"G{config['graph_d']}"
                 f"L{config['graph_l']}"
