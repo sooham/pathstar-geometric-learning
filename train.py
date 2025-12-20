@@ -117,6 +117,7 @@ def get_default_config():
         'embd_dropout': 0.0,
         'holdout_percentage': 0.0, # Percentage of paths to hold out for validation
         'interleave_dataset': False, # If True, combines edges and paths into a single training dataset
+        'balance_interleaved_datasets': True, # If True, upsample smaller dataset to match larger when interleaving
         'bias': False,
         
         # Optimization
@@ -1852,25 +1853,26 @@ def train(config=None):
     combined_data = None
     combined_size = 0
     if default_config['interleave_dataset']:
-        # Balance datasets by upsampling the smaller one to match the larger one
-        max_size = max(paths_size, edges_size)
-        
-        if paths_size < max_size:
-            print(f"Balancing: Upsampling paths from {paths_size} to {max_size}")
-            indices = np.random.choice(paths_size, max_size, replace=True)
+        # Optionally balance datasets by upsampling paths to match edges
+        # Note: edges_size >= paths_size always holds for PathStar graphs
+        # Uses deterministic duplication (tiling) rather than random sampling to avoid noise
+        if default_config['balance_interleaved_datasets'] and paths_size < edges_size:
+            # Tile the paths dataset: repeat full copies then take remainder from start
+            num_full_copies = edges_size // paths_size
+            remainder = edges_size % paths_size
+            print(f"Balancing: Upsampling paths from {paths_size} to {edges_size} ({num_full_copies} full copies + {remainder} remainder)")
+            indices = np.concatenate([
+                np.tile(np.arange(paths_size), num_full_copies),
+                np.arange(remainder)
+            ])
             paths_data_balanced = paths_data[indices]
         else:
+            if not default_config['balance_interleaved_datasets']:
+                print(f"Skipping dataset balancing (paths: {paths_size}, edges: {edges_size})")
             paths_data_balanced = paths_data
-            
-        if edges_size < max_size:
-            print(f"Balancing: Upsampling edges from {edges_size} to {max_size}")
-            indices = np.random.choice(edges_size, max_size, replace=True)
-            edges_data_balanced = edges_data[indices]
-        else:
-            edges_data_balanced = edges_data
 
         # Concatenate paths and edges
-        combined_data = np.concatenate((paths_data_balanced, edges_data_balanced), axis=0)
+        combined_data = np.concatenate((paths_data_balanced, edges_data), axis=0)
         combined_size = combined_data.shape[0]
         # Shuffle the combined data initially
         np.random.shuffle(combined_data)
