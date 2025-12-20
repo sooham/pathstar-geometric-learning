@@ -1530,13 +1530,15 @@ def evaluate(estimate_metrics, config, meta, iter_num, lr, ctx, device, model, v
         save_checkpoint = True
     
     if save_checkpoint and iter_num > 0:
+        # Exclude non-serializable objects (like console) from saved config
+        serializable_config = {k: v for k, v in config.items() if k != 'console'}
         checkpoint_data = {
             'model': model.state_dict(),
             'optimizer': meta['optimizer'].state_dict(),
             'model_args': meta['model_args'],
             'iter_num': iter_num,
             'best_val_loss': meta['best_val_loss'],
-            'config': config,
+            'config': serializable_config,
         }
         # Save LR scheduler state if using ReduceLROnPlateau
         if lr_scheduler_obj is not None:
