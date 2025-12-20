@@ -775,6 +775,7 @@ def set_wandb_name(config):
             ptgt_label = 'ptgt_' if config.get('use_task_tokens_in_path', False) else ''
             ped_or_pet_label = 'ped_' if config['predict_direction_for_edge_task'] else 'pet_'
             wt_label = 'wt_' if config['weight_tying'] else ''
+            wd_label = f"wdecay{config['weight_decay']}_" if config['weight_decay'] > 0 else ""
             # Include both dropout values if they differ, otherwise just one
             if config['dropout'] == config['embd_dropout']:
                 dropout_label = f"D{config['dropout']}_"
@@ -789,6 +790,7 @@ def set_wandb_name(config):
                 f"E{config['n_embd']}_"
                 f"H{config['n_head']}_"
                 f"{dropout_label}"
+                f"{wd_label}"
                 f"p{config['num_pause_tokens']}_"
                 f"{dir_label}"
                 f"{tt_label}"
