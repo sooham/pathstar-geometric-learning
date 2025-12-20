@@ -71,6 +71,7 @@ def get_default_config():
         'attention_map_interval': 500,  # How often to log attention maps (iterations)
         'attention_map_samples': 3,  # Number of samples to visualize
         'analyze_embedding_geometry': False,  # If True, compute and log embedding geometry metrics during eval
+        'show_edge_memorization_metrics': False, # If True, show and log % of edges memorized by model
         # Debugging
         'debug_masking': False,          # If True, show target masks applied to Y
         'debug_masking_samples': 2,      # How many batch rows to show
@@ -102,8 +103,8 @@ def get_default_config():
         # Early termination when val loss falls below this threshold (None = disabled)
         'target_val_loss': None,
         # Evaluation batch sizes (kept separate from training batch_size)
-        'eval_batch_size': 512,
-        'edge_eval_batch_size': 512,
+        'eval_batch_size': 2000,
+        'edge_eval_batch_size': 2000,
         
         # Model architecture
         'n_layer': 3,
@@ -150,7 +151,6 @@ def get_default_config():
         'console': console
     }
 
-# TODO: check this 
 @torch.compile
 def compute_per_token_loss_with_teacher_forcing(meta, logits, input, targets, token_positions_to_record, task_type='path'):
     """
@@ -670,7 +670,7 @@ def compute_per_token_accuracy_autoregressive(ctx, model, meta, val_data_batch, 
     return per_token_accuracies, generated_text_output
 
 # DONE 
-def evaluate_samples(device, ctx, model, meta, data, data_size, split_name, num_samples=5, eval_batch_size=512):
+def generate_samples_autoregressive(device, ctx, model, meta, data, data_size, split_name, num_samples=5, eval_batch_size=512):
     """
     Evaluate autoregressive generation on samples from a dataset.
     Assumes data is path-only (no filtering needed).
@@ -1365,22 +1365,24 @@ def evaluate(estimate_metrics, config, meta, iter_num, lr, ctx, device, model, v
     # Use fewer samples during sweeps for faster evaluation
     is_sweep_mode = wandb.run is not None and hasattr(wandb.run, 'sweep_id') and wandb.run.sweep_id is not None
     autoregressive_eval_samples = 20 if is_sweep_mode else 100
-    val_avg_accuracy = evaluate_samples(
-        device, ctx, model, meta, val_data_np, VAL_DATASET_SIZE, 'val',
-        num_samples=min(VAL_DATASET_SIZE, autoregressive_eval_samples),
-        eval_batch_size=int(config.get('eval_batch_size', 512)),
-    )
-    train_avg_accuracy = evaluate_samples(
-        device, ctx, model, meta, paths_data_np, PATHS_DATASET_SIZE, 'train',
-        num_samples=min(PATHS_DATASET_SIZE, autoregressive_eval_samples),
-        eval_batch_size=int(config.get('eval_batch_size', 512)),
-    )
+    # val_avg_accuracy = generate_samples_autoregressive(
+    #     device, ctx, model, meta, val_data_np, VAL_DATASET_SIZE, 'val',
+    #     num_samples=min(VAL_DATASET_SIZE, autoregressive_eval_samples),
+    #     eval_batch_size=int(config.get('eval_batch_size', 512)),
+    # )
+    # train_avg_accuracy = generate_samples_autoregressive(
+    #     device, ctx, model, meta, paths_data_np, PATHS_DATASET_SIZE, 'train',
+    #     num_samples=min(PATHS_DATASET_SIZE, autoregressive_eval_samples),
+    #     eval_batch_size=int(config.get('eval_batch_size', 512)),
+    # )
     
     # Evaluate edge memorization
-    edge_memorization_pct = evaluate_edge_memorization(
-        ctx, model, meta, edges_data_np, device,
-        batch_size=int(config.get('edge_eval_batch_size', 512)),
-    )
+    edge_memorization_pct = None
+    if config['show_edge_memorization_metrics']:
+        edge_memorization_pct = evaluate_edge_memorization(
+            ctx, model, meta, edges_data_np, device,
+            batch_size=int(config.get('edge_eval_batch_size', 512)),
+        )
     
     # Analyze embedding geometry when printing samples (every print_eval_interval)
     embedding_geometry_results = None
@@ -1459,10 +1461,12 @@ def evaluate(estimate_metrics, config, meta, iter_num, lr, ctx, device, model, v
             "val/loss/overall": losses['val'],
             "train/loss/eval": losses['train'],
             "lr": lr,
-            "gen/val_paths_avg_accuracy": val_avg_accuracy,
-            "gen/train_paths_avg_accuracy": train_avg_accuracy,
-            "edge_memorization_pct": edge_memorization_pct
+            #"gen/val_paths_avg_accuracy": val_avg_accuracy,
+            # "gen/train_paths_avg_accuracy": train_avg_accuracy,
         }
+
+        if edge_memorization_pct != None:
+            log_dict["edge_memorization_pct"] = edge_memorization_pct
         
         if 'val_per_token' in losses:
             for token_pos in range(1, graph_length + 1):
@@ -1950,8 +1954,6 @@ def train(config=None):
         console=default_config.get('console')
     )
     
-    # Skip theoretical loss calculation for separate datasets (not applicable)
-    # theoretical_token_1_loss = get_theoretical_loss(meta)
     
     # Initialize GradScaler
     scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
@@ -2435,7 +2437,7 @@ def train(config=None):
     
     @torch.no_grad()
     def estimate_metrics(split, print_samples=False):
-        """Estimate loss and metrics on validation or training split"""
+        """Estimate loss and metrics on validation or training split. Total and per token"""
         out = {}
         model.eval()
         
@@ -2550,7 +2552,7 @@ def train(config=None):
             layout["training"].update(Panel("Waiting for first training batch...", title="Training Slice (10 samples)", border_style="green"))
         if show_debug_masking:
             layout["mask"].update(Panel("Waiting for first mask debug...", title="Mask Debug", border_style="yellow"))
-        live_context = Live(layout, console=console, refresh_per_second=4)
+        live_context = Live(layout, console=console, refresh_per_second=0.1)
     else:
         layout = None
         live_context = nullcontext()
