@@ -111,6 +111,9 @@ def get_default_config():
         'n_head': 8,
         'n_embd': 96,
         'dropout': 0.0,  # Dropout for attention, MLP, and residual connections
+        'use_layernorm': True,
+        'use_mlp': True,
+        'activation': 'GELU',
         'embd_dropout': 0.0,
         'holdout_percentage': 0.0, # Percentage of paths to hold out for validation
         'interleave_dataset': False, # If True, combines edges and paths into a single training dataset
@@ -770,36 +773,48 @@ def set_wandb_name(config):
     if config is not None:
         # Set custom run name for sweep runs
         if wandb.run is not None:
-            utc_time = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
-            dir_label = "undir_" if config["use_undirected"] else "dir_"
-            tt_label = "tt_" if config['use_task_tokens'] else 'nott_'
-            dt_label = 'dt_' if config['use_directional_tokens'] else 'nodt_'
-            ptgt_label = 'ptgt_' if config.get('use_directional_tokens_in_path', False) else ''
-            ped_or_pet_label = 'ped_' if config['predict_direction_for_edge_task'] else 'pet_'
-            wt_label = 'wt_' if config['weight_tying'] else ''
-            wd_label = f"wdecay{config['weight_decay']}_" if config['weight_decay'] > 0 else ""
+            utc_time = datetime.utcnow().strftime('%Y%m%dT%H%M%S')
+            dir_label = "Udir" if config["use_undirected"] else "Dir"
+            tt_label = "Tt" if config['use_task_tokens'] else ''
+            dt_label = 'Dt' if config['use_directional_tokens'] else ''
+            ptgt_label = 'Pgt' if config.get('use_directional_tokens_in_path', False) else ''
+            ped_or_pet_label = 'Pd' if config['predict_direction_for_edge_task'] else 'Pe'
+            wt_label = 'Wt' if config['weight_tying'] else ''
+            wd_label = f"Wd{config['weight_decay']}" if config['weight_decay'] > 0 else ""
+
+            model_bias_label = "Bias" if config["bias"] else ""
+            model_ln_label = "Ln" if config["use_layernorm"] else ""
+            model_mlp_label = "Mlp" if config["use_mlp"] else ""
+            activation = "A" + ((config["activation"] ) if config["activation"] else "").lower()
             # Include both dropout values if they differ, otherwise just one
             if config['dropout'] == config['embd_dropout']:
-                dropout_label = f"D{config['dropout']}_"
+                dropout_label = f"D{config['dropout']}"
             else:
-                dropout_label = f"D{config['dropout']}_ED{config['embd_dropout']}_"
+                dropout_label = f"D{config['dropout']}ED{config['embd_dropout']}"
+
             custom_name = (
                 f"{utc_time}_"
-                f"G{config['graph_d']},"
-                f"{config['graph_l']}_"
+                "DSET_"
+                f"G{config['graph_d']}"
+                f"L{config['graph_l']}"
+                f"P{config['num_pause_tokens']}"
                 f"{ped_or_pet_label}"
-                f"L{config['n_layer']}_"
-                f"E{config['n_embd']}_"
-                f"H{config['n_head']}_"
-                f"{dropout_label}"
-                f"{wd_label}"
-                f"p{config['num_pause_tokens']}_"
                 f"{dir_label}"
                 f"{tt_label}"
                 f"{dt_label}"
                 f"{ptgt_label}"
+                "_"
+                f"L{config['n_layer']}"
+                f"E{config['n_embd']}"
+                f"H{config['n_head']}"
+                f"{model_mlp_label}"
+                f"{activation}"
+                f"{model_ln_label}"
+                f"{model_bias_label}"
+                f"{dropout_label}"
+                f"{wd_label}"
                 f"{wt_label}"
-                f"{config['epochs']}"
+                f"Ep{config['epochs']}"
             )
             wandb.run.name = custom_name
             print(f"Set sweep run name: {custom_name}")
@@ -2692,11 +2707,6 @@ def train(config=None):
             if iter_num % default_config['log_interval'] == 0:
                 lossf = loss.item() * steps
                 tokens_per_sec = (X.numel() * steps) / dt
-                if default_config['interleave_dataset']:
-                    phase_label = "[COMBINED]"
-                else:
-                    phase_label = "[EDGE]" if current_phase == 'edge' else "[PATH]"
-                # console.print(f"iter {iter_num}: {phase_label} loss {lossf:.4f}, time {dt*1000:.2f}ms, tok/sec {tokens_per_sec:.2f}")
                 if default_config['wandb_log']:
                     wandb.log({
                         'train/loss/overall': lossf,
