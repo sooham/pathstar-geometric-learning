@@ -103,8 +103,8 @@ def get_default_config():
         # Early termination when val loss falls below this threshold (None = disabled)
         'target_val_loss': None,
         # Evaluation batch sizes (kept separate from training batch_size)
-        'eval_batch_size': 2000,
-        'edge_eval_batch_size': 2000,
+        'eval_batch_size': 5000,
+        'edge_eval_batch_size': 5000,
         
         # Model architecture
         'n_layer': 3,
