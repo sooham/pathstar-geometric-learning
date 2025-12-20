@@ -88,7 +88,7 @@ def get_default_config():
         'use_task_tokens': False,
         # If True, PATH task sequences interleave GT tokens between edges:
         #   [PATH] leaf (PAUSE)xN root GT n2 GT n3 ... GT leaf
-        'use_directional_tokens_in_path': False,
+        'use_task_tokens_in_path': False,
         
         # Training parameters
         'gradient_accumulation_steps': 1,
@@ -1103,7 +1103,7 @@ def analyze_embedding_geometry(model, meta, paths_data_np, val_data_np, iter_num
     num_special_tokens = len(special_tokens)
     use_task_tokens = meta.get('use_task_tokens', True)
     num_pause_tokens = meta.get('num_pause_tokens', 1)
-    use_directional_tokens_in_path = meta.get('use_directional_tokens_in_path', False)
+    use_task_tokens_in_path = meta.get('use_task_tokens_in_path', False)
     
     # Calculate sequence dimensions from meta
     seq_len = meta['block_size'] + 1  # Full sequence length
@@ -1779,7 +1779,7 @@ def train(config=None):
         use_directional_tokens=default_config['use_directional_tokens'],
         use_task_tokens=default_config['use_task_tokens'],
         predict_direction_for_edge_task=default_config['predict_direction_for_edge_task'],
-        use_directional_tokens_in_path=default_config.get('use_directional_tokens_in_path', False),
+        use_task_tokens_in_path=default_config.get('use_task_tokens_in_path', False),
     )
     
     meta, paths_data, edges_data, val_data = gen.load_dataset()

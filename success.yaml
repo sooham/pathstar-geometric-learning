@@ -69,12 +69,12 @@ parameters:
   
   # Learning rate schedule
   lr_scheduler:
-    value: 'None' #'ReduceLROnPlateau'
+    value: 'ReduceLROnPlateau'
 
   plateau_factor:
     value: 0.80
   plateau_patience:
-    value: 20
+    value: 10
   plateau_threshold:
     value: 1e-4
   plateau_cooldown:
