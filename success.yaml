@@ -44,7 +44,7 @@ parameters:
     values: [16,32]
   dropout:
     values: [0]
-  dropout_embd:
+  embed_dropout:
     values: [0]
   bias:
     value: true

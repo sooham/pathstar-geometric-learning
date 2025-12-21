@@ -10,8 +10,6 @@ parameters:
     values: [50, 100, 250, 500]
   graph_l:
     values: [5, 7, 9, 11]
-  graph_vocab_size:
-    value: 2000
   graph_holdout_percentage:
     values: [0.1, 0.2, 0.3]
   num_pause_tokens:
@@ -30,7 +28,7 @@ parameters:
     values: [64, 96, 128, 192]
   dropout:
     values: [0.0, 0.1, 0.2]
-  dropout_embd:
+  embd_dropout:
     value: 0
   bias:
     values: [false, true]
