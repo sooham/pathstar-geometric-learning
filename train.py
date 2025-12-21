@@ -2638,6 +2638,12 @@ def train(config=None):
                 # Update ReduceLROnPlateau scheduler if being used
                 if lr_scheduler_obj is not None:
                     lr_scheduler_obj.step(val_loss, iter_num)
+                    
+                    # Early termination if LR has dropped below threshold (LR exhausted)
+                    if lr_scheduler_obj.is_lr_exhausted():
+                        console.print(f"[yellow]Learning rate exhausted! LR={lr_scheduler_obj.current_lr:.2e} < 1e-8[/yellow]")
+                        console.print(f"[yellow]Terminating training early at iter {iter_num}[/yellow]")
+                        break
                 
                 # Early termination if validation loss falls below target threshold
                 if default_config['target_val_loss'] is not None and val_loss < default_config['target_val_loss']:

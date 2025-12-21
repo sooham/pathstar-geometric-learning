@@ -148,6 +148,18 @@ class ReduceLROnPlateauScheduler:
         self.num_bad_evals = state_dict['num_bad_evals']
         self.cooldown_counter = state_dict['cooldown_counter']
         self.last_update_iter = state_dict['last_update_iter']
+    
+    def is_lr_exhausted(self, threshold=1e-8):
+        """
+        Check if learning rate has dropped below a threshold.
+        
+        Args:
+            threshold: LR threshold below which training should stop (default: 1e-8)
+        
+        Returns:
+            True if current_lr < threshold, False otherwise
+        """
+        return self.current_lr < threshold
 
 
 def get_lr(it, warmup_iters, lr_decay_iters, config, lr_scheduler_obj=None):
