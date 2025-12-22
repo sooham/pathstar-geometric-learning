@@ -672,7 +672,11 @@ def compute_per_token_accuracy_autoregressive(ctx, model, meta, val_data_batch, 
         else:
             per_token_accuracies[token_pos] = float('nan')
     
-    return per_token_accuracies, generated_text_output
+    # Compute full path exact match accuracy (entire generated path matches ground truth)
+    full_path_matches = np.all(generated_tokens_batch == ground_truths_array, axis=1)
+    full_path_accuracy = np.mean(full_path_matches)
+    
+    return per_token_accuracies, generated_text_output, full_path_accuracy
 
 # DONE 
 def generate_samples_autoregressive(device, ctx, model, meta, data, data_size, split_name, num_samples=5, eval_batch_size=512):
@@ -1516,6 +1520,10 @@ def evaluate(estimate_metrics, config, meta, iter_num, lr, ctx, device, model, v
                     log_dict["val/accuracy/token_final"] = losses['val_per_token_accuracy'][token_pos]
                 else:
                     log_dict[f"val/accuracy/token_{token_pos}"] = losses['val_per_token_accuracy'][token_pos]
+        
+        # Full path exact match accuracy (no teacher forcing)
+        if 'val_full_path_accuracy' in losses:
+            log_dict["val/accuracy/full_path"] = losses['val_full_path_accuracy']
         
         # Add embedding geometry metrics if available
         if embedding_geometry_results is not None:
@@ -2545,10 +2553,11 @@ def train(config=None):
         # Compute per-token accuracy (autoregressive)
         # Use small number of samples for speed
         num_samples_for_accuracy = min(100, data_size)
-        per_token_accuracy, generated_text = compute_per_token_accuracy_autoregressive(
+        per_token_accuracy, generated_text, full_path_accuracy = compute_per_token_accuracy_autoregressive(
             ctx, model, meta, data_source, num_samples_for_accuracy, device, print_samples
         )
         out[f'{split}_per_token_accuracy'] = per_token_accuracy
+        out[f'{split}_full_path_accuracy'] = full_path_accuracy
         
         if print_samples and split == 'val':
             out['generated_text'] = generated_text
