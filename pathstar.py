@@ -8,6 +8,7 @@ import math
 import networkx as nx
 from scipy.sparse.linalg import eigsh
 from scipy.sparse.linalg import eigsh
+from filelock import FileLock
 
 # PATH TASK
 # <PATH> x_leaf <PAUSE> ... <PAUSE> x_root, x_1, x_2, ... , x_leaf
@@ -879,6 +880,9 @@ class InWeightsPathStar:
                                    use_task_tokens=True, predict_direction_for_edge_task=True, use_task_tokens_in_path=False):
         """
         Generate the dataset using InWeightsPathStar if it doesn't exist or parameters don't match.
+        
+        Uses file locking to prevent race conditions when multiple GPU processes
+        call this method simultaneously.
         """
         # Validate vocab_size
         if self.randomize_vocab_size != 'auto' and self.randomize_vocab_size < self.num_vertices:
@@ -896,33 +900,41 @@ class InWeightsPathStar:
             use_task_tokens, predict_direction_for_edge_task, use_task_tokens_in_path
         )
         
-        # Check if dataset exists and parameters match
-        if self._check_dataset_exists():
-            print(f"Dataset '{dataset_name}' exists with matching parameters. Using existing dataset.")
-            return dataset_name
+        # Ensure data directory exists for lock file
+        os.makedirs('data', exist_ok=True)
         
-        # Dataset doesn't exist or needs regeneration
-        print(f"\n{'='*80}")
-        print(f"Generating dataset: {dataset_name}")
-        print(f"{'='*80}\n")
+        # Use file lock to prevent race condition when multiple GPUs try to generate simultaneously
+        lock_path = os.path.join('data', f'{dataset_name}.lock')
+        lock = FileLock(lock_path, timeout=3600)  # 1 hour timeout for large datasets
         
-        # Create InWeightsPathStar generator
-        generator = self
-        
-        # Generate and save dataset
-        output_dir = generator.prepare(
-            num_pause_tokens=num_pause_tokens,
-            output_dir='./data',
-            use_undirected=use_undirected,
-            use_directional_tokens=use_directional_tokens,
-            use_task_tokens=use_task_tokens,
-            predict_direction_for_edge_task=predict_direction_for_edge_task,
-            use_task_tokens_in_path=use_task_tokens_in_path,
-        )
-        
-        print(f"\n{'='*80}")
-        print(f"Dataset generation complete: {output_dir}")
-        print(f"{'='*80}\n")
+        with lock:
+            # Re-check if dataset exists AFTER acquiring lock (another process may have created it)
+            if self._check_dataset_exists():
+                print(f"Dataset '{dataset_name}' exists with matching parameters. Using existing dataset.")
+                return dataset_name
+            
+            # Dataset doesn't exist or needs regeneration
+            print(f"\n{'='*80}")
+            print(f"Generating dataset: {dataset_name}")
+            print(f"{'='*80}\n")
+            
+            # Create InWeightsPathStar generator
+            generator = self
+            
+            # Generate and save dataset
+            output_dir = generator.prepare(
+                num_pause_tokens=num_pause_tokens,
+                output_dir='./data',
+                use_undirected=use_undirected,
+                use_directional_tokens=use_directional_tokens,
+                use_task_tokens=use_task_tokens,
+                predict_direction_for_edge_task=predict_direction_for_edge_task,
+                use_task_tokens_in_path=use_task_tokens_in_path,
+            )
+            
+            print(f"\n{'='*80}")
+            print(f"Dataset generation complete: {output_dir}")
+            print(f"{'='*80}\n")
         
         return dataset_name
 
