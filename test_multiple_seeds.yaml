@@ -26,8 +26,6 @@ parameters:
     values: [true]
   balance_interleaved_datasets:
     values: [true]
-  use_cot_for_pause:
-    values: [false]
   weight_tying:
     values: [true] # weight tying requires that the input to the unembedding matrix match the embedding of the output, so x + W_0 (attn from v) needs to be close.
   interleave_dataset:
