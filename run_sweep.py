@@ -35,10 +35,128 @@ import os
 import signal
 import sys
 import torch
-from train import sweep_train
+from itertools import product
+from train import train
 
 # Flag to track if we're shutting down
 _shutting_down = False
+
+# Parameters that can be passed as dicts and need unpacking
+DICT_UNPACK_PARAMS = {'model_config', 'training_config', 'dataset_config'}
+
+
+def expand_partial_cross_products(sweep_config):
+    """
+    Expand partial cross products in dict-valued sweep parameters.
+    
+    If a dict in model_config.values contains lists, expand them into
+    the cross product of all combinations.
+    
+    Example input:
+        model_config:
+          values:
+            - n_layer: 5
+              bias: [true, false]
+              use_mlp: [true, false]
+    
+    Expands to:
+        model_config:
+          values:
+            - {n_layer: 5, bias: true, use_mlp: true}
+            - {n_layer: 5, bias: true, use_mlp: false}
+            - {n_layer: 5, bias: false, use_mlp: true}
+            - {n_layer: 5, bias: false, use_mlp: false}
+    
+    Returns:
+        Modified sweep_config with expanded values
+    """
+    if 'parameters' not in sweep_config:
+        return sweep_config
+    
+    for param_name in DICT_UNPACK_PARAMS:
+        if param_name not in sweep_config['parameters']:
+            continue
+        
+        param_config = sweep_config['parameters'][param_name]
+        if 'values' not in param_config:
+            continue
+        
+        expanded_values = []
+        for config_dict in param_config['values']:
+            if not isinstance(config_dict, dict):
+                expanded_values.append(config_dict)
+                continue
+            
+            # Find keys with list values (need expansion)
+            list_keys = []
+            list_values = []
+            scalar_items = {}
+            
+            for k, v in config_dict.items():
+                if isinstance(v, list):
+                    list_keys.append(k)
+                    list_values.append(v)
+                else:
+                    scalar_items[k] = v
+            
+            if not list_keys:
+                # No lists to expand
+                expanded_values.append(config_dict)
+            else:
+                # Generate cross product of all list values
+                for combo in product(*list_values):
+                    new_config = scalar_items.copy()
+                    for key, val in zip(list_keys, combo):
+                        new_config[key] = val
+                    expanded_values.append(new_config)
+        
+        # Update the config with expanded values
+        sweep_config['parameters'][param_name]['values'] = expanded_values
+        
+        # Log expansion
+        original_count = len(param_config['values'])
+        expanded_count = len(expanded_values)
+        if expanded_count != original_count:
+            print(f"  Expanded {param_name}: {original_count} configs → {expanded_count} configs")
+    
+    return sweep_config
+
+
+def sweep_train_with_unpack():
+    """
+    Wrapper for wandb sweeps that unpacks dict-valued parameters.
+    
+    This allows sweep configs to use structured dicts instead of full cross-products:
+    
+    Example YAML:
+        model_config:
+          values:
+            - {n_layer: 5, bias: true, use_mlp: true}
+            - {n_layer: 3, bias: false, use_mlp: false}
+    
+    The dict values get unpacked into individual config keys before training.
+    """
+    print("Running in wandb sweep mode (with dict unpacking)")
+    
+    # Initialize wandb run if not already initialized by agent
+    if wandb.run is None:
+        wandb.init()
+    
+    # Convert wandb.config to a regular dict
+    config_dict = {k: v for k, v in wandb.config.items()}
+    
+    # Unpack any dict-valued parameters
+    for param_name in DICT_UNPACK_PARAMS:
+        if param_name in config_dict and isinstance(config_dict[param_name], dict):
+            print(f"  Unpacking {param_name}: {config_dict[param_name]}")
+            # Extract the nested dict values into top-level config
+            nested_config = config_dict.pop(param_name)
+            config_dict.update(nested_config)
+    
+    # Log the final flattened config
+    print(f"  Final config keys: {list(config_dict.keys())}")
+    
+    train(config=config_dict)
 
 
 def calculate_total_runs(sweep_config):
@@ -145,6 +263,9 @@ def main():
         print(f"Loading sweep configuration from: {args.sweep_config}")
         with open(args.sweep_config, 'r') as f:
             sweep_config = yaml.safe_load(f)
+        
+        # Expand partial cross products in dict-valued parameters
+        sweep_config = expand_partial_cross_products(sweep_config)
 
     # Determine project name
     project = args.project
@@ -246,7 +367,7 @@ def main():
     # If sweep_id is bare, we need to pass entity/project to help wandb locate the sweep
     agent_kwargs = {
         'sweep_id': sweep_id,
-        'function': sweep_train,
+        'function': sweep_train_with_unpack,
         'project': project
     }
     

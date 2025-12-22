@@ -35,42 +35,50 @@ parameters:
   use_task_tokens_in_path:
     values: [false] # for now test this
   
-  # Model architecture parameters - sweep these
-  n_layer:
-    values: [5,1]
-  n_head:
-    values: [1]
-  n_embd:
-    values: [16,32]
-  dropout:
-    values: [0]
-  embed_dropout:
-    values: [0]
-  bias:
-    value: true
-  base:
-    values: [100]
-  
-  # Training hyperparameters - sweep learning rate
-  learning_rate:
-    value: 1e-3
+  # Model + Training config combinations (partial cross-product)
+  # Lists within a dict are expanded into cross products
+  # Single values remain fixed for that config group
+  model_config:
+    values:
+      # Deep models (n_layer=5): sweep MLP and LayerNorm (2x2 = 4 configs)
+      - n_layer: 5
+        n_head: 1
+        n_embd: [16,32]
+        dropout: 0
+        embed_dropout: 0
+        bias: [false, true]
+        base: 100
+        learning_rate: 1e-3
+        weight_decay: 0
+        lr_scheduler: 'ReduceLROnPlateau'
+        epochs: 120_000
+        use_mlp: [true]
+        use_layernorm: [true]
+      - n_layer: [5,6,7,8]
+        n_head: 1
+        n_embd: [32]
+        dropout: 0
+        embed_dropout: 0
+        bias: [false]
+        base: 100
+        learning_rate: 1e-3
+        weight_decay: 0
+        lr_scheduler: 'ReduceLROnPlateau'
+        epochs: 120_000
+        use_mlp: [false]
+        use_layernorm: [false]
+
+  # Other training hyperparameters (not in model_config)
   label_smoothing:
     value: 0
-  weight_decay:
-    values: [0]
   beta1:
     value: 0.9
   beta2:
     value: 0.95
   grad_clip:
     value: 0.0
-      #batch_size:
-      #value: 2000
-  
-  # Learning rate schedule
-  lr_scheduler:
-    value: 'None' #'ReduceLROnPlateau'
 
+  # LR schedule params (when lr_scheduler is set in model_config)
   plateau_factor:
     value: 0.80
   plateau_patience:
@@ -79,17 +87,12 @@ parameters:
     value: 1e-4
   plateau_cooldown:
     value: 0
-
   warmup_frac:
     value: 0
   lr_decay_frac:
     value: 1
   min_lr:
     value: 0
-  
-  # Fixed training parameters
-  epochs:
-    value: 100_000  # Shorter for quick testing
   target_val_loss:
     value: 0.03
   edge_iterations_per_epoch: # 16k edges total for d=1000, l=5
