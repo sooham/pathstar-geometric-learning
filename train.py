@@ -1843,8 +1843,16 @@ def train(config=None):
 
     # Set random seed and backend configurations
     random.seed(config['seed'])
-    torch.manual_seed(default_config['seed'])
+    torch.manual_seed(config['seed'])
     np.random.seed(config['seed'])
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(default_config['seed'])
+        torch.cuda.manual_seed_all(default_config['seed'])  # for multi-GPU
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
+
 
     ptdtype, dtype = set_dtype(default_config)
 
