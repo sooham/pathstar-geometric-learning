@@ -43,7 +43,21 @@ from rich.table import Table
 console = Console()
 
 
-# GOOD
+def get_git_commit_id():
+    """Get the short git commit ID, or 'unknown' if not in a git repo."""
+    try:
+        result = subprocess.run(
+            ['git', 'rev-parse', '--short', 'HEAD'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return 'unknown'
+
 def get_default_config():
     """
     Returns default configuration for training.
@@ -90,6 +104,10 @@ def get_default_config():
         # If True, PATH task sequences interleave GT tokens between edges:
         #   [PATH] leaf (PAUSE)xN root GT n2 GT n3 ... GT leaf
         'use_task_tokens_in_path': False,
+        # If True, PAUSE tokens predict the path (chain-of-thought style):
+        #   1st PAUSE → root, 2nd PAUSE → n2, ..., last PAUSE → leaf
+        # This turns PAUSE into active prediction positions instead of dead zones.
+        'use_cot_for_pause': False,
         
         # Training parameters
         'gradient_accumulation_steps': 1,
@@ -153,7 +171,8 @@ def get_default_config():
         'predict_direction_for_edge_task': True,
 
         # console info
-        'console': console
+        'console': console,
+        'commit': get_git_commit_id()
     }
 
 @torch.compile
@@ -774,20 +793,6 @@ def clear_gpu_memory():
         except Exception as e:
             print(f"Warning during GPU memory clearing: {e}")
 
-def get_git_commit_id():
-    """Get the short git commit ID, or 'unknown' if not in a git repo."""
-    try:
-        result = subprocess.run(
-            ['git', 'rev-parse', '--short', 'HEAD'],
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
-        if result.returncode == 0:
-            return result.stdout.strip()
-    except Exception:
-        pass
-    return 'unknown'
 
 # GOOD
 def set_wandb_name(config):
@@ -795,12 +800,13 @@ def set_wandb_name(config):
         # Set custom run name for sweep runs
         if wandb.run is not None:
             utc_time = datetime.utcnow().strftime('%Y%m%dT%H%M%S')
-            commit_id = get_git_commit_id()
+            commit_id = config['commit']
             dir_label = "Udir" if config["use_undirected"] else "Dir"
             tt_label = "Tt" if config['use_task_tokens'] else ''
             dt_label = 'Dt' if config['use_directional_tokens'] else ''
             ptgt_label = 'Pgt' if config.get('use_task_tokens_in_path', False) else ''
             ped_or_pet_label = 'Pd' if config['predict_direction_for_edge_task'] else 'Pe'
+            cot_label = 'Cot' if config.get('use_cot_for_pause', False) else ''
             wt_label = 'Wt' if config['weight_tying'] else ''
             wd_label = f"Wd{config['weight_decay']}" if config['weight_decay'] > 0 else ""
 
@@ -826,6 +832,7 @@ def set_wandb_name(config):
                 f"{tt_label}"
                 f"{dt_label}"
                 f"{ptgt_label}"
+                f"{cot_label}"
                 "_"
                 f"L{config['n_layer']}"
                 f"E{config['n_embd']}"
@@ -2079,6 +2086,14 @@ def train(config=None):
     print(f"  Val: {VAL_DATASET_SIZE} sequences of length {val_seq_length}")
     print(f"  Block size: {meta['block_size']}")
     
+    # Log CoT for PAUSE configuration
+    if default_config.get('use_cot_for_pause', False):
+        print(f"\n=== Chain-of-Thought for PAUSE Enabled ===")
+        print(f"  PAUSE tokens will predict path nodes instead of being ignored:")
+        print(f"    1st PAUSE → root, 2nd PAUSE → n2, ..., {meta['num_pause_tokens']}th PAUSE → n{meta['num_pause_tokens']}")
+        print(f"  This adds {meta['num_pause_tokens']} active prediction positions per path sequence")
+        print(f"================================================\n")
+    
     assert paths_seq_length == edges_seq_length, f"Sequence length mismatch: paths={paths_seq_length}, edges={edges_seq_length}"
     
     # DETERMINE OPTIMAL STORAGE DTYPE
@@ -2098,7 +2113,14 @@ def train(config=None):
     # Pre-process datasets: Create X (inputs) and Y (targets) tensors with optimized dtype
     # We apply masking to Y statically here to avoid doing it in the inner loop
     
-    def preprocess_dataset(data_np):
+    def preprocess_dataset(data_np, dataset_type='paths'):
+        """
+        Preprocess dataset: split into X/Y and apply masking.
+        
+        Args:
+            data_np: numpy array of sequences
+            dataset_type: 'paths', 'edges', or 'combined'
+        """
         # Convert to tensor with optimized dtype
         data_inv = torch.from_numpy(data_np.astype(np.int64)) # Load as int64 first safely
         
@@ -2111,8 +2133,57 @@ def train(config=None):
         # Apply masking to Y
         if pad_token_id is not None:
             Y[Y == pad_token_id] = -1
+        
+        # Handle PAUSE tokens
         if pause_token_id is not None:
-            Y[Y == pause_token_id] = -1
+            use_cot = default_config.get('use_cot_for_pause', False)
+            
+            if use_cot and dataset_type in ['paths', 'combined']:
+                # Chain-of-thought for PAUSE: set PAUSE targets to predict path nodes
+                # Path format: [PATH?, leaf, PAUSE×N, root, n2, ..., leaf]
+                # Y format:    [leaf, PAUSE×N, root, n2, ..., leaf]
+                # We want: 1st PAUSE → root, 2nd PAUSE → n2, ..., Nth PAUSE → n_N
+                
+                use_task_tokens = meta.get('use_task_tokens', True)
+                num_pause = meta['num_pause_tokens']
+                
+                # Identify which rows are paths (for combined datasets)
+                if dataset_type == 'paths':
+                    is_path = torch.ones(Y.size(0), dtype=torch.bool)
+                else:  # combined
+                    special = meta.get('special_tokens', {})
+                    PATH_token = special.get('PATH')
+                    if use_task_tokens and PATH_token is not None:
+                        is_path = (data_inv[:, 0] == PATH_token)
+                    else:
+                        # Fallback: check if row contains PAUSE tokens
+                        is_path = (data_inv == pause_token_id).any(dim=1)
+                
+                # Calculate indices in Y
+                # If use_task_tokens: Y = [leaf, PAUSE×N, root, n2, ..., leaf]
+                #   PAUSE at positions 1 to N, path starts at N+1
+                # If not use_task_tokens: Y = [PAUSE×N, root, n2, ..., leaf]
+                #   PAUSE at positions 0 to N-1, path starts at N
+                if use_task_tokens:
+                    pause_start_idx = 1  # First PAUSE is at index 1 (after leaf)
+                else:
+                    pause_start_idx = 0  # First PAUSE is at index 0
+                path_start_idx = pause_start_idx + num_pause
+                path_end_idx = path_start_idx + graph_length - 1
+                
+                # Copy path nodes to PAUSE positions for path rows
+                # 1st PAUSE → root (path_start_idx), 2nd PAUSE → n2 (path_start_idx+1), etc.
+                for i in range(num_pause): # 0 ... num_pause-1
+                    pause_idx = pause_start_idx + i
+                    path_node_idx = path_end_idx - 1 - i
+                    if pause_idx < Y.size(1) and path_node_idx < Y.size(1):
+                        Y[is_path, pause_idx] = Y[is_path, path_node_idx]
+                
+                # Mask any remaining PAUSE tokens (e.g., in edge rows of combined dataset)
+                Y[Y == pause_token_id] = -1
+            else:
+                # Standard behavior: mask all PAUSE tokens
+                Y[Y == pause_token_id] = -1
             
         # Now cast Y to storage dtype. 
         # Note: -1 (mask) in int16/int32 is preserved as -1 (signed)
@@ -2123,20 +2194,25 @@ def train(config=None):
     # Create tensors and load to GPU if pre-calculated decision indicates they fit
     # If interleaving, combined_data is already prepared
     if default_config['interleave_dataset']:
-        paths_X, paths_Y = None, None
         edges_X, edges_Y = None, None
         print("Pre-processing combined dataset...")
-        combined_X, combined_Y = preprocess_dataset(combined_data)
+        combined_X, combined_Y = preprocess_dataset(combined_data, dataset_type='combined')
         print(f"Created pre-processed combined tensors: X={combined_X.shape}, Y={combined_Y.shape}, dtype={storage_dtype}")
+        # Also preprocess paths separately for evaluation (estimate_metrics uses paths-only data)
+        print("Pre-processing paths dataset (for evaluation)...")
+        paths_X, paths_Y = preprocess_dataset(paths_data, dataset_type='paths')
+        print(f"Created pre-processed path tensors: X={paths_X.shape}, Y={paths_Y.shape}")
     else:
         print("Pre-processing separate datasets...")
-        paths_X, paths_Y = preprocess_dataset(paths_data)
-        edges_X, edges_Y = preprocess_dataset(edges_data)
+        paths_X, paths_Y = preprocess_dataset(paths_data, dataset_type='paths')
+        edges_X, edges_Y = preprocess_dataset(edges_data, dataset_type='edges')
         combined_X, combined_Y = None, None
         print(f"Created pre-processed path tensors: X={paths_X.shape}, Y={paths_Y.shape}")
     
-    # Store validation data with optimized dtype too (though less critical)
-    val_data_tensor = torch.from_numpy(val_data.astype(np.int64)).to(storage_dtype)
+    # Preprocess validation data (always paths) with same logic as training
+    print("Pre-processing validation dataset...")
+    val_X, val_Y = preprocess_dataset(val_data, dataset_type='paths')
+    print(f"Created pre-processed validation tensors: X={val_X.shape}, Y={val_Y.shape}")
     
     datasets_on_gpu = False
     if device_type == 'cuda':
@@ -2149,11 +2225,13 @@ def train(config=None):
                 combined_X = combined_X.pin_memory().to(device, non_blocking=True)
                 combined_Y = combined_Y.pin_memory().to(device, non_blocking=True)
             else:
-                paths_X = paths_X.pin_memory().to(device, non_blocking=True)
-                paths_Y = paths_Y.pin_memory().to(device, non_blocking=True)
                 edges_X = edges_X.pin_memory().to(device, non_blocking=True)
                 edges_Y = edges_Y.pin_memory().to(device, non_blocking=True)
-            val_data_tensor = val_data_tensor.pin_memory().to(device, non_blocking=True)
+            # paths_X/paths_Y always needed for evaluation
+            paths_X = paths_X.pin_memory().to(device, non_blocking=True)
+            paths_Y = paths_Y.pin_memory().to(device, non_blocking=True)
+            val_X = val_X.pin_memory().to(device, non_blocking=True)
+            val_Y = val_Y.pin_memory().to(device, non_blocking=True)
             datasets_on_gpu = True
             print(f"===================================\n")
         else:
@@ -2164,10 +2242,13 @@ def train(config=None):
                 combined_X = combined_X.pin_memory()
                 combined_Y = combined_Y.pin_memory()
             else:
-                paths_X = paths_X.pin_memory()
-                paths_Y = paths_Y.pin_memory()
                 edges_X = edges_X.pin_memory()
                 edges_Y = edges_Y.pin_memory()
+            # paths_X/paths_Y always needed for evaluation
+            paths_X = paths_X.pin_memory()
+            paths_Y = paths_Y.pin_memory()
+            val_X = val_X.pin_memory()
+            val_Y = val_Y.pin_memory()
             print(f"===================================\n")
             datasets_on_gpu = False
     else:
@@ -2179,11 +2260,13 @@ def train(config=None):
                 combined_X = combined_X.to(device)
                 combined_Y = combined_Y.to(device)
             else:
-                paths_X = paths_X.to(device)
-                paths_Y = paths_Y.to(device)
                 edges_X = edges_X.to(device)
                 edges_Y = edges_Y.to(device)
-            val_data_tensor = val_data_tensor.to(device)
+            # paths_X/paths_Y always needed for evaluation
+            paths_X = paths_X.to(device)
+            paths_Y = paths_Y.to(device)
+            val_X = val_X.to(device)
+            val_Y = val_Y.to(device)
             datasets_on_gpu = True
         else:
             datasets_on_gpu = False
@@ -2387,15 +2470,12 @@ def train(config=None):
             Y_source = combined_Y
             epoch_completed = combined_epoch_completed
         elif dataset == 'val':
-            # Validation logic remains largely same but we need to handle X/Y/Masking dynamically or pre-process it too.
-            # For simplicity, we'll keep dynamic slicing for val since it's infrequent
-            # But let's use the optimized storage tensor
+            # Validation uses preprocessed val_X, val_Y (same as training data)
             batch_idx = val_batch_idx
             epoch_indices = val_epoch_indices
             dataset_size = VAL_DATASET_SIZE
-            X_source = None # Special case
-            Y_source = None
-            dataset_tensors = val_data_tensor
+            X_source = val_X
+            Y_source = val_Y
             epoch_completed = val_epoch_completed
         else:
             raise ValueError("This should not happen")
@@ -2437,22 +2517,23 @@ def train(config=None):
 
 
         if dataset == 'val':
-            # Special handling for validation (dynamic)
+            # Validation uses preprocessed val_X, val_Y (masking already applied in preprocess_dataset)
             if datasets_on_gpu:
-                sequences = dataset_tensors[batch_seq_indices]
+                x = X_source[batch_seq_indices]
+                y = Y_source[batch_seq_indices]
             else:
-                sequences = dataset_tensors[batch_seq_indices]
+                x = X_source[batch_seq_indices]
+                y = Y_source[batch_seq_indices]
                 if device_type in ['cuda', 'mps']:
-                    sequences = sequences.to(device, non_blocking=True)
+                    x = x.to(device, non_blocking=True)
+                    y = y.to(device, non_blocking=True)
             
             # Cast to Long for model input (important for embedding)
-            sequences = sequences.to(torch.long)
+            x = x.to(torch.long)
+            y = y.to(torch.long)
             
-            x = sequences[:, :-1]
-            y = sequences[:, 1:].clone() # Clone needed for masking
-            if pad_token_id is not None: y[y == pad_token_id] = -1
-            if pause_token_id is not None: y[y == pause_token_id] = -1
             # Validation set contains only path sequences; apply path-specific masking.
+            # Note: PAUSE/PAD masking already done in preprocess_dataset, this handles leaf masking
             if default_config.get('debug_masking') and (iter_num % default_config.get('log_interval', 100) == 0):
                 y_before = y.clone()
                 y_after = apply_task_specific_target_mask(x, y, 'paths')
@@ -2519,15 +2600,21 @@ def train(config=None):
             if split == 'val':
                 X, Y = get_batch('val')
             else:
-                # Manual sampling for training paths to safely handle interleaved case
-                # and ensures we only evaluate on paths
+                # Use preprocessed paths data (consistent with training, including CoT if enabled)
                 idx = np.random.randint(0, data_size, train_batch_size)
-                batch = torch.from_numpy(data_source[idx].astype(np.int64)).to(device)
-                X = batch[:, :-1].contiguous()
-                Y = batch[:, 1:].contiguous()
-                if pad_token_id is not None: Y[Y == pad_token_id] = -1
-                if pause_token_id is not None: Y[Y == pause_token_id] = -1
-                # Training metrics here are for paths; apply path-specific masking.
+                if datasets_on_gpu:
+                    X = paths_X[idx]
+                    Y = paths_Y[idx].clone()
+                else:
+                    X = paths_X[idx]
+                    Y = paths_Y[idx].clone()
+                    if device_type in ['cuda', 'mps']:
+                        X = X.to(device, non_blocking=True)
+                        Y = Y.to(device, non_blocking=True)
+                X = X.to(torch.long)
+                Y = Y.to(torch.long)
+                # Training metrics here are for paths; apply path-specific masking (leaf masking).
+                # Note: PAUSE/PAD masking already done in preprocess_dataset
                 Y = apply_task_specific_target_mask(X, Y, 'paths')
 
             with ctx:
