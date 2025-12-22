@@ -41,9 +41,9 @@ parameters:
   model_config:
     values:
       # Deep models (n_layer=5): sweep MLP and LayerNorm (2x2 = 4 configs)
-      - n_layer: 5
+      - n_layer: [5]
         n_head: 1
-        n_embd: [16]
+        n_embd: [64,32]
         dropout: 0
         embed_dropout: 0
         bias: [true]
@@ -51,7 +51,21 @@ parameters:
         learning_rate: 1e-3
         weight_decay: 0
         lr_scheduler: 'ReduceLROnPlateau'
-        epochs: 120_000
+        epochs: 30_000
+        use_mlp: [true]
+        use_layernorm: [true]
+        seed: [2723,2842,9004,253,4259]
+      - n_layer: [12,10,8,6]
+        n_head: 1
+        n_embd: [32,64]
+        dropout: 0
+        embed_dropout: 0
+        bias: [true]
+        base: 100
+        learning_rate: 1e-3
+        weight_decay: 0
+        lr_scheduler: 'ReduceLROnPlateau'
+        epochs: 30_000
         use_mlp: [true]
         use_layernorm: [true]
         seed: [2723,2842,9004,253,4259]
