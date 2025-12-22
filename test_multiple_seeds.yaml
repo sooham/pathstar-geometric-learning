@@ -34,6 +34,8 @@ parameters:
     values: [false]
   use_task_tokens_in_path:
     values: [false] # for now test this
+  p_autoregressive_substitution:
+    values: [0.05]
   
   # Model + Training config combinations (partial cross-product)
   # Lists within a dict are expanded into cross products

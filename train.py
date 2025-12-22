@@ -91,6 +91,14 @@ def get_default_config():
         #   [PATH] leaf (PAUSE)xN root GT n2 GT n3 ... GT leaf
         'use_task_tokens_in_path': False,
         
+        # Scheduled sampling / autoregressive substitution for PATH tasks:
+        # During training, with probability p_autoregressive_substitution, substitute
+        # teacher-forced tokens with the model's own predictions. This helps bridge
+        # the gap between teacher forcing and autoregressive inference.
+        # 0.0 = pure teacher forcing, 1.0 = pure autoregressive (no teacher forcing)
+        # Only applies to PATH tasks, not EDGE tasks.
+        'p_autoregressive_substitution': 0.0,
+        
         # Training parameters
         'gradient_accumulation_steps': 1,
         # If set, this caps the memory-based auto batch size.
@@ -235,6 +243,119 @@ def compute_per_token_loss_with_teacher_forcing(meta, logits, input, targets, to
     
     return per_token_losses
 
+
+def forward_with_scheduled_sampling(model, X, Y, meta, p_sub, label_smoothing=0.0, ctx=None):
+    """
+    Forward pass with scheduled sampling (autoregressive substitution) for PATH tasks.
+    
+    For PATH sequences, after the context portion, with probability p_sub at each position,
+    substitute the ground truth input token with the model's prediction from the previous
+    position. This helps the model learn to recover from its own prediction errors during
+    autoregressive inference.
+    
+    EDGE sequences always use standard teacher forcing (no substitution).
+    
+    Loss masking logic:
+        For sequence: x_root, ..., x_a, x_b, x_c, ..., x_leaf
+        If x_b is substituted with model's prediction:
+        - Loss for predicting x_b (given x_a) is MASKED - the target would be the model's
+          own prediction, not ground truth, so computing loss is meaningless.
+        - Loss for predicting x_c (given substituted x_b) is KEPT - we want the model
+          to learn to predict correctly even when its input may be wrong.
+    
+    Args:
+        model: GPT model
+        X: input tokens (batch, seq_len) - teacher-forced inputs
+        Y: target tokens (batch, seq_len) - targets with masking (-1 for ignored positions)
+        meta: dataset metadata containing special_tokens and path_context_length
+        p_sub: probability of using model's prediction instead of ground truth (0.0 to 1.0)
+        label_smoothing: label smoothing for cross entropy loss
+        ctx: autocast context manager (e.g., torch.amp.autocast)
+    
+    Returns:
+        logits: (batch, seq_len, vocab_size)
+        loss: scalar loss tensor
+    
+    Note:
+        When p_sub > 0, this function processes the prediction portion step-by-step,
+        which is slower than standard teacher forcing but produces more robust models.
+        The time complexity is O(prediction_length) forward passes for PATH sequences.
+    """
+    
+    if ctx is None:
+        ctx = nullcontext()
+    
+    # If no scheduled sampling, use standard teacher forcing
+    if p_sub <= 0:
+        with ctx:
+            return model(X, Y, label_smoothing=label_smoothing)
+    
+    batch_size, seq_len = X.shape
+    device = X.device
+    
+    # Identify PATH vs EDGE sequences using the task token at position 0
+    PATH_TOKEN = meta['special_tokens']['PATH']
+    is_path = (X[:, 0] == PATH_TOKEN)
+    
+    # If no PATH sequences in batch, use standard teacher forcing
+    if not is_path.any():
+        with ctx:
+            return model(X, Y, label_smoothing=label_smoothing)
+    
+    # Get context length for PATH tasks
+    # Context = <PATH> + leaf + <PAUSE> tokens = 1 + 1 + num_pause_tokens
+    path_context_length = meta['path_context_length']
+    
+    # Clone X and Y for modification
+    # - X_modified: we'll substitute tokens for PATH sequences
+    # - Y_modified: we'll mask out targets for substituted positions
+    X_modified = X.clone()
+    Y_modified = Y.clone()
+    
+    # Process step by step for positions after context
+    # For each position pos in [path_context_length, seq_len):
+    #   - Get model's prediction based on X_modified[:, :pos]
+    #   - With probability p_sub (for PATH sequences only), substitute X_modified[:, pos] with prediction
+    #   - When substituting, also mask Y_modified[pos-1] since the target is now model's prediction
+    #
+    # Indexing explanation:
+    #   - X[:, pos] is the input token at position pos
+    #   - Y[:, pos-1] is the target for predicting what goes at position pos (i.e., Y[pos-1] = ground_truth[pos])
+    #   - When we substitute X[pos], Y[pos-1] should be masked because:
+    #     * The model predicted some token at pos-1 to produce the substituted X[pos]
+    #     * Computing loss against ground_truth[pos] doesn't make sense since we're using model's prediction
+    #   - Y[pos] (predicting ground_truth[pos+1] given substituted X[pos]) is still valid and KEPT
+    #     * We want the model to learn to predict correctly even from potentially wrong inputs
+    
+    for pos in range(path_context_length, seq_len):
+        # Get predictions based on sequence up to position pos
+        # The model will output logits for predicting the next token after each input position
+        # We want the prediction at position pos-1 (which predicts what should go at position pos)
+        with torch.no_grad():
+            with ctx:
+                logits_partial, _ = model(X_modified[:, :pos], targets=None)
+        
+        # logits_partial has shape (batch, pos, vocab_size)
+        # The last position (pos-1 in 0-indexed) predicts the token at position pos
+        predicted = logits_partial[:, -1, :].argmax(dim=-1)  # (batch,)
+        
+        # Determine which samples to substitute (only PATH sequences, with probability p_sub)
+        should_substitute = (torch.rand(batch_size, device=device) < p_sub) & is_path
+        
+        # Substitute in X_modified for position pos
+        X_modified[should_substitute, pos] = predicted[should_substitute]
+        
+        # Mask out the target Y[pos-1] for substituted samples
+        # Y[pos-1] is the target for predicting X[pos], which we've replaced with model's prediction
+        # Computing loss against ground truth here doesn't make sense anymore
+        if pos > 0:
+            Y_modified[should_substitute, pos - 1] = -1  # -1 is cross_entropy's ignore_index
+    
+    # Final forward pass with modified input and masked targets to compute loss
+    with ctx:
+        logits, loss = model(X_modified, Y_modified, label_smoothing=label_smoothing)
+    
+    return logits, loss
 
 
 def get_rich_token_str(token, itos, meta):
@@ -1845,6 +1966,22 @@ def train(config=None):
         print(f"  Paths: {paths_size} (no replication)")
         print(f"  Edges: {edges_size}")
         print(f"  Total: {paths_size + edges_size} samples")
+    
+    # Log scheduled sampling configuration
+    p_sub = default_config.get('p_autoregressive_substitution', 0.0)
+    if p_sub > 0:
+        if default_config['interleave_dataset'] and default_config['use_task_tokens']:
+            print(f"\n=== Scheduled Sampling (Autoregressive Substitution) ===")
+            print(f"  p_autoregressive_substitution: {p_sub}")
+            print(f"  PATH sequences: With probability {p_sub}, teacher-forced tokens will be")
+            print(f"                  substituted with model predictions during training.")
+            print(f"  EDGE sequences: Always use pure teacher forcing (no substitution).")
+            print(f"  Note: This may slow down training but improves inference robustness.")
+            print(f"=========================================================\n")
+        else:
+            print(f"\n[Warning] p_autoregressive_substitution={p_sub} is set but will be ignored.")
+            print(f"          Scheduled sampling requires: interleave_dataset=True, use_task_tokens=True")
+            print(f"          Current: interleave_dataset={default_config['interleave_dataset']}, use_task_tokens={default_config['use_task_tokens']}\n")
 
     # Auto-detect device
     device, device_type, gpu_id = detect_device(default_config)
@@ -2688,9 +2825,21 @@ def train(config=None):
             steps = min(default_config['gradient_accumulation_steps'], cur_batch_size) if not default_config['interleave_dataset'] else default_config['gradient_accumulation_steps']
 
             for micro_step in range(steps):
-                with ctx:
-                    _, loss = model(X, Y, label_smoothing=default_config['label_smoothing'])
-                    loss = loss / steps
+                # Use scheduled sampling for PATH tasks if p_autoregressive_substitution > 0
+                p_sub = default_config.get('p_autoregressive_substitution', 0.0)
+                if p_sub > 0 and default_config['interleave_dataset'] and default_config['use_task_tokens']:
+                    # Scheduled sampling: substitute teacher-forced tokens with model predictions
+                    # for PATH sequences (EDGE sequences still use pure teacher forcing)
+                    _, loss = forward_with_scheduled_sampling(
+                        model, X, Y, meta, p_sub,
+                        label_smoothing=default_config['label_smoothing'],
+                        ctx=ctx
+                    )
+                else:
+                    # Standard teacher forcing
+                    with ctx:
+                        _, loss = model(X, Y, label_smoothing=default_config['label_smoothing'])
+                loss = loss / steps
                 
                 # Prefetch next batch while backward pass runs (overlap I/O with compute)
                 if micro_step < steps - 1:
