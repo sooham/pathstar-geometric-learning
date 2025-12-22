@@ -834,6 +834,7 @@ def set_wandb_name(config):
                 f"{wd_label}"
                 f"{wt_label}"
                 f"Ep{config['epochs']}"
+                f"Seed{config['seed']}"
             )
             wandb.run.name = custom_name
             print(f"Set sweep run name: {custom_name}")
