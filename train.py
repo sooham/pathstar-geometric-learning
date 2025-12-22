@@ -1841,7 +1841,10 @@ def train(config=None):
     device, device_type, gpu_id = detect_device(default_config)
 
     # Set random seed and backend configurations
+    random.seed(config['seed'])
     torch.manual_seed(default_config['seed'])
+    np.random.seed(config['seed'])
+
     ptdtype, dtype = set_dtype(default_config)
 
     ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
