@@ -82,7 +82,7 @@ parameters:
   plateau_factor:
     value: 0.80
   plateau_patience:
-    value: 10
+    value: 30
   plateau_threshold:
     value: 1e-4
   plateau_cooldown:
