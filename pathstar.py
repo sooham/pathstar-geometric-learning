@@ -423,33 +423,32 @@ class InWeightsPathStar:
         
         return edge_sequences
 
-    def _generate_path_prediction_training_set(self, size, split, num_pause_tokens=1, use_task_tokens=True, use_task_tokens_in_path=False):
+    def _generate_path_prediction_training_set(self, size, split, use_task_tokens=True, use_task_tokens_in_path=False):
         """
         Generate a path-finding training set for the in-weights path memorization objective.
         
-        Each training example has the format:
-        Input (default): [<optional PATH>, leaf, <PAUSE>, ..., <PAUSE>, root, n_2, n_3, ..., n_ℓ]
+        NOTE: Pause tokens are NOT included in the stored dataset. They should be added
+        at runtime using add_pause_tokens_to_batch() based on the training config.
+        
+        Each training example has the format (WITHOUT pause tokens):
+        Input (default): [<optional PATH>, leaf, root, n_2, n_3, ..., n_ℓ]
         Input (with use_task_tokens_in_path=True):
-               [<optional PATH>, leaf, <PAUSE>, ..., <PAUSE>, root, GT, n_2, GT, n_3, ..., GT, n_ℓ]
-               where <PATH> is a task prefix token and the number of <PAUSE> tokens 
-               is controlled by num_pause_tokens
+               [<optional PATH>, leaf, root, GT, n_2, GT, n_3, ..., GT, n_ℓ]
+        
         Target: predict each next token left-to-right
         
         Args:
             size: Number of samples (K) to generate
-            num_pause_tokens: Number of <PAUSE> tokens to insert between leaf and path (default: 1)
             split: either 'train' (training leaves only), 'val' (holdout leaves) or all (both)
             use_task_tokens: If True, include <PATH> task prefix token (default: True)
             use_task_tokens_in_path: If True, interleave GT tokens between path edges (default: False)
         
         Returns:
-            sequences: torch tensor containing full sequences.
+            sequences: torch tensor containing full sequences (WITHOUT pause tokens).
                       If use_task_tokens_in_path=False, sequence length is:
-                        (task?1:0) + 1(leaf) + num_pause_tokens + l(path vertices)
+                        (task?1:0) + 1(leaf) + l(path vertices)
                       If use_task_tokens_in_path=True, sequence length is:
-                        (task?1:0) + 1(leaf) + num_pause_tokens + (2*l - 1)  (root plus GT+vertex for each edge)
-                      <PATH>, leaf, pause_1, ..., pause_n, root, n_2, ..., n_ℓ) if use_task_tokens=True
-                      or (leaf, pause_1, ..., pause_n, root, n_2, ..., n_ℓ) if use_task_tokens=False
+                        (task?1:0) + 1(leaf) + (2*l - 1)  (root plus GT+vertex for each edge)
         """
         # Determine which leaf nodes to sample from
         if split == 'val':
@@ -492,14 +491,13 @@ class InWeightsPathStar:
             else:
                 path_tokens = path
             
-            # Construct sequence with or without task prefix token
-            pause_tokens = [self.pause_token] * num_pause_tokens
+            # Construct sequence with or without task prefix token (NO pause tokens)
             if use_task_tokens:
-                # With task token: [<PATH>, leaf, <PAUSE>, ..., <PAUSE>, root, n_2, ..., n_ℓ]
-                sequence = [self.SPECIAL_TOKENS['PATH'], leaf] + pause_tokens + path_tokens
+                # With task token: [<PATH>, leaf, root, n_2, ..., n_ℓ]
+                sequence = [self.SPECIAL_TOKENS['PATH'], leaf] + path_tokens
             else:
-                # Without task token: [leaf, <PAUSE>, ..., <PAUSE>, root, n_2, ..., n_ℓ]
-                sequence = [leaf] + pause_tokens + path_tokens
+                # Without task token: [leaf, root, n_2, ..., n_ℓ]
+                sequence = [leaf] + path_tokens
             sequences.append(sequence)
         
         # Convert to tensor
@@ -507,11 +505,14 @@ class InWeightsPathStar:
         
         return sequences
     
-    def prepare(self, num_pause_tokens=1, output_dir='./data',
+    def prepare(self, output_dir='./data',
                 use_undirected=True, use_directional_tokens=True, use_task_tokens=True,
                 predict_direction_for_edge_task=True, use_task_tokens_in_path=False):
         """
         Prepare and save training and validation datasets to disk for in-weights path-star.
+        
+        NOTE: Pause tokens are NOT stored in the dataset. They should be added at runtime
+        using add_pause_tokens_to_batch() based on the training configuration.
         
         Dataset structure:
         - Training set: All training paths (self.train_leaves) + All edges (mixed and shuffled)
@@ -523,7 +524,6 @@ class InWeightsPathStar:
         - Validation paths: determined by holdout_percentage (holdout_leaves)
         
         Args:
-            num_pause_tokens: Number of PAUSE tokens between leaf and path
             output_dir: Base directory for output (default: './data')
             use_undirected: If True, use undirected edges (both x->y and y->x) (default: True)
             use_directional_tokens: If True, use special tokens to demarcate edge directions in the edge training set
@@ -547,9 +547,9 @@ class InWeightsPathStar:
         
         # Validation set: only holdout paths (no edges)
         
-        # Create output directory with parameters in name
+        # Create output directory with parameters in name (NO pause tokens in name)
         dir_name = self._generate_dataset_name(
-            num_pause_tokens, use_undirected, use_directional_tokens, use_task_tokens,
+            use_undirected, use_directional_tokens, use_task_tokens,
             predict_direction_for_edge_task, use_task_tokens_in_path
         )
         full_output_dir = os.path.join(output_dir, dir_name)
@@ -565,7 +565,7 @@ class InWeightsPathStar:
         print(f"    Validation paths (holdout): {num_val_path_samples}")
         print(f"  Dataset composition:")
         print(f"    Holdout percentage: {self.holdout_percentage}")
-        print(f"    Number of pause tokens: {num_pause_tokens}")
+        print(f"    NOTE: Pause tokens added at runtime (not stored in dataset)")
         print(f"    Edge samples: {num_edge_samples} ({'undirected' if use_undirected else 'directed'})")
         print(f"    Edge prediction: ({'direction' if predict_direction_for_edge_task else 'edge'})")
         print(f"    Training path samples (original): {num_train_path_samples}")
@@ -575,9 +575,10 @@ class InWeightsPathStar:
         print(f"    Edge dataset: {num_edge_samples}")
         print(f"    Validation set: {num_val_path_samples} (holdout paths only, no edges)")
         path_suffix_len = (2 * self.l - 1) if use_task_tokens_in_path else self.l
-        print(f"    2d dimension of training set is : {(1 if use_task_tokens else 0) + 1 + num_pause_tokens + path_suffix_len}")
+        # Sequence length WITHOUT pause tokens: (task?1:0) + 1(leaf) + path_suffix_len
+        print(f"    Sequence length (without pause): {(1 if use_task_tokens else 0) + 1 + path_suffix_len}")
         print(f"  Output directory: {full_output_dir}")
-        print(f"  Pause token: {self.pause_token}")
+        print(f"  Pause token ID: {self.pause_token} (added at runtime)")
         print(f"  Pad token: {self.pad_token}")
         print(f"  EDGE token: {self.SPECIAL_TOKENS['EDGE']}")
         print(f"  PATH token: {self.SPECIAL_TOKENS['PATH']}")
@@ -595,10 +596,10 @@ class InWeightsPathStar:
         # print("\nGenerating training set (training paths + edges)...")
         
         # Generate path sequences for training (uses self.train_leaves)
+        # NOTE: No pause tokens - they are added at runtime
         train_path_sequences = self._generate_path_prediction_training_set(
             size=num_train_path_samples,
             split='train',
-            num_pause_tokens=num_pause_tokens,
             use_task_tokens=use_task_tokens,
             use_task_tokens_in_path=use_task_tokens_in_path,
         )
@@ -626,11 +627,11 @@ class InWeightsPathStar:
         
         
         # Generate validation set: only holdout paths (no edges)
+        # NOTE: No pause tokens - they are added at runtime
         print("Generating validation set (holdout paths only, no edges)...")
         val_sequences = self._generate_path_prediction_training_set(
             size=num_val_path_samples,
             split='val',
-            num_pause_tokens=num_pause_tokens,
             use_task_tokens=use_task_tokens,
             use_task_tokens_in_path=use_task_tokens_in_path,
         )
@@ -706,7 +707,7 @@ class InWeightsPathStar:
                 itos[token] = f'NODE_{token}'
                 stoi[f'NODE_{token}'] = token
         
-        # Calculate context lengths
+        # Calculate context lengths (WITHOUT pause tokens - those are added at runtime)
         # edge_context_length: number of tokens provided to predict the supervised target on EDGE task.
         # - predict_direction_for_edge_task=True:  [EDGE] u v -> predict direction, so context is (task) + 2
         # - predict_direction_for_edge_task=False: [EDGE] u (dir) -> predict v, so context is (task) + (dir) + 1
@@ -714,12 +715,13 @@ class InWeightsPathStar:
             edge_context_length = (1 if use_task_tokens else 0) + 2
         else:
             edge_context_length = (1 if use_task_tokens else 0) + (1 if use_directional_tokens else 0) + 1
-        # path_context_length = PATH prefix (conditional) + leaf + pause tokens
-        path_context_length = (1 if use_task_tokens else 0) + 1 + num_pause_tokens
         
-        # Note: path_seq_len was already calculated above (from generated sequences).
-        # It represents the full sequence length: path_context_length + path_target_length
-        # Edge sequences are padded to match this length
+        # path_context_length_base = PATH prefix (conditional) + leaf (NO pause tokens)
+        # The full path_context_length = path_context_length_base + num_pause_tokens (added at runtime)
+        path_context_length_base = (1 if use_task_tokens else 0) + 1
+        
+        # Note: path_seq_len is the stored sequence length (WITHOUT pause tokens).
+        # At runtime, the actual sequence length = path_seq_len + num_pause_tokens
         
         # Save metadata
         meta = {
@@ -733,7 +735,7 @@ class InWeightsPathStar:
             'pause_token': self.SPECIAL_TOKENS["PAUSE"],
             'pad_token': self.SPECIAL_TOKENS["PAD"],
             'special_tokens': self.SPECIAL_TOKENS,
-            'num_pause_tokens': num_pause_tokens,
+            # NOTE: num_pause_tokens is NOT stored - it's a runtime config parameter
             'root_vertex': self.v_root,
             'leaf_vertices': self.v_leaf,
             'vertices': self.vertices,
@@ -748,15 +750,17 @@ class InWeightsPathStar:
             # - predict_direction_for_edge_task=False: [EDGE] u (GT/LT) v
             # - predict_direction_for_edge_task=True:  [EDGE] u v (GT/LT)
             'edge_task_layout': 'u_dir_v' if (use_directional_tokens and not predict_direction_for_edge_task) else ('u_v_dir' if (use_directional_tokens and predict_direction_for_edge_task) else 'u_v'),
-            # PATH layout note:
-            # - use_task_tokens_in_path=False: [PATH] leaf (PAUSE)xN root n2 ... nℓ
-            # - use_task_tokens_in_path=True:  [PATH] leaf (PAUSE)xN root GT n2 GT n3 ... GT nℓ
+            # PATH layout note (stored WITHOUT pause tokens):
+            # - Stored: [PATH] leaf root n2 ... nℓ  (pause tokens added at runtime)
+            # - At runtime: [PATH] leaf (PAUSE)xN root n2 ... nℓ
             'path_task_layout': 'root_gt_nodes' if use_task_tokens_in_path else 'root_nodes',
             # How many tokens the model should generate after the PATH context to reproduce the target suffix.
             'path_target_length': (2 * self.l - 1) if use_task_tokens_in_path else self.l,
             'edge_context_length': edge_context_length,
-            'path_context_length': path_context_length,
-            'block_size': path_seq_len - 1,  # Use actual sequence length (path_context_length + l), not just context length TODO: if you want EOS or to use full context, you need to remove the -1.
+            # path_context_length_base does NOT include pause tokens
+            'path_context_length_base': path_context_length_base,
+            # block_size_base is WITHOUT pause tokens - actual block_size = block_size_base + num_pause_tokens
+            'block_size_base': path_seq_len - 1,
             'num_train_path_samples': num_train_path_samples,
             'num_val_path_samples': num_val_path_samples,
             'total_edge_size': num_edge_samples,
@@ -798,12 +802,14 @@ class InWeightsPathStar:
         edges_data = np.memmap(os.path.join(data_dir, 'edges.bin'), dtype=np.uint16, mode='r')
         return meta, paths_data, edges_data, val_data
 
-    def _generate_dataset_name(self, num_pause_tokens, use_undirected, use_directional_tokens,
+    def _generate_dataset_name(self, use_undirected, use_directional_tokens,
                                use_task_tokens=True, predict_direction_for_edge_task=True, use_task_tokens_in_path=False):
         """
-        Generate dataset directory name matching the naming convention in pathstar.py
+        Generate dataset directory name matching the naming convention in pathstar.py.
+        
+        NOTE: num_pause_tokens is NOT part of the dataset name because pause tokens
+        are added at runtime, not stored in the dataset.
         """
-        self.num_pause_tokens = num_pause_tokens
         self.use_undirected = use_undirected
         self.use_directional_tokens = use_directional_tokens
         self.use_task_tokens = use_task_tokens
@@ -814,14 +820,19 @@ class InWeightsPathStar:
         randomize = (f"_v{self.randomize_vocab_size}" if self.randomize_vocab_size else "")
         # IMPORTANT: bump dataset name when sequence layout changes to avoid silently loading stale .bin files.
         # edge_layout_v2 corresponds to EDGE endpoint prediction layout: [EDGE] u (GT/LT) v
+        # v3: pause tokens removed from stored dataset (added at runtime)
         edge_layout_suffix = "_elv2"
         path_layout_suffix = "_plgt" if use_task_tokens_in_path else "_plplain"
-        self.dir_name = f'inweights_pathstar{randomize}{predict_edge_or_direction}{edge_layout_suffix}{path_layout_suffix}_d{self.d}_l{self.l}_p{num_pause_tokens}_{"un" if use_undirected else ""}directed_{"dt" if use_directional_tokens else ""}{task_token_suffix}'
+        # NOTE: No _p{num_pause_tokens} in name - pause tokens are a runtime config
+        self.dir_name = f'inweights_pathstar_v3{randomize}{predict_edge_or_direction}{edge_layout_suffix}{path_layout_suffix}_d{self.d}_l{self.l}_{"un" if use_undirected else ""}directed_{"dt" if use_directional_tokens else ""}{task_token_suffix}'
         return self.dir_name
 
     def _check_dataset_exists(self):
         """
         Check if dataset exists and validate that metadata matches requested parameters.
+        
+        NOTE: num_pause_tokens is NOT validated because pause tokens are added at runtime,
+        not stored in the dataset.
         
         Returns:
             bool: True if dataset exists and parameters match, False otherwise
@@ -847,11 +858,11 @@ class InWeightsPathStar:
             print(f"Error reading metadata: {e}")
             return False
         
-        # Check if all key parameters match
+        # Check if all key parameters match (NO num_pause_tokens - it's a runtime config)
         params_match = (
             meta.get('d') == self.d and
             meta.get('l') == self.l and
-            meta.get('num_pause_tokens') == self.num_pause_tokens and
+            # NOTE: num_pause_tokens is NOT checked - it's added at runtime
             meta.get('use_undirected') == self.use_undirected and
             meta.get('use_directional_tokens') == self.use_directional_tokens and
             meta.get('use_task_tokens', True) == self.use_task_tokens and  # Default to True for backward compatibility
@@ -864,10 +875,10 @@ class InWeightsPathStar:
         
         if not params_match:
             print(f"Dataset exists but parameters don't match:")
-            print(f"  Existing: d={meta.get('d')}, l={meta.get('l')}, pause={meta.get('num_pause_tokens')}, "
+            print(f"  Existing: d={meta.get('d')}, l={meta.get('l')}, "
                 f"undirected={meta.get('use_undirected')}, directional_tokens={meta.get('use_directional_tokens')}, "
                 f"task_tokens={meta.get('use_task_tokens', True)}, predict_direction_for_edge_task={meta.get('predict_direction_for_edge_task', True)}, holdout={meta.get('holdout_percentage')}")
-            print(f"  Requested: d={self.d}, l={self.l}, pause={self.num_pause_tokens}, "
+            print(f"  Requested: d={self.d}, l={self.l}, "
                 f"undirected={self.use_undirected}, directional_tokens={self.use_directional_tokens}, "
                 f"task_tokens={self.use_task_tokens}, predict_direction_for_edge_task={self.predict_direction_for_edge_task}, holdout={self.holdout_percentage}")
             print(f"  Will regenerate dataset...")
@@ -876,10 +887,14 @@ class InWeightsPathStar:
         return True
 
 
-    def generate_dataset_if_needed(self, num_pause_tokens, use_undirected, use_directional_tokens,
+    def generate_dataset_if_needed(self, use_undirected, use_directional_tokens,
                                    use_task_tokens=True, predict_direction_for_edge_task=True, use_task_tokens_in_path=False):
         """
         Generate the dataset using InWeightsPathStar if it doesn't exist or parameters don't match.
+        
+        NOTE: num_pause_tokens is NOT a parameter here because pause tokens are added
+        at runtime, not stored in the dataset. This allows using the same dataset with
+        different pause token counts without regeneration.
         
         Uses file locking to prevent race conditions when multiple GPU processes
         call this method simultaneously.
@@ -894,9 +909,9 @@ class InWeightsPathStar:
         if use_task_tokens_in_path and not use_directional_tokens:
             raise ValueError("Is an invalid config PATH directions requires use_directional_tokens")
         
-        # Generate dataset name
+        # Generate dataset name (NO num_pause_tokens - it's a runtime config)
         dataset_name = self._generate_dataset_name(
-            num_pause_tokens, use_undirected, use_directional_tokens,
+            use_undirected, use_directional_tokens,
             use_task_tokens, predict_direction_for_edge_task, use_task_tokens_in_path
         )
         
@@ -921,9 +936,8 @@ class InWeightsPathStar:
             # Create InWeightsPathStar generator
             generator = self
             
-            # Generate and save dataset
+            # Generate and save dataset (NO num_pause_tokens)
             output_dir = generator.prepare(
-                num_pause_tokens=num_pause_tokens,
                 output_dir='./data',
                 use_undirected=use_undirected,
                 use_directional_tokens=use_directional_tokens,
@@ -939,6 +953,93 @@ class InWeightsPathStar:
         return dataset_name
 
 
+def add_pause_tokens_to_batch(batch, num_pause_tokens, pause_token_id, use_task_tokens=True):
+    """
+    Add pause tokens to a batch of PATH sequences at runtime.
+    
+    This function inserts pause tokens between the leaf and the path (root -> leaf).
+    It handles both edge sequences (no modification) and path sequences.
+    
+    Input format (stored in dataset, WITHOUT pause tokens):
+        With task tokens:    [PATH, leaf, root, n2, ..., leaf]
+        Without task tokens: [leaf, root, n2, ..., leaf]
+    
+    Output format (after adding pause tokens):
+        With task tokens:    [PATH, leaf, PAUSE, ..., PAUSE, root, n2, ..., leaf]
+        Without task tokens: [leaf, PAUSE, ..., PAUSE, root, n2, ..., leaf]
+    
+    Args:
+        batch: torch.Tensor of shape (batch_size, seq_len) - sequences WITHOUT pause tokens
+        num_pause_tokens: Number of pause tokens to insert
+        pause_token_id: The token ID for PAUSE
+        use_task_tokens: Whether PATH/EDGE task prefix tokens are used
+    
+    Returns:
+        torch.Tensor of shape (batch_size, seq_len + num_pause_tokens)
+    """
+    if num_pause_tokens == 0:
+        return batch
+    
+    batch_size, seq_len = batch.shape
+    device = batch.device
+    dtype = batch.dtype
+    
+    # Position where pause tokens should be inserted:
+    # - With task tokens: after position 1 (after [PATH, leaf])
+    # - Without task tokens: after position 0 (after [leaf])
+    insert_pos = 2 if use_task_tokens else 1
+    
+    # Create the pause token tensor
+    pause_tokens = torch.full(
+        (batch_size, num_pause_tokens), 
+        pause_token_id, 
+        dtype=dtype, 
+        device=device
+    )
+    
+    # Split the batch at the insertion point and concatenate with pause tokens
+    prefix = batch[:, :insert_pos]  # [PATH, leaf] or [leaf]
+    suffix = batch[:, insert_pos:]  # [root, n2, ..., leaf]
+    
+    # Concatenate: prefix + pause_tokens + suffix
+    result = torch.cat([prefix, pause_tokens, suffix], dim=1)
+    
+    return result
+
+
+def add_pause_tokens_to_edges(batch, num_pause_tokens, pad_token_id):
+    """
+    Pad edge sequences to match the length of path sequences with pause tokens.
+    
+    Edge sequences don't need pause tokens inserted, but they need to be padded
+    to the same length as path sequences (which have pause tokens added).
+    
+    Args:
+        batch: torch.Tensor of shape (batch_size, seq_len) - edge sequences
+        num_pause_tokens: Number of pause tokens added to paths (determines padding)
+        pad_token_id: The token ID for PAD
+    
+    Returns:
+        torch.Tensor of shape (batch_size, seq_len + num_pause_tokens)
+    """
+    if num_pause_tokens == 0:
+        return batch
+    
+    batch_size, seq_len = batch.shape
+    device = batch.device
+    dtype = batch.dtype
+    
+    # Add padding at the end
+    padding = torch.full(
+        (batch_size, num_pause_tokens),
+        pad_token_id,
+        dtype=dtype,
+        device=device
+    )
+    
+    return torch.cat([batch, padding], dim=1)
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Generate PathStar datasets')
     parser.add_argument('--d', type=int, default=100,
@@ -947,8 +1048,7 @@ if __name__ == '__main__':
                         help='Length of each path (default: 5)')
     parser.add_argument('--randomize_vocab_size', type=str, default=None,
                         help='Vocabulary size to randomize on, "auto" will set it based on d and l. (default: None)')
-    parser.add_argument('--num_pause_tokens', type=int, default=1,
-                        help='Number of PAUSE tokens used (default: 1)')
+    # NOTE: --num_pause_tokens is removed - pause tokens are added at runtime
     parser.add_argument('--use_directional_tokens', action='store_true',
                         help='Use directional tokens (> and <)')
     parser.add_argument('--use_task_tokens', action='store_true',
@@ -965,6 +1065,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
     
     print(f"Generating InWeightsPathStar dataset...")
+    print(f"NOTE: Pause tokens are NOT stored in dataset - they are added at runtime")
     
     # Create randomized mapping from canonical node IDs to vocabulary tokens
     num_vertices = args.d * (args.l - 1) + 1
@@ -980,7 +1081,6 @@ if __name__ == '__main__':
     )
     
     generator.prepare(
-        num_pause_tokens=args.num_pause_tokens,
         output_dir=args.output_dir,
         use_undirected=not args.use_directed,
         use_directional_tokens=args.use_directional_tokens,

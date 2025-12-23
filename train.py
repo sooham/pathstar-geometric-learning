@@ -28,7 +28,7 @@ matplotlib.use('Agg')  # Non-interactive backend for server environments
 import matplotlib.pyplot as plt
 
 from model import GPTConfig, GPT
-from pathstar import InWeightsPathStar
+from pathstar import InWeightsPathStar, add_pause_tokens_to_batch, add_pause_tokens_to_edges
 from learning_rate_scheduler import get_lr, initialize_lr_scheduler
 
 # Rich imports
@@ -1246,11 +1246,11 @@ def analyze_embedding_geometry(model, meta, paths_data_np, val_data_np, iter_num
     special_tokens = meta['special_tokens']
     num_special_tokens = len(special_tokens)
     use_task_tokens = meta.get('use_task_tokens', True)
-    num_pause_tokens = meta.get('num_pause_tokens', 1)
     use_task_tokens_in_path = meta.get('use_task_tokens_in_path', False)
     
     # Calculate sequence dimensions from meta
-    seq_len = meta['block_size'] + 1  # Full sequence length
+    # NOTE: Use block_size_base since paths_data_np and val_data_np are raw stored data (WITHOUT pause tokens)
+    seq_len = meta['block_size_base'] + 1  # Full sequence length (stored, without pause tokens)
     PATHS_DATASET_SIZE = meta['PATHS_DATASET_SIZE']
     VAL_DATASET_SIZE = meta['VAL_DATASET_SIZE']
     
@@ -1262,15 +1262,16 @@ def analyze_embedding_geometry(model, meta, paths_data_np, val_data_np, iter_num
         """
         Extract just the graph node tokens from a path sequence.
         
-        Path format: [PATH?, leaf, PAUSE, ..., PAUSE, root, (GT?), n_2, (GT?), ..., leaf]
+        Path format (stored, WITHOUT pause tokens): [PATH?, leaf, root, (GT?), n_2, (GT?), ..., leaf]
         
         Returns list of node tokens: [root, n_2, ..., leaf] (length = l)
         """
         seq = [int(x) for x in sequence]
         
         # Calculate where path nodes start
-        # Skip: PATH token (if present) + leaf + PAUSE tokens
-        path_start_idx = (1 if use_task_tokens else 0) + 1 + num_pause_tokens
+        # NOTE: Stored sequences do NOT have pause tokens
+        # Skip: PATH token (if present) + leaf
+        path_start_idx = (1 if use_task_tokens else 0) + 1
         
         # Extract the path portion
         path_portion = seq[path_start_idx:]
@@ -1777,8 +1778,9 @@ def compute_token_colors(paths_data, val_data, meta):
     
     # Reshape data to get sequences (paths_data is a flat memmap, need to reshape)
     # Calculate sequence length from metadata
-    block_size = meta['block_size']
-    seq_length = block_size + 1  # block_size is context + targets - 1, so full sequence is block_size + 1
+    # NOTE: Use block_size_base (stored length WITHOUT pause tokens) since we're working with raw stored data
+    block_size_base = meta['block_size_base']
+    seq_length = block_size_base + 1  # block_size is context + targets - 1, so full sequence is block_size + 1
     
     # Reshape paths_data and val_data into sequences
     paths_sequences = paths_data.reshape(-1, seq_length)
@@ -1921,8 +1923,8 @@ def train(config=None):
         holdout_percentage=default_config['graph_holdout_percentage'],
     )
 
+    # NOTE: num_pause_tokens is NOT passed here - pause tokens are added at runtime
     gen.generate_dataset_if_needed(
-        num_pause_tokens=default_config['num_pause_tokens'],
         use_undirected=default_config['use_undirected'],
         use_directional_tokens=default_config['use_directional_tokens'],
         use_task_tokens=default_config['use_task_tokens'],
@@ -1931,6 +1933,22 @@ def train(config=None):
     )
     
     meta, paths_data, edges_data, val_data = gen.load_dataset()
+    
+    # num_pause_tokens is a RUNTIME config parameter (not stored in dataset)
+    # Add it to meta for use throughout training
+    num_pause_tokens = default_config['num_pause_tokens']
+    meta['num_pause_tokens'] = num_pause_tokens
+    
+    # Update block_size and path_context_length to include pause tokens
+    # The dataset stores *_base values (without pause tokens)
+    meta['block_size'] = meta['block_size_base'] + num_pause_tokens
+    meta['path_context_length'] = meta['path_context_length_base'] + num_pause_tokens
+    
+    print(f"Runtime pause tokens: {num_pause_tokens}")
+    print(f"  block_size_base (stored): {meta['block_size_base']}")
+    print(f"  block_size (with pause): {meta['block_size']}")
+    print(f"  path_context_length_base (stored): {meta['path_context_length_base']}")
+    print(f"  path_context_length (with pause): {meta['path_context_length']}")
     
     # Only compute token colors if live display is enabled (saves compute)
     if default_config['live_display']:
@@ -2211,10 +2229,10 @@ def train(config=None):
         print(f"Loaded vocabulary mappings: {len(itos)} tokens")
     
     print(f"Dataset info:")
-    print(f"  Paths: {paths_size} sequences of length {paths_seq_length}")
-    print(f"  Edges: {edges_size} sequences of length {edges_seq_length}")
-    print(f"  Val: {VAL_DATASET_SIZE} sequences of length {val_seq_length}")
-    print(f"  Block size: {meta['block_size']}")
+    print(f"  Paths: {paths_size} sequences of length {paths_seq_length} (stored, without pause tokens)")
+    print(f"  Edges: {edges_size} sequences of length {edges_seq_length} (stored, without pause tokens)")
+    print(f"  Val: {VAL_DATASET_SIZE} sequences of length {val_seq_length} (stored, without pause tokens)")
+    print(f"  Block size (with pause tokens): {meta['block_size']}")
     
     assert paths_seq_length == edges_seq_length, f"Sequence length mismatch: paths={paths_seq_length}, edges={edges_seq_length}"
     
@@ -2234,16 +2252,77 @@ def train(config=None):
         
     # Pre-process datasets: Create X (inputs) and Y (targets) tensors with optimized dtype
     # We apply masking to Y statically here to avoid doing it in the inner loop
+    # 
+    # PAUSE TOKENS: The stored dataset does NOT contain pause tokens. We add them here
+    # at preprocessing time based on the runtime config (num_pause_tokens).
     
-    def preprocess_dataset(data_np):
-        # Convert to tensor with optimized dtype
-        data_inv = torch.from_numpy(data_np.astype(np.int64)) # Load as int64 first safely
+    num_pause_tokens = meta['num_pause_tokens']
+    use_task_tokens = meta.get('use_task_tokens', True)
+    PATH_TOKEN = meta['special_tokens'].get('PATH')
+    EDGE_TOKEN = meta['special_tokens'].get('EDGE')
+    
+    def preprocess_dataset(data_np, dataset_type='paths'):
+        """
+        Preprocess dataset by adding pause tokens and creating X/Y tensors.
+        
+        Args:
+            data_np: numpy array of sequences (WITHOUT pause tokens)
+            dataset_type: 'paths', 'edges', 'combined', or 'val'
+                - 'paths'/'val': Insert pause tokens between leaf and path
+                - 'edges': Add padding at the end
+                - 'combined': Smart handling based on task token
+        
+        Returns:
+            X, Y tensors with pause tokens inserted and masking applied
+        """
+        # Convert to tensor
+        data_tensor = torch.from_numpy(data_np.astype(np.int64))
+        
+        # Add pause tokens based on dataset type
+        if num_pause_tokens > 0:
+            if dataset_type in ('paths', 'val'):
+                # PATH sequences: insert pause tokens after [PATH, leaf] or [leaf]
+                data_tensor = add_pause_tokens_to_batch(
+                    data_tensor, num_pause_tokens, pause_token_id, use_task_tokens
+                )
+            elif dataset_type == 'edges':
+                # EDGE sequences: add padding at the end
+                data_tensor = add_pause_tokens_to_edges(
+                    data_tensor, num_pause_tokens, pad_token_id
+                )
+            elif dataset_type == 'combined':
+                # Combined: identify PATH vs EDGE sequences and handle separately
+                if use_task_tokens and PATH_TOKEN is not None and EDGE_TOKEN is not None:
+                    is_path = (data_tensor[:, 0] == PATH_TOKEN)
+                    is_edge = (data_tensor[:, 0] == EDGE_TOKEN)
+                    
+                    # Process in batches by type for efficiency
+                    result = torch.zeros(
+                        (data_tensor.shape[0], data_tensor.shape[1] + num_pause_tokens),
+                        dtype=data_tensor.dtype
+                    )
+                    
+                    if is_path.any():
+                        path_data = add_pause_tokens_to_batch(
+                            data_tensor[is_path], num_pause_tokens, pause_token_id, use_task_tokens
+                        )
+                        result[is_path] = path_data
+                    
+                    if is_edge.any():
+                        edge_data = add_pause_tokens_to_edges(
+                            data_tensor[is_edge], num_pause_tokens, pad_token_id
+                        )
+                        result[is_edge] = edge_data
+                    
+                    data_tensor = result
+                else:
+                    raise ValueError("Combined dataset requires use_task_tokens=True with PATH/EDGE tokens")
         
         # Split into X and Y
         # X: 0 to L-1
         # Y: 1 to L
-        X = data_inv[:, :-1].to(storage_dtype)
-        Y = data_inv[:, 1:].clone() # Keep as int64 temporarily for masking if needed, or mask then cast
+        X = data_tensor[:, :-1].to(storage_dtype)
+        Y = data_tensor[:, 1:].clone()
         
         # Apply masking to Y
         if pad_token_id is not None:
@@ -2251,29 +2330,35 @@ def train(config=None):
         if pause_token_id is not None:
             Y[Y == pause_token_id] = -1
             
-        # Now cast Y to storage dtype. 
-        # Note: -1 (mask) in int16/int32 is preserved as -1 (signed)
+        # Cast Y to storage dtype
         Y = Y.to(storage_dtype)
         
         return X, Y
 
     # Create tensors and load to GPU if pre-calculated decision indicates they fit
     # If interleaving, combined_data is already prepared
+    # NOTE: preprocess_dataset adds pause tokens at runtime based on config
     if default_config['interleave_dataset']:
         paths_X, paths_Y = None, None
         edges_X, edges_Y = None, None
-        print("Pre-processing combined dataset...")
-        combined_X, combined_Y = preprocess_dataset(combined_data)
+        print(f"Pre-processing combined dataset (adding {num_pause_tokens} pause tokens)...")
+        combined_X, combined_Y = preprocess_dataset(combined_data, dataset_type='combined')
         print(f"Created pre-processed combined tensors: X={combined_X.shape}, Y={combined_Y.shape}, dtype={storage_dtype}")
     else:
-        print("Pre-processing separate datasets...")
-        paths_X, paths_Y = preprocess_dataset(paths_data)
-        edges_X, edges_Y = preprocess_dataset(edges_data)
+        print(f"Pre-processing separate datasets (adding {num_pause_tokens} pause tokens)...")
+        paths_X, paths_Y = preprocess_dataset(paths_data, dataset_type='paths')
+        edges_X, edges_Y = preprocess_dataset(edges_data, dataset_type='edges')
         combined_X, combined_Y = None, None
         print(f"Created pre-processed path tensors: X={paths_X.shape}, Y={paths_Y.shape}")
     
     # Store validation data with optimized dtype too (though less critical)
-    val_data_tensor = torch.from_numpy(val_data.astype(np.int64)).to(storage_dtype)
+    # NOTE: Validation data also needs pause tokens added
+    val_data_with_pause = torch.from_numpy(val_data.astype(np.int64))
+    if num_pause_tokens > 0:
+        val_data_with_pause = add_pause_tokens_to_batch(
+            val_data_with_pause, num_pause_tokens, pause_token_id, use_task_tokens
+        )
+    val_data_tensor = val_data_with_pause.to(storage_dtype)
     
     datasets_on_gpu = False
     if device_type == 'cuda':
@@ -2634,19 +2719,21 @@ def train(config=None):
         model.eval()
         
         # Determine data and size
+        # NOTE: data_source_raw is stored data WITHOUT pause tokens
+        # We add pause tokens on-the-fly when needed
         if split == 'val':
             nonlocal val_batch_idx, val_epoch_indices
             # Reset validation batch state for reproducible evaluation
             val_batch_idx = 0
             np.random.shuffle(val_epoch_indices)
             num_iters = eval_iters
-            data_source = val_data
+            data_source_raw = val_data
             data_size = VAL_DATASET_SIZE
         else: # train
             # For training, we sample randomly from paths_data
             # We use a limited number of iterations similar to validation
             num_iters = eval_iters
-            data_source = paths_data
+            data_source_raw = paths_data
             data_size = paths_size
             
         token_losses = {i: [] for i in range(1, graph_length + 1)}
@@ -2659,7 +2746,11 @@ def train(config=None):
                 # Manual sampling for training paths to safely handle interleaved case
                 # and ensures we only evaluate on paths
                 idx = np.random.randint(0, data_size, train_batch_size)
-                batch = torch.from_numpy(data_source[idx].astype(np.int64)).to(device)
+                batch = torch.from_numpy(data_source_raw[idx].astype(np.int64))
+                # Add pause tokens to raw batch (stored data doesn't have them)
+                if num_pause_tokens > 0:
+                    batch = add_pause_tokens_to_batch(batch, num_pause_tokens, pause_token_id, use_task_tokens)
+                batch = batch.to(device)
                 X = batch[:, :-1].contiguous()
                 Y = batch[:, 1:].contiguous()
                 if pad_token_id is not None: Y[Y == pad_token_id] = -1
@@ -2689,9 +2780,15 @@ def train(config=None):
         
         # Compute per-token accuracy (autoregressive)
         # Use small number of samples for speed
+        # NOTE: Need to add pause tokens to raw data before passing to this function
         num_samples_for_accuracy = min(100, data_size)
+        data_source_with_pause = torch.from_numpy(data_source_raw.astype(np.int64))
+        if num_pause_tokens > 0:
+            data_source_with_pause = add_pause_tokens_to_batch(
+                data_source_with_pause, num_pause_tokens, pause_token_id, use_task_tokens
+            )
         per_token_accuracy, generated_text, full_path_accuracy = compute_per_token_accuracy_autoregressive(
-            ctx, model, meta, data_source, num_samples_for_accuracy, device, print_samples
+            ctx, model, meta, data_source_with_pause.numpy(), num_samples_for_accuracy, device, print_samples
         )
         out[f'{split}_per_token_accuracy'] = per_token_accuracy
         out[f'{split}_full_path_accuracy'] = full_path_accuracy
