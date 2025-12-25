@@ -71,6 +71,7 @@ def get_default_config():
         'log_attention_maps': False,  # If True, log attention map heatmaps to wandb
         'attention_map_interval': 500,  # How often to log attention maps (iterations)
         'attention_map_samples': 3,  # Number of samples to visualize
+        'log_activation_stats': True,  # If True, log activation mean/variance per layer to wandb
         'analyze_embedding_geometry': False,  # If True, compute and log embedding geometry metrics during eval
         'show_edge_memorization_metrics': False, # If True, show and log % of edges memorized by model
         # Debugging
@@ -2918,6 +2919,10 @@ def train(config=None):
                 
             steps = min(default_config['gradient_accumulation_steps'], cur_batch_size) if not default_config['interleave_dataset'] else default_config['gradient_accumulation_steps']
 
+            # Track activation stats on the last micro_step only (to avoid overhead)
+            track_stats = default_config.get('log_activation_stats', True)
+            last_activation_stats = None
+            
             for micro_step in range(steps):
                 # Use scheduled sampling for PATH tasks if p_autoregressive_substitution > 0
                 p_sub = default_config.get('p_autoregressive_substitution', 0.0)
@@ -2931,8 +2936,15 @@ def train(config=None):
                     )
                 else:
                     # Standard teacher forcing
+                    # Track activation stats on last micro_step only
+                    should_track = track_stats and (micro_step == steps - 1)
                     with ctx:
-                        _, loss = model(X, Y, label_smoothing=default_config['label_smoothing'])
+                        result = model(X, Y, label_smoothing=default_config['label_smoothing'], 
+                                       track_activation_stats=should_track)
+                        if should_track:
+                            _, loss, last_activation_stats = result
+                        else:
+                            _, loss = result
                 loss = loss / steps
                 
                 # Prefetch next batch while backward pass runs (overlap I/O with compute)
@@ -3030,6 +3042,14 @@ def train(config=None):
                             wandb.log(attn_images, step=iter_num)
                         except Exception as e:
                             console.print(f"[yellow]Warning: Failed to log attention maps: {e}[/yellow]")
+                
+                # Log activation mean/variance per layer (collected during forward pass)
+                if default_config['wandb_log'] and last_activation_stats is not None:
+                    try:
+                        activation_log = {f'activation/{k}': v for k, v in last_activation_stats.items()}
+                        wandb.log(activation_log, step=iter_num)
+                    except Exception as e:
+                        console.print(f"[yellow]Warning: Failed to log activation stats: {e}[/yellow]")
             
             iter_num += 1
             

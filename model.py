@@ -239,17 +239,25 @@ class GPT(nn.Module):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt((2 if self.config.use_mlp else 1) * self.config.n_layer))
 
 
-    def forward(self, idx, targets=None, label_smoothing=0.0):
+    def forward(self, idx, targets=None, label_smoothing=0.0, track_activation_stats=False):
         """
         Assumption: targets are already shifted to account for the correct prediction of 
         of target[i] based on idx[0:i]
 
         idx: tokenized vector of shape (batch, sequence_length)
+        track_activation_stats: if True, also return dict with mean/variance of activations per layer
+        
+        Returns:
+            logits, loss  (if track_activation_stats=False)
+            logits, loss, activation_stats  (if track_activation_stats=True)
         """
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+
+        # Optional activation stats tracking
+        activation_stats = {} if track_activation_stats else None
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
@@ -258,9 +266,22 @@ class GPT(nn.Module):
         # This randomly zeros out some elements with probability config.dropout,
         # helping prevent overfitting by making the model more robust.
         x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.h:
+        
+        if track_activation_stats:
+            activation_stats['embedding_mean'] = x.mean().item()
+            activation_stats['embedding_var'] = x.var().item()
+        
+        for i, block in enumerate(self.transformer.h):
             x = block(x)
+            if track_activation_stats:
+                activation_stats[f'layer_{i}_mean'] = x.mean().item()
+                activation_stats[f'layer_{i}_var'] = x.var().item()
+        
         x = self.transformer.ln_f(x)
+        
+        if track_activation_stats:
+            activation_stats['final_mean'] = x.mean().item()
+            activation_stats['final_var'] = x.var().item()
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
@@ -272,6 +293,8 @@ class GPT(nn.Module):
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
+        if track_activation_stats:
+            return logits, loss, activation_stats
         return logits, loss
 
     def get_attention_maps(self, idx):
