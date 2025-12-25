@@ -54,6 +54,7 @@ fi
 SWEEP_CONFIG=$1
 PROJECT=${2:-pathstar_sweep_dataset}  # Default project name
 ENTITY=${3:-}  # Optional entity name
+AGENTS_PER_GPU=${4:-1} # Default to 1 agent per GPU
 
 echo "========================================="
 echo "Multi-GPU Sweep Runner"
@@ -121,27 +122,37 @@ if [ $NUM_GPUS -eq 0 ]; then
 fi
 
 # Launch agents on each GPU in the background
-for ((gpu=0; gpu<$NUM_GPUS; gpu++)); do
-    echo "Launching agent on GPU $gpu..."
-    CUDA_VISIBLE_DEVICES=$gpu python3 run_sweep.py \
-        --sweep_id $SWEEP_ID \
-        --project $PROJECT \
-        --sweep_config $SWEEP_CONFIG \
-        --num_gpus $NUM_GPUS \
-        --gpu_id $gpu \
-        $ENTITY_ARG \
-        > gpu_${gpu}_sweep.log 2>&1 &
+    TOTAL_WORKERS=$((NUM_GPUS * AGENTS_PER_GPU))
     
-    # Store process ID in array for cleanup
-    PID=$!
-    AGENT_PIDS+=($PID)
-    echo "  PID: $PID"
-    echo "  Log: gpu_${gpu}_sweep.log"
-    echo ""
-    
-    # Small delay to avoid race conditions
-    sleep 2
-done
+    for ((gpu=0; gpu<$NUM_GPUS; gpu++)); do
+        for ((i=0; i<$AGENTS_PER_GPU; i++)); do
+            # Calculate a unique worker rank for this agent across all GPUs
+            # Formula: worker_rank = (gpu_index * agents_per_gpu) + agent_index_on_this_gpu
+            WORKER_RANK=$((gpu * AGENTS_PER_GPU + i))
+            
+            echo "Launching agent $i on GPU $gpu (Global Worker Rank: $WORKER_RANK / $TOTAL_WORKERS)..."
+            
+            CUDA_VISIBLE_DEVICES=$gpu python3 run_sweep.py \
+                --sweep_id $SWEEP_ID \
+                --project $PROJECT \
+                --sweep_config $SWEEP_CONFIG \
+                --gpu_id $gpu \
+                --worker_rank $WORKER_RANK \
+                --num_workers $TOTAL_WORKERS \
+                $ENTITY_ARG \
+                > gpu_${gpu}_agent_${i}_sweep.log 2>&1 &
+            
+            # Store process ID in array for cleanup
+            PID=$!
+            AGENT_PIDS+=($PID)
+            echo "  PID: $PID"
+            echo "  Log: gpu_${gpu}_agent_${i}_sweep.log"
+            echo ""
+            
+            # Small delay to avoid race conditions
+            sleep 2
+        done
+    done
 
 echo "========================================="
 echo "All agents launched!"
@@ -153,9 +164,11 @@ echo "  - Distributed evenly across $NUM_GPUS GPU(s)"
 echo "  - Each agent knows exactly how many runs to execute"
 echo ""
 echo "Monitor progress:"
-echo "  - wandb dashboard: https://wandb.ai/<your-entity>/$PROJECT/sweeps/$SWEEP_ID"
+echo "  - wandb dashboard: https://wandb.ai/${ENTITY:-<your-entity>}/$PROJECT/sweeps/$SWEEP_ID"
 for ((gpu=0; gpu<$NUM_GPUS; gpu++)); do
-    echo "  - GPU $gpu log: tail -f gpu_${gpu}_sweep.log"
+    for ((i=0; i<$AGENTS_PER_GPU; i++)); do
+        echo "  - GPU $gpu Agent $i log: tail -f gpu_${gpu}_agent_${i}_sweep.log"
+    done
 done
 echo ""
 echo "To stop all agents:"

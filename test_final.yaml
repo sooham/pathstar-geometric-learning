@@ -51,7 +51,7 @@ parameters:
         bias: [true]
         base: 100
         learning_rate: 1e-3
-        weight_decay: 0.01
+        weight_decay: 0
         lr_scheduler: 'None' #'ReduceLROnPlateau'
         epochs: 15_000
         use_mlp: [true]

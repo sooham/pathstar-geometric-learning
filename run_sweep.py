@@ -245,7 +245,11 @@ def main():
     parser.add_argument('--gpu_id', type=str, default=None,
                         help='GPU/Worker ID to use (will set CUDA_VISIBLE_DEVICES). Use for load balancing.')
     parser.add_argument('--num_gpus', type=int, default=1,
-                        help='Total number of workers/GPUs running agents (for auto-distributing grid search runs)')
+                        help='Total number of workers/GPUs running agents (for auto-distributing grid search runs). DEPRECATED: use --num_workers instead if running multiple agents per GPU.')
+    parser.add_argument('--worker_rank', type=int, default=None,
+                        help='Rank of this worker (0 to num_workers-1). Used for logical distribution of runs. Defaults to gpu_id if not set.')
+    parser.add_argument('--num_workers', type=int, default=None,
+                        help='Total number of experimental workers. Used for logical distribution of runs. Defaults to num_gpus if not set.')
     args = parser.parse_args()
     
     # Set GPU if specified
@@ -257,6 +261,26 @@ def main():
     cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', 'not set')
     print(f"CUDA_VISIBLE_DEVICES: {cuda_visible}")
     
+    # Determine logical worker rank and total workers
+    # If explicit worker args are provided, use them.
+    # Otherwise fallback to gpu_id/num_gpus for backward compatibility.
+    
+    # Default num_workers to num_gpus if not specified
+    num_workers = args.num_workers if args.num_workers is not None else args.num_gpus
+    
+    # Default worker_rank to gpu_id (as int) if not specified
+    # Note: gpu_id defaults to None, but usually set in multi-gpu context
+    worker_rank = args.worker_rank
+    if worker_rank is None:
+        if args.gpu_id is not None and args.gpu_id.isdigit():
+            worker_rank = int(args.gpu_id)
+        else:
+            worker_rank = 0
+
+    print(f"Worker Configuration:")
+    print(f"  Physical GPU ID: {args.gpu_id if args.gpu_id is not None else 'N/A'}")
+    print(f"  Logical Worker Rank: {worker_rank} / {num_workers}")
+
     # Load sweep config if provided
     sweep_config = None
     if args.sweep_config:
@@ -345,22 +369,21 @@ def main():
     if run_count is None and sweep_config is not None:
         total_runs = calculate_total_runs(sweep_config)
         if total_runs is not None:
-            # Distribute runs across GPUs
-            runs_per_gpu = total_runs // args.num_gpus
-            remainder = total_runs % args.num_gpus
+            # Distribute runs across workers
+            runs_per_worker = total_runs // num_workers
+            remainder = total_runs % num_workers
             
-            # Current GPU gets extra run if there's a remainder and it's one of the first GPUs
-            gpu_idx = int(args.gpu_id) if args.gpu_id is not None else 0
-            if gpu_idx < remainder:
-                run_count = runs_per_gpu + 1
+            # Current worker gets extra run if there's a remainder and it's one of the first workers
+            if worker_rank < remainder:
+                run_count = runs_per_worker + 1
             else:
-                run_count = runs_per_gpu
+                run_count = runs_per_worker
             
             print(f"\nAuto-calculated run distribution:")
             print(f"  Total grid search runs: {total_runs}")
-            print(f"  Number of GPUs: {args.num_gpus}")
-            print(f"  Runs per GPU: {runs_per_gpu} (+ {remainder} GPU(s) get 1 extra)")
-            print(f"  This GPU (ID {gpu_idx}): {run_count} runs")
+            print(f"  Number of Workers: {num_workers}")
+            print(f"  Runs per Worker: {runs_per_worker} (+ {remainder} Worker(s) get 1 extra)")
+            print(f"  This Worker (Rank {worker_rank}): {run_count} runs")
     
     # Run agent
     # Note: If sweep_id is in full format (entity/project/sweep_id), entity/project parameters may be ignored
