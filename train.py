@@ -588,7 +588,7 @@ def create_architecture_info_panel(config):
         f"[bold cyan]Act:[/bold cyan] {activation}  "
         f"{mlp_label}  {ln_label}  {bias_label}  "
         f"[dim]{dropout_str}[/dim]"
-        f"{seed_label}"
+        f"[dim]seed={seed_label}[/dim]"
     )
     
     return Text.from_markup(info_str)
