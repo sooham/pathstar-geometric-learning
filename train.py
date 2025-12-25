@@ -1636,7 +1636,7 @@ def evaluate(estimate_metrics, config, meta, iter_num, lr, ctx, device, model, v
             'warmup_iters': meta['warmup_iters'],
             "epoch": round(current_epoch, 4),
             "val/loss/overall": losses['val'],
-            "train/loss/eval": losses['train'],
+            "train/loss/eval_paths": losses['train'],
             "lr": lr,
             #"gen/val_paths_avg_accuracy": val_avg_accuracy,
             # "gen/train_paths_avg_accuracy": train_avg_accuracy,
