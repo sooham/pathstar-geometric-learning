@@ -86,7 +86,6 @@ def get_default_config():
         'num_pause_tokens': 5,
         'use_undirected': True,
         'use_directional_tokens': False,
-        'use_task_tokens': False,
         # If True, PATH task sequences interleave GT tokens between edges:
         #   [PATH] leaf (PAUSE)xN root GT n2 GT n3 ... GT leaf
         'use_task_tokens_in_path': False,
@@ -178,30 +177,17 @@ def compute_per_token_loss_with_teacher_forcing(meta, logits, input, targets, to
 
     per_token_losses = {}
     
-    use_task_tokens = meta.get('use_task_tokens', True)
-    
-    # Compute context length per input based on task type and task tokens
-    if use_task_tokens:
-        # Use task tokens to determine context length
-        context_length_per_input = torch.where(
-            input[:, 0] == meta['special_tokens']['EDGE'],
-            torch.tensor((1 if use_task_tokens else 0) + (1 if meta['use_directional_tokens'] else 0) + 1, device=input.device),
-            torch.where(
-                input[:, 0] == meta['special_tokens']['PATH'],
-                torch.tensor((1 if use_task_tokens else 0) + 1 + meta['num_pause_tokens'], device=input.device),
-                torch.tensor(0, device=input.device)
-            )
-        ).unsqueeze(1)
-    else:
-        # No task tokens - compute based on task_type
-        if task_type == 'edge':
-            # Edge: (directional token if present) + 1
-            edge_context = (1 if meta['use_directional_tokens'] else 0) + 1
-            context_length_per_input = torch.full((input.size(0), 1), edge_context, device=input.device, dtype=torch.long)
-        else:  # path
-            # Path: leaf + pause tokens
-            path_context = 1 + meta['num_pause_tokens']
-            context_length_per_input = torch.full((input.size(0), 1), path_context, device=input.device, dtype=torch.long)
+    # Compute context length per input based on task type
+    # Use task tokens (PATH/EDGE prefix) to determine context length
+    context_length_per_input = torch.where(
+        input[:, 0] == meta['special_tokens']['EDGE'],
+        torch.tensor(1 + (1 if meta['use_directional_tokens'] else 0) + 1, device=input.device),
+        torch.where(
+            input[:, 0] == meta['special_tokens']['PATH'],
+            torch.tensor(1 + 1 + meta['num_pause_tokens'], device=input.device),
+            torch.tensor(0, device=input.device)
+        )
+    ).unsqueeze(1)
     
     for token_pos in token_positions_to_record:
         y_idx = context_length_per_input + token_pos - 2 # TODO: I think there is an issue here
@@ -531,10 +517,10 @@ def create_metrics_table(metrics, graph_length, iter_num, epoch, lr, tokens_per_
     title += ")"
     table = Table(title=title, show_header=True, header_style="bold magenta")
     table.add_column("Pos", style="cyan", justify="center")
-    table.add_column("Train Loss", style="red", justify="right")
-    table.add_column("Val Loss", style="red", justify="right")
-    table.add_column("Train Acc", style="green", justify="right")
-    table.add_column("Val Acc", style="green", justify="right")
+    table.add_column("Train Loss (TF)", style="red", justify="right")
+    table.add_column("Val Loss (TF)", style="red", justify="right")
+    table.add_column("Train Acc (Autoregressive)", style="green", justify="right")
+    table.add_column("Val Acc (Autoregressive)", style="green", justify="right")
     
     # The live metrics panel has a fixed height in the UI; for long sequences the table will be
     # visually truncated. To make it obvious we still compute all tokens, we display:
@@ -648,7 +634,6 @@ def evaluate_edge_memorization(ctx, model, meta, edges_data_np, device, batch_si
     print(f"Total edges: {num_edges}")
     print(f"Batch size: {batch_size}")
     print(f"Number of batches: {num_batches}")
-    print(f"use_task_tokens: {meta.get('use_task_tokens', False)}")
     print(f"use_directional_tokens: {meta.get('use_directional_tokens', False)}")
     
     for batch_idx in range(num_batches):
@@ -660,9 +645,9 @@ def evaluate_edge_memorization(ctx, model, meta, edges_data_np, device, batch_si
         
         predict_dir = bool(meta.get('predict_direction_for_edge_task', False))
         if predict_dir:
-            pos = (1 if meta.get('use_task_tokens', False) else 0) + 2
+            pos = 1 + 2  # EDGE token + u + v
         else:
-            pos = (1 if meta.get('use_task_tokens', False) else 0) + (1 if meta.get('use_directional_tokens', False) else 0) + 1
+            pos = 1 + (1 if meta.get('use_directional_tokens', False) else 0) + 1
 
         X = batch[:, :pos]
         Y_true = batch[:, pos]
@@ -698,12 +683,8 @@ def compute_per_token_accuracy_autoregressive(ctx, model, meta, val_data_batch, 
     """Compute per-token accuracy using autoregressive generation"""
     sample_indices = np.random.choice(len(val_data_batch), size=min(num_samples, len(val_data_batch)), replace=False)
     
-    # Calculate context length based on whether task tokens are used
-    use_task_tokens = meta.get('use_task_tokens', True)
-    if use_task_tokens:
-        context_length = 2 + meta['num_pause_tokens']  # task token + leaf + pause tokens
-    else:
-        context_length = 1 + meta['num_pause_tokens']  # leaf + pause tokens
+    # Context length: task token + leaf + pause tokens
+    context_length = 2 + meta['num_pause_tokens']
     
     contexts = []
     ground_truths = []
@@ -825,12 +806,8 @@ def generate_samples_autoregressive(device, ctx, model, meta, data, data_size, s
     # Sample randomly without replacement (data is already path-only)
     sample_indices = np.random.choice(data_size, size=num_samples, replace=False)
     
-    # Calculate context length based on whether task tokens are used
-    use_task_tokens = meta.get('use_task_tokens', True)
-    if use_task_tokens:
-        context_length = 2 + meta['num_pause_tokens']  # task token + leaf + pause tokens
-    else:
-        context_length = 1 + meta['num_pause_tokens']  # leaf + pause tokens
+    # Context length: task token + leaf + pause tokens
+    context_length = 2 + meta['num_pause_tokens']
     contexts = []
     ground_truths = []
     path_target_len = int(meta.get('path_target_length', meta['l']))
@@ -918,7 +895,6 @@ def set_wandb_name(config):
             utc_time = datetime.utcnow().strftime('%Y%m%dT%H%M%S')
             commit_id = get_git_commit_id()
             dir_label = "Udir" if config["use_undirected"] else "Dir"
-            tt_label = "Tt" if config['use_task_tokens'] else ''
             dt_label = 'Dt' if config['use_directional_tokens'] else ''
             ptgt_label = 'Pgt' if config.get('use_task_tokens_in_path', False) else ''
             ped_or_pet_label = 'Pd' if config['predict_direction_for_edge_task'] else 'Pe'
@@ -944,7 +920,6 @@ def set_wandb_name(config):
                 f"P{config['num_pause_tokens']}"
                 f"{ped_or_pet_label}"
                 f"{dir_label}"
-                f"{tt_label}"
                 f"{dt_label}"
                 f"{ptgt_label}"
                 "_"
@@ -1245,7 +1220,6 @@ def analyze_embedding_geometry(model, meta, paths_data_np, val_data_np, iter_num
     l = meta['l']
     special_tokens = meta['special_tokens']
     num_special_tokens = len(special_tokens)
-    use_task_tokens = meta.get('use_task_tokens', True)
     use_task_tokens_in_path = meta.get('use_task_tokens_in_path', False)
     
     # Calculate sequence dimensions from meta
@@ -1270,8 +1244,8 @@ def analyze_embedding_geometry(model, meta, paths_data_np, val_data_np, iter_num
         
         # Calculate where path nodes start
         # NOTE: Stored sequences do NOT have pause tokens
-        # Skip: PATH token (if present) + leaf
-        path_start_idx = (1 if use_task_tokens else 0) + 1
+        # Skip: PATH token + leaf
+        path_start_idx = 2
         
         # Extract the path portion
         path_portion = seq[path_start_idx:]
@@ -1771,7 +1745,6 @@ def compute_token_colors(paths_data, val_data, meta):
     # Extract metadata for coloring
     root_vertex = meta['root_vertex']
     special_tokens = set(meta['special_tokens'].values())
-    use_task_tokens = meta['use_task_tokens']
     
     # Build a mapping from each token to its distance from root
     token_to_depth = {}
@@ -1788,8 +1761,8 @@ def compute_token_colors(paths_data, val_data, meta):
     
     # Process training paths to determine depth
     for path_seq in paths_sequences:
-        # Skip special tokens and find the actual path
-        path_tokens = [t for t in path_seq[1+(1 if use_task_tokens else 0):] if t not in special_tokens]
+        # Skip PATH token and leaf, find the actual path
+        path_tokens = [t for t in path_seq[2:] if t not in special_tokens]
         if len(path_tokens) > 0:
             # First token after special tokens should be leaf, last should be root
             for i, token in enumerate(path_tokens):
@@ -1801,7 +1774,7 @@ def compute_token_colors(paths_data, val_data, meta):
     
     # Process validation paths
     for path_seq in val_sequences:
-        path_tokens = [t for t in path_seq[1+(1 if use_task_tokens else 0):] if t not in special_tokens]
+        path_tokens = [t for t in path_seq[2:] if t not in special_tokens]
         if len(path_tokens) > 0:
             for i, token in enumerate(path_tokens):
                 depth = len(path_tokens) - 1 - i
@@ -1927,7 +1900,6 @@ def train(config=None):
     gen.generate_dataset_if_needed(
         use_undirected=default_config['use_undirected'],
         use_directional_tokens=default_config['use_directional_tokens'],
-        use_task_tokens=default_config['use_task_tokens'],
         predict_direction_for_edge_task=default_config['predict_direction_for_edge_task'],
         use_task_tokens_in_path=default_config.get('use_task_tokens_in_path', False),
     )
@@ -1988,7 +1960,7 @@ def train(config=None):
     # Log scheduled sampling configuration
     p_sub = default_config.get('p_autoregressive_substitution', 0.0)
     if p_sub > 0:
-        if default_config['interleave_dataset'] and default_config['use_task_tokens']:
+        if default_config['interleave_dataset']:
             print(f"\n=== Scheduled Sampling (Autoregressive Substitution) ===")
             print(f"  p_autoregressive_substitution: {p_sub}")
             print(f"  PATH sequences: With probability {p_sub}, teacher-forced tokens will be")
@@ -1998,8 +1970,8 @@ def train(config=None):
             print(f"=========================================================\n")
         else:
             print(f"\n[Warning] p_autoregressive_substitution={p_sub} is set but will be ignored.")
-            print(f"          Scheduled sampling requires: interleave_dataset=True, use_task_tokens=True")
-            print(f"          Current: interleave_dataset={default_config['interleave_dataset']}, use_task_tokens={default_config['use_task_tokens']}\n")
+            print(f"          Scheduled sampling requires: interleave_dataset=True")
+            print(f"          Current: interleave_dataset={default_config['interleave_dataset']}\n")
 
     # Auto-detect device
     device, device_type, gpu_id = detect_device(default_config)
@@ -2257,7 +2229,6 @@ def train(config=None):
     # at preprocessing time based on the runtime config (num_pause_tokens).
     
     num_pause_tokens = meta['num_pause_tokens']
-    use_task_tokens = meta.get('use_task_tokens', True)
     PATH_TOKEN = meta['special_tokens'].get('PATH')
     EDGE_TOKEN = meta['special_tokens'].get('EDGE')
     
@@ -2281,9 +2252,9 @@ def train(config=None):
         # Add pause tokens based on dataset type
         if num_pause_tokens > 0:
             if dataset_type in ('paths', 'val'):
-                # PATH sequences: insert pause tokens after [PATH, leaf] or [leaf]
+                # PATH sequences: insert pause tokens after [PATH, leaf]
                 data_tensor = add_pause_tokens_to_batch(
-                    data_tensor, num_pause_tokens, pause_token_id, use_task_tokens
+                    data_tensor, num_pause_tokens, pause_token_id
                 )
             elif dataset_type == 'edges':
                 # EDGE sequences: add padding at the end
@@ -2292,7 +2263,7 @@ def train(config=None):
                 )
             elif dataset_type == 'combined':
                 # Combined: identify PATH vs EDGE sequences and handle separately
-                if use_task_tokens and PATH_TOKEN is not None and EDGE_TOKEN is not None:
+                if PATH_TOKEN is not None and EDGE_TOKEN is not None:
                     is_path = (data_tensor[:, 0] == PATH_TOKEN)
                     is_edge = (data_tensor[:, 0] == EDGE_TOKEN)
                     
@@ -2304,7 +2275,7 @@ def train(config=None):
                     
                     if is_path.any():
                         path_data = add_pause_tokens_to_batch(
-                            data_tensor[is_path], num_pause_tokens, pause_token_id, use_task_tokens
+                            data_tensor[is_path], num_pause_tokens, pause_token_id
                         )
                         result[is_path] = path_data
                     
@@ -2316,7 +2287,7 @@ def train(config=None):
                     
                     data_tensor = result
                 else:
-                    raise ValueError("Combined dataset requires use_task_tokens=True with PATH/EDGE tokens")
+                    raise ValueError("Combined dataset requires PATH/EDGE tokens")
         
         # Split into X and Y
         # X: 0 to L-1
@@ -2356,7 +2327,7 @@ def train(config=None):
     val_data_with_pause = torch.from_numpy(val_data.astype(np.int64))
     if num_pause_tokens > 0:
         val_data_with_pause = add_pause_tokens_to_batch(
-            val_data_with_pause, num_pause_tokens, pause_token_id, use_task_tokens
+            val_data_with_pause, num_pause_tokens, pause_token_id
         )
     val_data_tensor = val_data_with_pause.to(storage_dtype)
     
@@ -2505,7 +2476,6 @@ def train(config=None):
         - Combined: apply per-sample based on task/direction tokens.
         """
         # y is (B, T) where T == x.size(1)
-        use_task_tokens = meta.get('use_task_tokens', True)
         use_directional_tokens = meta.get('use_directional_tokens', True)
 
         special = meta.get('special_tokens', {}) or {}
@@ -2537,11 +2507,9 @@ def train(config=None):
 
         def mask_paths(x_in, y_in):
             y_out = y_in.clone()
-            # If PATH task token exists, the first target token is the leaf; ignore it.
-            if use_task_tokens:
-                path_rows = (x_in[:, 0] == PATH)
-                y_out[path_rows, 0] = -1 # ignore the first targent token leaf
-            # no task token, first token in y is PAUSE or the root which is already masked correctly
+            # PATH task token exists, the first target token is the leaf; ignore it.
+            path_rows = (x_in[:, 0] == PATH)
+            y_out[path_rows, 0] = -1  # ignore the first target token (leaf)
             return y_out
 
         if dataset == 'edges':
@@ -2549,28 +2517,11 @@ def train(config=None):
         if dataset == 'paths':
             return mask_paths(x, y)
         if dataset == 'combined':
-            # Need to determine per-sample task type.
-            if use_task_tokens:
-                if EDGE is None or PATH is None:
-                    raise ValueError("Combined dataset requires EDGE and PATH tokens in metadata when use_task_tokens=True")
-                is_edge = (x[:, 0] == EDGE)
-                is_path = (x[:, 0] == PATH)
-            else:
-                # Without task tokens, we can only disambiguate if directional tokens are present.
-                if not use_directional_tokens:
-                    raise ValueError("Cannot interleave edges/paths without task tokens or directional tokens (ambiguous sequences).")
-                # Note: if predict_direction_for_edge_task=True, EDGE sequences do not contain GT/LT in X
-                # (direction is the supervised token), so disambiguation is impossible without task tokens.
-                if bool(meta.get('predict_direction_for_edge_task', False)):
-                    raise ValueError("Cannot interleave edges/paths without task tokens when predict_direction_for_edge_task=True (ambiguous sequences).")
-                # For predict_direction_for_edge_task=False, EDGE examples include GT/LT inside X.
-                # Support both historical layouts:
-                #   - [GT/LT, u, v, ...]  (direction first)
-                #   - [u, GT/LT, v, ...]  (u first)
-                is_edge = (x[:, 0] == GT) | (x[:, 0] == LT)
-                if x.size(1) >= 2:
-                    is_edge = is_edge | (x[:, 1] == GT) | (x[:, 1] == LT)
-                is_path = ~is_edge
+            # Need to determine per-sample task type using task tokens
+            if EDGE is None or PATH is None:
+                raise ValueError("Combined dataset requires EDGE and PATH tokens in metadata")
+            is_edge = (x[:, 0] == EDGE)
+            is_path = (x[:, 0] == PATH)
 
             y_out = y.clone()
             if is_edge.any():
@@ -2749,7 +2700,7 @@ def train(config=None):
                 batch = torch.from_numpy(data_source_raw[idx].astype(np.int64))
                 # Add pause tokens to raw batch (stored data doesn't have them)
                 if num_pause_tokens > 0:
-                    batch = add_pause_tokens_to_batch(batch, num_pause_tokens, pause_token_id, use_task_tokens)
+                    batch = add_pause_tokens_to_batch(batch, num_pause_tokens, pause_token_id)
                 batch = batch.to(device)
                 X = batch[:, :-1].contiguous()
                 Y = batch[:, 1:].contiguous()
@@ -2785,7 +2736,7 @@ def train(config=None):
         data_source_with_pause = torch.from_numpy(data_source_raw.astype(np.int64))
         if num_pause_tokens > 0:
             data_source_with_pause = add_pause_tokens_to_batch(
-                data_source_with_pause, num_pause_tokens, pause_token_id, use_task_tokens
+                data_source_with_pause, num_pause_tokens, pause_token_id
             )
         per_token_accuracy, generated_text, full_path_accuracy = compute_per_token_accuracy_autoregressive(
             ctx, model, meta, data_source_with_pause.numpy(), num_samples_for_accuracy, device, print_samples
@@ -2924,7 +2875,7 @@ def train(config=None):
             for micro_step in range(steps):
                 # Use scheduled sampling for PATH tasks if p_autoregressive_substitution > 0
                 p_sub = default_config.get('p_autoregressive_substitution', 0.0)
-                if p_sub > 0 and default_config['interleave_dataset'] and default_config['use_task_tokens']:
+                if p_sub > 0 and default_config['interleave_dataset']:
                     # Scheduled sampling: substitute teacher-forced tokens with model predictions
                     # for PATH sequences (EDGE sequences still use pure teacher forcing)
                     _, loss = forward_with_scheduled_sampling(
