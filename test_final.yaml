@@ -17,7 +17,7 @@ parameters:
   graph_holdout_percentage:
     value: 0.2
   num_pause_tokens:
-    values: [5] 
+    values: [1,5] 
   use_undirected:
     value: true
   use_directional_tokens:
