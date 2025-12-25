@@ -551,6 +551,48 @@ def create_metrics_table(metrics, graph_length, iter_num, epoch, lr, tokens_per_
     return table
 
 
+def create_architecture_info_panel(config):
+    """Create a Rich Text display for architecture info"""
+    # Extract architecture parameters
+    n_layer = config.get('n_layer', '?')
+    n_embd = config.get('n_embd', '?')
+    n_head = config.get('n_head', '?')
+
+    num_pause = config.get('num_pause_tokens', 0)
+    activation = config.get('activation', 'GELU')
+    use_ln = config.get('use_layernorm', True)
+    use_bias = config.get('bias', False)
+    use_mlp = config.get('use_mlp', True)
+    dropout = config.get('dropout', 0.0)
+    embd_dropout = config.get('embd_dropout', 0.0)
+    
+    # Format labels
+    ln_label = "[green]LN[/green]" if use_ln else "[dim]no-LN[/dim]"
+    bias_label = "[green]Bias[/green]" if use_bias else "[dim]no-Bias[/dim]"
+    mlp_label = "[green]MLP[/green]" if use_mlp else "[dim]no-MLP[/dim]"
+
+    seed_label = config.get('seed', '?')
+    
+    # Dropout display
+    if dropout == embd_dropout:
+        dropout_str = f"D={dropout}"
+    else:
+        dropout_str = f"D={dropout}/ED={embd_dropout}"
+    
+    info_str = (
+        f"[bold cyan]Layers:[/bold cyan] {n_layer}  "
+        f"[bold cyan]Embd:[/bold cyan] {n_embd}  "
+        f"[bold cyan]Heads:[/bold cyan] {n_head}  "
+        f"[bold cyan]Pause:[/bold cyan] {num_pause}  "
+        f"[bold cyan]Act:[/bold cyan] {activation}  "
+        f"{mlp_label}  {ln_label}  {bias_label}  "
+        f"[dim]{dropout_str}[/dim]"
+        f"{seed_label}"
+    )
+    
+    return Text.from_markup(info_str)
+
+
 def create_embedding_geometry_table(embedding_geometry, l):
     """Create a Rich Table for embedding geometry cosine similarities"""
     if embedding_geometry is None:
@@ -2777,6 +2819,7 @@ def train(config=None):
         
         # Build layout based on enabled features
         layout_components = [
+            Layout(name="architecture", size=3),  # Compact architecture info
             Layout(name="metrics", size=14),  # Fixed size for metrics table
             Layout(name="evaluation"),
         ]
@@ -2787,6 +2830,9 @@ def train(config=None):
         
         layout.split_column(*layout_components)
         
+        # Initialize architecture panel with config info (static, doesn't change during training)
+        arch_info = create_architecture_info_panel(default_config)
+        layout["architecture"].update(Panel(Align.center(arch_info), title="Architecture", border_style="cyan"))
         layout["metrics"].update(Panel("Waiting for first evaluation...", title="Validation Metrics", border_style="magenta"))
         layout["evaluation"].update(Panel("Waiting for first evaluation...", title="Evaluation Examples", border_style="blue"))
         if show_training_slices:
