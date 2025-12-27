@@ -587,7 +587,7 @@ def create_architecture_info_panel(config):
         f"[bold cyan]Pause:[/bold cyan] {num_pause}  "
         f"[bold cyan]Act:[/bold cyan] {activation}  "
         f"{mlp_label}  {ln_label}  {bias_label}  "
-        f"[dim]{dropout_str}[/dim]"
+        f"[dim]{dropout_str}[/dim] "
         f"[dim]seed={seed_label}[/dim]"
     )
     
@@ -1094,16 +1094,6 @@ def initalize_model(device, meta, config, checkpoint_filename):
     model.to(device)
 
     return model, model_args, checkpoint,  iter_num
-
-def get_theoretical_loss(meta):
-    # Calculate theoretical baseline for train/loss/token_1
-    # This represents the expected loss for the first token prediction
-    root_edges_in_dataset = meta['d']
-    theoretical_token_1_loss = -np.log(
-        (meta['total_edge_size'] - root_edges_in_dataset + meta['replicated_train_paths'] + 1) / meta['TRAIN_DATASET_SIZE']
-    )
-    print(f"Theoretical baseline for train/loss/token_1: {theoretical_token_1_loss:.4f}")
-    return theoretical_token_1_loss
     
 def calculate_optimal_batch_size_for_training(model, block_size, vocab_size, device, dtype, 
                                     gradient_accumulation_steps, safety_factor=0.90, reserved_memory=0, target_batch_size=None):
@@ -2245,7 +2235,7 @@ def train(config=None):
         GT_token = meta['special_tokens']['GT']
         EDGE_token = meta['special_tokens']['EDGE']
         num_gt_edges_from_root = 0
-        edges_data_to_check = edges_data_np
+        edges_data_to_check = edges_data
         
         for i in range(len(edges_data_to_check)):
             seq = edges_data_to_check[i]
@@ -2306,8 +2296,6 @@ def train(config=None):
         meta['theoretical_min_loss'] = optimal_loss
         meta['entropy_mass'] = entropy_mass
         meta['total_contributing_tokens'] = total_tokens
-        
-        wandb.log({'train/optimal_loss': optimal_loss})
     
     meta_vocab_size = meta['randomize_vocab_size']
     print(f"found randomize_vocab_size= {meta_vocab_size}")
@@ -3132,6 +3120,7 @@ def train(config=None):
                         'train/loss/running_avg_epoch': running_avg_loss,
                         'train/batch_composition/num_edges': num_edges_in_batch,
                         'train/batch_composition/num_paths': num_paths_in_batch,
+                        'train/optimal_loss': meta['theoretical_min_loss'],
                         'dt': dt,
                         'iter': iter_num,
                         "epoch": round(current_epoch, 4),
