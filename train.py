@@ -2240,6 +2240,35 @@ def train(config=None):
         path_target_len = int(meta.get('path_target_length', meta['l']))
         total_tokens = (n_path_samples * path_target_len) + (n_edge_samples * 1)
         
+        # DEBUG: Count how many GT edges from root are actually in the dataset
+        root_vertex = meta['root_vertex']
+        GT_token = meta['special_tokens']['GT']
+        EDGE_token = meta['special_tokens']['EDGE']
+        num_gt_edges_from_root = 0
+        edges_data_to_check = edges_data_np
+        
+        for i in range(len(edges_data_to_check)):
+            seq = edges_data_to_check[i]
+            # Check if this is an edge starting from root with GT direction
+            # Format depends on predict_direction_for_edge_task:
+            # - False: [EDGE, u, GT, v, ...]
+            # - True: [EDGE, u, v, GT, ...]
+            if seq[0] != EDGE_token:
+                continue
+            
+            if predict_dir:
+                # Format: [EDGE, u, v, GT/LT, ...]
+                # Check if u == root and direction == GT
+                if len(seq) >= 4 and seq[1] == root_vertex and seq[3] == GT_token:
+                    num_gt_edges_from_root += 1
+            else:
+                # Format: [EDGE, u, GT/LT, v, ...]
+                # Check if u == root and direction == GT  
+                if len(seq) >= 4 and seq[1] == root_vertex and seq[2] == GT_token:
+                    num_gt_edges_from_root += 1
+        
+        print(f"DEBUG: Found {num_gt_edges_from_root} GT edges from root in edge dataset (expected: {meta['d']})")
+        
         # Calculate total entropy (Loss Mass)
         # Paths: Assumed perfect memorization -> 0 entropy.
         # Edges: 
@@ -2249,16 +2278,35 @@ def train(config=None):
         #     - From Root (LT): Not possible (Root has no parent).
         #     - From Node (GT): 1 branch (linear path). Entropy = 0.
         #     - From Node (LT): 1 branch (parent). Entropy = 0.
-        #     Total Entropy Mass = d * log(d)
+        #     Total Entropy Mass = num_gt_edges_from_root * log(num_gt_edges_from_root)
         
         if predict_dir:
             optimal_loss = 0.0
         else:
-            d_val = meta['d']
-            entropy_mass = d_val * math.log(d_val)
+            # Use actual count instead of meta['d']
+            d_val = num_gt_edges_from_root if num_gt_edges_from_root > 0 else meta['d']
+            entropy_mass = d_val * math.log(d_val) if d_val > 0 else 0.0
             optimal_loss = entropy_mass / total_tokens
             
-        print(f"Theoretical Minimum Loss: {optimal_loss:.6f}")
+        print(f"=== Theoretical Minimum Loss Calculation ===")
+        print(f"  d (graph spokes): {meta['d']}")
+        print(f"  l (path length): {meta['l']}")
+        print(f"  GT edges from root: {num_gt_edges_from_root}")
+        print(f"  Path samples (after upsampling): {n_path_samples}")
+        print(f"  Edge samples: {n_edge_samples}")
+        print(f"  Path tokens per sample: {path_target_len}")
+        print(f"  Total path tokens: {n_path_samples * path_target_len}")
+        print(f"  Total edge tokens: {n_edge_samples}")
+        print(f"  Total tokens: {total_tokens}")
+        print(f"  Entropy mass: {entropy_mass:.6f} ({d_val} * log({d_val}))")
+        print(f"  Theoretical Minimum Loss: {optimal_loss:.8f}")
+        print(f"=============================================")
+        
+        # Store for reference during training
+        meta['theoretical_min_loss'] = optimal_loss
+        meta['entropy_mass'] = entropy_mass
+        meta['total_contributing_tokens'] = total_tokens
+        
         wandb.log({'train/optimal_loss': optimal_loss})
     
     meta_vocab_size = meta['randomize_vocab_size']
@@ -2837,6 +2885,11 @@ def train(config=None):
     # Training loop with interleaved edge and path training
     t0 = time.time()
     
+    # Track running average of training loss for comparison with theoretical minimum
+    running_loss_sum = 0.0
+    running_loss_count = 0
+    epoch_loss_history = []
+    
     # Track which phase we're in (edge or path)
     if default_config['interleave_dataset']:
         current_phase = 'combined'
@@ -3047,12 +3100,38 @@ def train(config=None):
             dt = t1 - t0
             t0 = t1
             current_epoch = iter_num / meta['batches_per_epoch']
+            
+            # Track running average for comparison with theoretical minimum
+            lossf = loss.item() * steps
+            running_loss_sum += lossf
+            running_loss_count += 1
+            
+            # Reset running average at epoch boundaries
+            if iter_num > 0 and iter_num % meta['batches_per_epoch'] == 0:
+                epoch_avg_loss = running_loss_sum / running_loss_count
+                epoch_loss_history.append(epoch_avg_loss)
+                console.print(f"[yellow]Epoch {int(current_epoch)} complete: avg_loss={epoch_avg_loss:.6f} (theoretical_min={meta.get('theoretical_min_loss', 'N/A')})[/yellow]")
+                running_loss_sum = 0.0
+                running_loss_count = 0
+            
             if iter_num % default_config['log_interval'] == 0:
-                lossf = loss.item() * steps
                 tokens_per_sec = (X.numel() * steps) / dt
+                
+                # DEBUG: Count how many edge vs path samples in this batch
+                EDGE_token = meta['special_tokens']['EDGE']
+                PATH_token = meta['special_tokens']['PATH']
+                num_edges_in_batch = (X[:, 0] == EDGE_token).sum().item()
+                num_paths_in_batch = (X[:, 0] == PATH_token).sum().item()
+                
+                # Calculate running average
+                running_avg_loss = running_loss_sum / running_loss_count if running_loss_count > 0 else 0.0
+                
                 if default_config['wandb_log']:
                     wandb.log({
                         'train/loss/overall': lossf,
+                        'train/loss/running_avg_epoch': running_avg_loss,
+                        'train/batch_composition/num_edges': num_edges_in_batch,
+                        'train/batch_composition/num_paths': num_paths_in_batch,
                         'dt': dt,
                         'iter': iter_num,
                         "epoch": round(current_epoch, 4),
