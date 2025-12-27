@@ -9,15 +9,15 @@ metric:
 parameters:
   # Dataset parameters - small fixed values for quick iteration
   graph_d:
-    values: [10]
+    values: [8000]
   graph_l:
-    value: 10
+    values: [3, 4, 5]
   graph_vocab_size:
     value: '1max'
   graph_holdout_percentage:
     value: 0.2
   num_pause_tokens:
-    values: [1,5] 
+    values: [1] 
   use_undirected:
     value: true
   use_directional_tokens:
@@ -43,9 +43,9 @@ parameters:
   model_config:
     values:
       # Deep models (n_layer=5): sweep MLP and LayerNorm (2x2 = 4 configs)
-      - n_layer: [1,2,3,4,5,6]
+      - n_layer: [1,2,3]
         n_head: 1
-        n_embd: [12,24,48,64]
+        n_embd: [32,64]
         dropout: 0
         embed_dropout: 0
         bias: [true]
@@ -56,7 +56,7 @@ parameters:
         epochs: 15_000
         use_mlp: [true]
         use_layernorm: [true]
-        seed: [2723,2842,9004]
+        seed: [4731,7828]
 
   # Other training hyperparameters (not in model_config)
   label_smoothing:
@@ -84,7 +84,7 @@ parameters:
   min_lr:
     value: 0
   target_val_loss:
-    value: 0.03
+    value: 0.001
   edge_iterations_per_epoch: # 16k edges total for d=1000, l=5
     value: 10
   path_iterations_per_epoch: # 1k paths total
@@ -111,5 +111,5 @@ parameters:
     value: 8000
   
   wandb_project:
-    value: debug
+    value: debug_simplest
 
