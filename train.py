@@ -2219,6 +2219,47 @@ def train(config=None):
     
     # Init tracking variables
     iter_num = 0
+
+    # Calculate and log theoretical minimum loss
+    if default_config['wandb_log'] and wandb.run is not None:
+        # Only relevant when predicting edge endpoint (1 out of d options)
+        # If predicting direction, the task is deterministic/binary so min loss is 0.
+        predict_dir = default_config.get('predict_direction_for_edge_task', True)
+        
+        # Calculate N_paths and N_edges effective samples based on sampling strategy
+        if default_config['interleave_dataset'] and default_config.get('balance_interleaved_datasets', True) and paths_size < edges_size:
+            n_path_samples = edges_size # Effective samples due to upsampling
+        else:
+            n_path_samples = paths_size 
+            
+        n_edge_samples = edges_size # Edges are never upsampled
+        
+        # Calculate total tokens contributing to loss
+        # Paths: 'path_target_length' tokens per sample (loss contribution is 0)
+        # Edges: 1 token per sample (masked)
+        path_target_len = int(meta.get('path_target_length', meta['l']))
+        total_tokens = (n_path_samples * path_target_len) + (n_edge_samples * 1)
+        
+        # Calculate total entropy (Loss Mass)
+        # Paths: Assumed perfect memorization -> 0 entropy.
+        # Edges: 
+        #   If predict_dir=True ([EDGE] u v -> GT/LT): Deterministic -> 0 entropy.
+        #   If predict_dir=False ([EDGE] u GT/LT -> v): 
+        #     - From Root (GT): d branches. Target is 1/d. Entropy = log(d). There are d such edges.
+        #     - From Root (LT): Not possible (Root has no parent).
+        #     - From Node (GT): 1 branch (linear path). Entropy = 0.
+        #     - From Node (LT): 1 branch (parent). Entropy = 0.
+        #     Total Entropy Mass = d * log(d)
+        
+        if predict_dir:
+            optimal_loss = 0.0
+        else:
+            d_val = meta['d']
+            entropy_mass = d_val * math.log(d_val)
+            optimal_loss = entropy_mass / total_tokens
+            
+        print(f"Theoretical Minimum Loss: {optimal_loss:.6f}")
+        wandb.log({'train/optimal_loss': optimal_loss})
     
     meta_vocab_size = meta['randomize_vocab_size']
     print(f"found randomize_vocab_size= {meta_vocab_size}")

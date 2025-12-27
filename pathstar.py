@@ -498,7 +498,7 @@ class InWeightsPathStar:
     
     def prepare(self, output_dir='./data',
                 use_undirected=True, use_directional_tokens=True,
-                predict_direction_for_edge_task=True, use_task_tokens_in_path=False):
+                predict_direction_for_edge_task=False, use_task_tokens_in_path=False):
         """
         Prepare and save training and validation datasets to disk for in-weights path-star.
         
@@ -555,7 +555,6 @@ class InWeightsPathStar:
         print(f"    Validation paths (holdout): {num_val_path_samples}")
         print(f"  Dataset composition:")
         print(f"    Holdout percentage: {self.holdout_percentage}")
-        print(f"    NOTE: Pause tokens added at runtime (not stored in dataset)")
         print(f"    Edge samples: {num_edge_samples} ({'undirected' if use_undirected else 'directed'})")
         print(f"    Edge prediction: ({'direction' if predict_direction_for_edge_task else 'edge'})")
         print(f"    Training path samples (original): {num_train_path_samples}")
@@ -872,7 +871,7 @@ class InWeightsPathStar:
 
 
     def generate_dataset_if_needed(self, use_undirected, use_directional_tokens,
-                                   predict_direction_for_edge_task=True, use_task_tokens_in_path=False):
+                                   predict_direction_for_edge_task=False, use_task_tokens_in_path=False):
         """
         Generate the dataset using InWeightsPathStar if it doesn't exist or parameters don't match.
         
@@ -1025,8 +1024,6 @@ if __name__ == '__main__':
                         help='Length of each path (default: 5)')
     parser.add_argument('--randomize_vocab_size', type=str, default=None,
                         help='Vocabulary size to randomize on, "auto" will set it based on d and l. (default: None)')
-    # NOTE: --num_pause_tokens is removed - pause tokens are added at runtime
-    # NOTE: --use_task_tokens is removed - task tokens are always included
     parser.add_argument('--use_directional_tokens', action='store_true',
                         help='Use directional tokens (> and <)')
     parser.add_argument('--use_task_tokens_in_path', action='store_true',
