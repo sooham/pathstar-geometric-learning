@@ -70,6 +70,8 @@ def get_default_config():
         'debug_masking': False,          # If True, show target masks applied to Y
         'debug_masking_samples': 2,      # How many batch rows to show
         'debug_masking_max_len': 32,     # Max tokens to show per row
+        'detect_anomaly': False,         # If True, enable PyTorch anomaly detection (slow but thorough)
+        'check_nan_interval': 50,        # Check for NaNs every N iterations (0 = disabled)
         
         # Dataset generation parameters
         'graph_d': 1000,
@@ -925,6 +927,101 @@ def calculate_optimal_batch_size_for_training(model, block_size, vocab_size, dev
     return max_batch_size
 
 
+def check_for_nans(model, optimizer, loss, logits, X, Y, iter_num, phase='unknown'):
+    """
+    Comprehensive NaN detection and reporting.
+    
+    Returns:
+        dict with NaN detection results, or None if no NaNs found
+    """
+    nan_report = {}
+    has_nan = False
+    
+    # Check loss
+    if torch.isnan(loss) or torch.isinf(loss):
+        nan_report['loss'] = float(loss)
+        has_nan = True
+    
+    # Check logits
+    if logits is not None:
+        if torch.isnan(logits).any():
+            nan_count = torch.isnan(logits).sum().item()
+            nan_pct = 100 * nan_count / logits.numel()
+            nan_report['logits_nan_count'] = nan_count
+            nan_report['logits_nan_pct'] = nan_pct
+            nan_report['logits_max'] = float(logits[~torch.isnan(logits)].max()) if nan_count < logits.numel() else float('nan')
+            nan_report['logits_min'] = float(logits[~torch.isnan(logits)].min()) if nan_count < logits.numel() else float('nan')
+            has_nan = True
+        elif torch.isinf(logits).any():
+            inf_count = torch.isinf(logits).sum().item()
+            nan_report['logits_inf_count'] = inf_count
+            has_nan = True
+        else:
+            # Log max/min even when healthy for tracking
+            nan_report['logits_max'] = float(logits.max())
+            nan_report['logits_min'] = float(logits.min())
+    
+    # Check inputs
+    if torch.isnan(X).any() or torch.isnan(Y).any():
+        nan_report['input_has_nan'] = True
+        has_nan = True
+    
+    # Check model parameters
+    param_nans = []
+    param_infs = []
+    for name, param in model.named_parameters():
+        if param is not None and torch.isnan(param).any():
+            param_nans.append(name)
+            has_nan = True
+        if param is not None and torch.isinf(param).any():
+            param_infs.append(name)
+            has_nan = True
+    
+    if param_nans:
+        nan_report['param_nans'] = param_nans
+    if param_infs:
+        nan_report['param_infs'] = param_infs
+    
+    # Check gradients
+    grad_nans = []
+    grad_infs = []
+    max_grad = 0.0
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            if torch.isnan(param.grad).any():
+                grad_nans.append(name)
+                has_nan = True
+            if torch.isinf(param.grad).any():
+                grad_infs.append(name)
+                has_nan = True
+            max_grad = max(max_grad, param.grad.abs().max().item())
+    
+    if grad_nans:
+        nan_report['grad_nans'] = grad_nans
+    if grad_infs:
+        nan_report['grad_infs'] = grad_infs
+    nan_report['max_grad'] = max_grad
+    
+    # Check optimizer state
+    if optimizer is not None:
+        for group_idx, group in enumerate(optimizer.param_groups):
+            for param_idx, param in enumerate(group['params']):
+                if param in optimizer.state:
+                    state = optimizer.state[param]
+                    for key, value in state.items():
+                        if isinstance(value, torch.Tensor):
+                            if torch.isnan(value).any():
+                                nan_report[f'optimizer_state_nan_group{group_idx}_param{param_idx}_{key}'] = True
+                                has_nan = True
+    
+    if has_nan:
+        nan_report['iter'] = iter_num
+        nan_report['phase'] = phase
+        return nan_report
+    
+    return None
+
+
 def analyze_embedding_geometry(model, meta, paths_data_np, val_data_np, iter_num, config, out_dir='out'):
     """
     Analyze if path structure is reflected in embedding space.
@@ -1548,9 +1645,13 @@ def train(config=None):
     
     if default_config['interleave_dataset']:
         print(f"Training dataset composition (INTERLEAVED):")
-        print(f"  Paths: {paths_size}")
+        print(f"  Paths (original): {paths_size}")
         print(f"  Edges: {edges_size}")
-        print(f"  Total Combined: {paths_size + edges_size} samples")
+        if default_config['balance_interleaved_datasets'] and paths_size < edges_size:
+            print(f"  Paths (after balancing): {edges_size}")
+            print(f"  Total Combined: {edges_size * 2} samples (50% paths, 50% edges)")
+        else:
+            print(f"  Total Combined: {paths_size + edges_size} samples ({paths_size} paths, {edges_size} edges)")
     else:
         print(f"Training dataset composition:")
         print(f"  Paths: {paths_size} (no replication)")
@@ -1575,7 +1676,12 @@ def train(config=None):
 
     # Auto-detect device
     device, device_type, gpu_id = detect_device(default_config)
-
+    
+    # Enable PyTorch anomaly detection if requested (slow but thorough NaN debugging)
+    if default_config.get('detect_anomaly', False):
+        torch.autograd.set_detect_anomaly(True)
+        LiveTrainingPanel.CONSOLE.print("[yellow]⚠️  Anomaly detection ENABLED - training will be slower but NaN sources will be caught[/yellow]")
+    
     # Set random seed and backend configurations
     random.seed(config['seed'])
     torch.manual_seed(config['seed'])
@@ -2563,6 +2669,7 @@ def train(config=None):
             # Track activation stats on the last micro_step only (to avoid overhead)
             track_stats = default_config.get('log_activation_stats', True)
             last_activation_stats = None
+            last_logits = None  # For NaN debugging
             
             for micro_step in range(steps):
                 # Use scheduled sampling for PATH tasks if p_autoregressive_substitution > 0
@@ -2570,11 +2677,13 @@ def train(config=None):
                 if p_sub > 0 and default_config['interleave_dataset']:
                     # Scheduled sampling: substitute teacher-forced tokens with model predictions
                     # for PATH sequences (EDGE sequences still use pure teacher forcing)
-                    _, loss = forward_with_scheduled_sampling(
+                    logits_step, loss = forward_with_scheduled_sampling(
                         model, X, Y, meta, p_sub,
                         label_smoothing=default_config['label_smoothing'],
                         ctx=ctx
                     )
+                    if micro_step == steps - 1:
+                        last_logits = logits_step
                 else:
                     # Standard teacher forcing
                     # Track activation stats on last micro_step only
@@ -2583,9 +2692,11 @@ def train(config=None):
                         result = model(X, Y, label_smoothing=default_config['label_smoothing'], 
                                        track_activation_stats=should_track)
                         if should_track:
-                            _, loss, last_activation_stats = result
+                            logits_step, loss, last_activation_stats = result
                         else:
-                            _, loss = result
+                            logits_step, loss = result
+                    if micro_step == steps - 1:
+                        last_logits = logits_step
                 loss = loss / steps
                 
                 # Prefetch next batch while backward pass runs (overlap I/O with compute)
@@ -2642,6 +2753,34 @@ def train(config=None):
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
             
+            # Check for NaNs at regular intervals
+            check_nan_interval = default_config.get('check_nan_interval', 0)
+            if check_nan_interval > 0 and iter_num % check_nan_interval == 0:
+                nan_report = check_for_nans(model, optimizer, loss * steps, last_logits, X, Y, iter_num, phase=current_phase if not default_config['interleave_dataset'] else 'combined')
+                if nan_report is not None:
+                    LiveTrainingPanel.CONSOLE.print(f"[red]🔥 NaN DETECTED at iter {iter_num}![/red]")
+                    LiveTrainingPanel.CONSOLE.print(f"[red]Phase: {nan_report.get('phase', 'unknown')}[/red]")
+                    
+                    if 'loss' in nan_report:
+                        LiveTrainingPanel.CONSOLE.print(f"[red]  Loss: {nan_report['loss']}[/red]")
+                    if 'logits_nan_count' in nan_report:
+                        LiveTrainingPanel.CONSOLE.print(f"[red]  Logits: {nan_report['logits_nan_count']} NaNs ({nan_report['logits_nan_pct']:.2f}%)[/red]")
+                    if 'logits_max' in nan_report and 'logits_min' in nan_report:
+                        LiveTrainingPanel.CONSOLE.print(f"[yellow]  Logits range: [{nan_report['logits_min']:.4f}, {nan_report['logits_max']:.4f}][/yellow]")
+                    if 'param_nans' in nan_report:
+                        LiveTrainingPanel.CONSOLE.print(f"[red]  Parameters with NaN: {nan_report['param_nans'][:5]}{'...' if len(nan_report['param_nans']) > 5 else ''}[/red]")
+                    if 'grad_nans' in nan_report:
+                        LiveTrainingPanel.CONSOLE.print(f"[red]  Gradients with NaN: {nan_report['grad_nans'][:5]}{'...' if len(nan_report['grad_nans']) > 5 else ''}[/red]")
+                    if 'max_grad' in nan_report:
+                        LiveTrainingPanel.CONSOLE.print(f"[yellow]  Max gradient: {nan_report['max_grad']:.6f}[/yellow]")
+                    
+                    # Log to wandb
+                    if default_config['wandb_log']:
+                        wandb_nan_log = {f'nan_debug/{k}': v for k, v in nan_report.items() if isinstance(v, (int, float, bool))}
+                        wandb.log(wandb_nan_log, step=iter_num)
+                    
+                    LiveTrainingPanel.CONSOLE.print("[red]Training will continue but model may be unstable[/red]")
+            
             # Timing and logging
             t1 = time.time()
             dt = t1 - t0
@@ -2674,6 +2813,25 @@ def train(config=None):
                 running_avg_loss = running_loss_sum / running_loss_count if running_loss_count > 0 else 0.0
 
                 if default_config['wandb_log']:
+                    # Calculate gradient statistics for monitoring
+                    grad_stats = {}
+                    if check_nan_interval > 0:  # Only if NaN checking is enabled
+                        max_grad = 0.0
+                        grad_norm = 0.0
+                        for name, param in model.named_parameters():
+                            if param.grad is not None:
+                                max_grad = max(max_grad, param.grad.abs().max().item())
+                                grad_norm += param.grad.norm().item() ** 2
+                        grad_norm = grad_norm ** 0.5
+                        grad_stats['train/grad_max'] = max_grad
+                        grad_stats['train/grad_norm'] = grad_norm
+                        
+                        # Log logits statistics if available
+                        if last_logits is not None:
+                            grad_stats['train/logits_max'] = float(last_logits.max())
+                            grad_stats['train/logits_min'] = float(last_logits.min())
+                            grad_stats['train/logits_mean'] = float(last_logits.mean())
+                    
                     wandb.log({
                         'train/loss/overall': lossf,
                         'train/loss/running_avg_epoch': running_avg_loss,
@@ -2684,6 +2842,7 @@ def train(config=None):
                         'iter': iter_num,
                         "epoch": round(current_epoch, 4),
                         'tokens_per_sec': tokens_per_sec,
+                        **grad_stats,
                     }, step=iter_num)
                 
                 # Update training slice panel (only if live display and show_training_slices are enabled)
