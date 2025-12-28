@@ -1,0 +1,117 @@
+# Minimal sweep configuration for quick testing
+# Focuses on a few key hyperparameters
+program: train.py
+method: grid
+metric:
+  name: val/loss/overall
+  goal: minimize
+
+parameters:
+  # Dataset parameters - small fixed values for quick iteration
+  graph_d:
+    values: [1000]
+  graph_l:
+    values: [5]
+  graph_vocab_size:
+    value: '1max'
+  graph_holdout_percentage:
+    value: 0.2
+  num_pause_tokens:
+    values: [1] 
+  use_undirected:
+    value: true
+  use_directional_tokens:
+    values: [true]
+  use_task_tokens:
+    values: [true]
+  balance_interleaved_datasets:
+    values: [true]
+  weight_tying:
+    values: [true] # weight tying requires that the input to the unembedding matrix match the embedding of the output, so x + W_0 (attn from v) needs to be close.
+  interleave_dataset:
+    value: true
+  predict_direction_for_edge_task:
+    values: [false]
+  use_task_tokens_in_path:
+    values: [false] # for now test this
+  p_autoregressive_substitution:
+    values: [0]
+  
+  # Model + Training config combinations (partial cross-product)
+  # Lists within a dict are expanded into cross products
+  # Single values remain fixed for that config group
+  model_config:
+    values:
+      # Deep models (n_layer=5): sweep MLP and LayerNorm (2x2 = 4 configs)
+      - n_layer: [3]
+        n_head: 1
+        n_embd: [256,128]
+        dropout: [0.01, 0.02]
+        embed_dropout: 0
+        bias: [true]
+        base: 100
+        learning_rate: 1e-3
+        weight_decay: [0]
+        lr_scheduler: 'None' #'ReduceLROnPlateau'
+        epochs: 10_000
+        use_mlp: [true]
+        use_layernorm: [true]
+        seed: [7828] #[4731,7828]
+
+  # Other training hyperparameters (not in model_config)
+  label_smoothing:
+    values: [0]
+  beta1:
+    value: 0.9
+  beta2:
+    value: 0.95
+  grad_clip:
+    value: 0.0
+
+  # LR schedule params (when lr_scheduler is set in model_config)
+  plateau_factor:
+    value: 0.80
+  plateau_patience:
+    value: 30
+  plateau_threshold:
+    value: 1e-4
+  plateau_cooldown:
+    value: 0
+  warmup_frac:
+    value: 0
+  lr_decay_frac:
+    value: 1
+  min_lr:
+    value: 0
+  target_val_loss:
+    value: 0.001
+  edge_iterations_per_epoch: # 16k edges total for d=1000, l=5
+    value: 10
+  path_iterations_per_epoch: # 1k paths total
+    value: 10
+  gradient_accumulation_steps:
+    value: 1  # Reduced from 4 for fewer optimizer steps, better GPU utilization
+  compile:
+    value: true
+  eval_interval:
+    value: 100  # Increased from 50 to reduce evaluation overhead
+  log_interval:
+    value: 5  # Increased from 10 to reduce print overhead
+  print_eval_interval:
+    value: 1
+  live_display:
+    value: false
+  vis_interval:
+    value: 100
+  debug_masking:
+    value: false
+  log_attention_maps:
+    value: false
+  show_edge_memorization_metrics:
+    value: false
+  attention_map_interval:
+    value: 8000
+  
+  wandb_project:
+    value: debug_simplest_nan
+
