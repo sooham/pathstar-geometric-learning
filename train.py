@@ -2514,12 +2514,35 @@ def train(config=None):
                     if lr_scheduler_obj.is_lr_exhausted():
                         LiveTrainingPanel.CONSOLE.print(f"[yellow]Learning rate exhausted! LR={lr_scheduler_obj.current_lr:.2e} < 1e-8[/yellow]")
                         LiveTrainingPanel.CONSOLE.print(f"[yellow]Terminating training early at iter {iter_num}[/yellow]")
+                        
+                        # Log early termination event to wandb
+                        if default_config['wandb_log'] and wandb.run is not None:
+                            wandb.log({
+                                'early_termination/triggered': True,
+                                'early_termination/reason': 'lr_exhausted',
+                                'early_termination/iter': iter_num,
+                                'early_termination/final_lr': lr_scheduler_obj.current_lr,
+                                'early_termination/epoch': iter_num / meta['batches_per_epoch'],
+                            }, step=iter_num)
+                        
                         break
                 
                 # Early termination if validation loss falls below target threshold
                 if default_config['target_val_loss'] is not None and val_loss < default_config['target_val_loss']:
                     LiveTrainingPanel.CONSOLE.print(f"[green]Target validation loss achieved! val_loss={val_loss:.6f} < target={default_config['target_val_loss']:.6f}[/green]")
                     LiveTrainingPanel.CONSOLE.print(f"[green]Terminating training early at iter {iter_num}[/green]")
+                    
+                    # Log early termination event to wandb
+                    if default_config['wandb_log'] and wandb.run is not None:
+                        wandb.log({
+                            'early_termination/triggered': True,
+                            'early_termination/reason': 'target_val_loss_achieved',
+                            'early_termination/iter': iter_num,
+                            'early_termination/val_loss': val_loss,
+                            'early_termination/target_val_loss': default_config['target_val_loss'],
+                            'early_termination/epoch': iter_num / meta['batches_per_epoch'],
+                        }, step=iter_num)
+                    
                     break
             
             if iter_num == 0 and default_config['eval_only']:
