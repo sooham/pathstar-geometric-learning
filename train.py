@@ -2836,7 +2836,6 @@ def train(config=None):
             
             # Reset running average at epoch boundaries
             if iter_num > 0 and iter_num % meta['batches_per_epoch'] == 0:
-                epoch_avg_loss = running_loss_sum / running_loss_count
                 running_loss_sum = 0.0
                 running_loss_count = 0
             

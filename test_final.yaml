@@ -125,6 +125,8 @@ parameters:
     value: false
   attention_map_interval:
     value: 8000
+  batch_size:
+    value: 4000
   
   wandb_project:
     value: debug_nan_on_wide_models
