@@ -2863,11 +2863,11 @@ def train(config=None):
                     
                     wandb.log({
                         'train/loss/overall': lossf,
-                        'train/loss/running_avg_epoch': running_avg_loss,
+                        'train/loss/overall_remove_optimal': lossf - meta['theoretical_min_loss'],
+                        'train/loss/running_avg_epoch': running_avg_loss - meta['theoretical_min_loss'],
                         'train/batch_composition/num_edges': num_edges_in_batch,
                         'train/batch_composition/num_paths': num_paths_in_batch,
                         'train/optimal_loss': meta['theoretical_min_loss'],
-                        'dt': dt,
                         'iter': iter_num,
                         "epoch": round(current_epoch, 4),
                         'tokens_per_sec': tokens_per_sec,
