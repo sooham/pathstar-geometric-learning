@@ -52,6 +52,10 @@ $(VENV_DIR)/bin/activate: requirements.txt
 	@echo "Setup complete! Virtual environment created at: $(VENV_DIR)"
 	@echo "To activate manually: source $(VENV_DIR)/bin/activate"
 	@echo ""
+	@if [ -f /etc/os-release ] && grep -q "Ubuntu" /etc/os-release; then \
+		echo "Detected Ubuntu - creating ~/.no_auto_tmux to disable auto-tmux..."; \
+		touch ~/.no_auto_tmux; \
+	fi
 
 # Single GPU sweep
 sweep: $(VENV_DIR)/bin/activate
