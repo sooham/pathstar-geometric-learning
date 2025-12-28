@@ -96,6 +96,7 @@ class LiveTrainingPanel:
             self._setup_layout(config)
         else:
             self.layout = None
+            self.context = nullcontext()
     
     def _setup_layout(self, config):
         """
