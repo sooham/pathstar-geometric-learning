@@ -2749,37 +2749,54 @@ def train(config=None):
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), default_config['grad_clip'])
             
+            # Check for NaNs BEFORE optimizer step (while gradients still exist)
+            check_nan_interval = default_config.get('check_nan_interval', 0)
+            cached_nan_report = None
+            if check_nan_interval > 0 and iter_num % check_nan_interval == 0:
+                cached_nan_report = check_for_nans(model, optimizer, loss * steps, last_logits, X, Y, iter_num, phase=current_phase if not default_config['interleave_dataset'] else 'combined')
+            
+            # Compute gradient statistics BEFORE optimizer step (for logging)
+            # Cache these values since gradients will be cleared after optimizer step
+            cached_grad_stats = {}
+            if check_nan_interval > 0 and default_config['wandb_log']:
+                max_grad = 0.0
+                grad_norm = 0.0
+                for name, param in model.named_parameters():
+                    if param.grad is not None:
+                        max_grad = max(max_grad, param.grad.abs().max().item())
+                        grad_norm += param.grad.norm().item() ** 2
+                grad_norm = grad_norm ** 0.5
+                cached_grad_stats['train/grad_max'] = max_grad
+                cached_grad_stats['train/grad_norm'] = grad_norm
+            
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
             
-            # Check for NaNs at regular intervals
-            check_nan_interval = default_config.get('check_nan_interval', 0)
-            if check_nan_interval > 0 and iter_num % check_nan_interval == 0:
-                nan_report = check_for_nans(model, optimizer, loss * steps, last_logits, X, Y, iter_num, phase=current_phase if not default_config['interleave_dataset'] else 'combined')
-                if nan_report is not None:
-                    LiveTrainingPanel.CONSOLE.print(f"[red]🔥 NaN DETECTED at iter {iter_num}![/red]")
-                    LiveTrainingPanel.CONSOLE.print(f"[red]Phase: {nan_report.get('phase', 'unknown')}[/red]")
-                    
-                    if 'loss' in nan_report:
-                        LiveTrainingPanel.CONSOLE.print(f"[red]  Loss: {nan_report['loss']}[/red]")
-                    if 'logits_nan_count' in nan_report:
-                        LiveTrainingPanel.CONSOLE.print(f"[red]  Logits: {nan_report['logits_nan_count']} NaNs ({nan_report['logits_nan_pct']:.2f}%)[/red]")
-                    if 'logits_max' in nan_report and 'logits_min' in nan_report:
-                        LiveTrainingPanel.CONSOLE.print(f"[yellow]  Logits range: [{nan_report['logits_min']:.4f}, {nan_report['logits_max']:.4f}][/yellow]")
-                    if 'param_nans' in nan_report:
-                        LiveTrainingPanel.CONSOLE.print(f"[red]  Parameters with NaN: {nan_report['param_nans'][:5]}{'...' if len(nan_report['param_nans']) > 5 else ''}[/red]")
-                    if 'grad_nans' in nan_report:
-                        LiveTrainingPanel.CONSOLE.print(f"[red]  Gradients with NaN: {nan_report['grad_nans'][:5]}{'...' if len(nan_report['grad_nans']) > 5 else ''}[/red]")
-                    if 'max_grad' in nan_report:
-                        LiveTrainingPanel.CONSOLE.print(f"[yellow]  Max gradient: {nan_report['max_grad']:.6f}[/yellow]")
-                    
-                    # Log to wandb
-                    if default_config['wandb_log']:
-                        wandb_nan_log = {f'nan_debug/{k}': v for k, v in nan_report.items() if isinstance(v, (int, float, bool))}
-                        wandb.log(wandb_nan_log, step=iter_num)
-                    
-                    LiveTrainingPanel.CONSOLE.print("[red]Training will continue but model may be unstable[/red]")
+            # Report NaNs if detected (using cached report from before zero_grad)
+            if cached_nan_report is not None:
+                LiveTrainingPanel.CONSOLE.print(f"[red]🔥 NaN DETECTED at iter {iter_num}![/red]")
+                LiveTrainingPanel.CONSOLE.print(f"[red]Phase: {cached_nan_report.get('phase', 'unknown')}[/red]")
+                
+                if 'loss' in cached_nan_report:
+                    LiveTrainingPanel.CONSOLE.print(f"[red]  Loss: {cached_nan_report['loss']}[/red]")
+                if 'logits_nan_count' in cached_nan_report:
+                    LiveTrainingPanel.CONSOLE.print(f"[red]  Logits: {cached_nan_report['logits_nan_count']} NaNs ({cached_nan_report['logits_nan_pct']:.2f}%)[/red]")
+                if 'logits_max' in cached_nan_report and 'logits_min' in cached_nan_report:
+                    LiveTrainingPanel.CONSOLE.print(f"[yellow]  Logits range: [{cached_nan_report['logits_min']:.4f}, {cached_nan_report['logits_max']:.4f}][/yellow]")
+                if 'param_nans' in cached_nan_report:
+                    LiveTrainingPanel.CONSOLE.print(f"[red]  Parameters with NaN: {cached_nan_report['param_nans'][:5]}{'...' if len(cached_nan_report['param_nans']) > 5 else ''}[/red]")
+                if 'grad_nans' in cached_nan_report:
+                    LiveTrainingPanel.CONSOLE.print(f"[red]  Gradients with NaN: {cached_nan_report['grad_nans'][:5]}{'...' if len(cached_nan_report['grad_nans']) > 5 else ''}[/red]")
+                if 'max_grad' in cached_nan_report:
+                    LiveTrainingPanel.CONSOLE.print(f"[yellow]  Max gradient: {cached_nan_report['max_grad']:.6f}[/yellow]")
+                
+                # Log to wandb
+                if default_config['wandb_log']:
+                    wandb_nan_log = {f'nan_debug/{k}': v for k, v in cached_nan_report.items() if isinstance(v, (int, float, bool))}
+                    wandb.log(wandb_nan_log, step=iter_num)
+                
+                LiveTrainingPanel.CONSOLE.print("[red]Training will continue but model may be unstable[/red]")
             
             # Timing and logging
             t1 = time.time()
@@ -2813,24 +2830,14 @@ def train(config=None):
                 running_avg_loss = running_loss_sum / running_loss_count if running_loss_count > 0 else 0.0
 
                 if default_config['wandb_log']:
-                    # Calculate gradient statistics for monitoring
-                    grad_stats = {}
-                    if check_nan_interval > 0:  # Only if NaN checking is enabled
-                        max_grad = 0.0
-                        grad_norm = 0.0
-                        for name, param in model.named_parameters():
-                            if param.grad is not None:
-                                max_grad = max(max_grad, param.grad.abs().max().item())
-                                grad_norm += param.grad.norm().item() ** 2
-                        grad_norm = grad_norm ** 0.5
-                        grad_stats['train/grad_max'] = max_grad
-                        grad_stats['train/grad_norm'] = grad_norm
-                        
-                        # Log logits statistics if available
-                        if last_logits is not None:
-                            grad_stats['train/logits_max'] = float(last_logits.max())
-                            grad_stats['train/logits_min'] = float(last_logits.min())
-                            grad_stats['train/logits_mean'] = float(last_logits.mean())
+                    # Use cached gradient statistics (computed before zero_grad)
+                    grad_stats = cached_grad_stats.copy()
+                    
+                    # Add logits statistics if available
+                    if check_nan_interval > 0 and last_logits is not None:
+                        grad_stats['train/logits_max'] = float(last_logits.max())
+                        grad_stats['train/logits_min'] = float(last_logits.min())
+                        grad_stats['train/logits_mean'] = float(last_logits.mean())
                     
                     wandb.log({
                         'train/loss/overall': lossf,
