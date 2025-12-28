@@ -9,9 +9,9 @@ metric:
 parameters:
   # Dataset parameters - small fixed values for quick iteration
   graph_d:
-    values: [8000]
+    values: [1000]
   graph_l:
-    values: [3, 4, 5]
+    values: [5]
   graph_vocab_size:
     value: '1max'
   graph_holdout_percentage:
@@ -43,24 +43,24 @@ parameters:
   model_config:
     values:
       # Deep models (n_layer=5): sweep MLP and LayerNorm (2x2 = 4 configs)
-      - n_layer: [1,2,3]
+      - n_layer: [3]
         n_head: 1
-        n_embd: [32,64]
-        dropout: 0
+        n_embd: [128,64,256,32,16]
+        dropout: [0, 0.01, 0.02]
         embed_dropout: 0
         bias: [true]
         base: 100
         learning_rate: 1e-3
-        weight_decay: 0
+        weight_decay: [0]
         lr_scheduler: 'None' #'ReduceLROnPlateau'
-        epochs: 15_000
+        epochs: 10_000
         use_mlp: [true]
         use_layernorm: [true]
-        seed: [4731,7828]
+        seed: [4731,7828] #[4731,7828]
 
   # Other training hyperparameters (not in model_config)
   label_smoothing:
-    value: 0
+    values: [0]
   beta1:
     value: 0.9
   beta2:
@@ -96,9 +96,11 @@ parameters:
   eval_interval:
     value: 100  # Increased from 50 to reduce evaluation overhead
   log_interval:
-    value: 100  # Increased from 10 to reduce print overhead
+    value: 5  # Increased from 10 to reduce print overhead
   print_eval_interval:
-    value: 100
+    value: 1
+  live_display:
+    value: false
   vis_interval:
     value: 100
   debug_masking:
