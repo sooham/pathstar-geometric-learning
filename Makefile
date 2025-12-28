@@ -1,4 +1,4 @@
-.PHONY: help setup venv sweep multi-sweep clean
+.PHONY: help setup venv sweep multi-sweep visualize clean
 
 # Default target
 help:
@@ -13,6 +13,9 @@ help:
 	@echo "  make sweep          - Run single GPU sweep"
 	@echo "  make multi-sweep    - Run multi-GPU sweep"
 	@echo ""
+	@echo "Visualization:"
+	@echo "  make visualize      - Visualize UMAP embeddings from checkpoint"
+	@echo ""
 	@echo "Cleanup:"
 	@echo "  make clean          - Remove virtual environment"
 	@echo ""
@@ -22,11 +25,18 @@ help:
 	@echo "  ENTITY=<name>       - WandB entity name (optional, uses YAML value if not specified)"
 	@echo "  COUNT=<num>         - Number of runs for single sweep (optional, auto-calculated for grid)"
 	@echo ""
+	@echo "Visualization Arguments (for make visualize):"
+	@echo "  RUN=<name>          - WandB run name (required, e.g., 20251228T030542_2556bb8_...)"
+	@echo "  DATA_DIR=<path>     - Data directory with meta.pkl (optional, auto-detected if possible)"
+	@echo "  DEVICE=<device>     - Device to use: cpu, cuda, mps (default: cpu)"
+	@echo ""
 	@echo "Examples:"
 	@echo "  make setup"
 	@echo "  make sweep CONFIG=test_final.yaml"
 	@echo "  make multi-sweep CONFIG=test_final.yaml ENTITY=my_team"
 	@echo "  make sweep CONFIG=test_final.yaml PROJECT=my_project  # Override YAML project"
+	@echo "  make visualize RUN=20251228T030542_2556bb8_DSET_G1000L5P1PeUdirDt_L3E256H1MlpAgeluLnBiasD0WtEp10000Seed7828"
+	@echo "  make visualize RUN=<run_name> DATA_DIR=data/my_dataset DEVICE=cuda"
 	@echo ""
 
 # Variables with defaults
@@ -37,6 +47,9 @@ CONFIG ?= sweep_config.yaml
 PROJECT ?=
 ENTITY ?=
 COUNT ?=
+RUN ?=
+DATA_DIR ?=
+DEVICE ?= cpu
 
 # Setup target - create venv and install requirements
 setup: $(VENV_DIR)/bin/activate
@@ -95,6 +108,37 @@ multi-sweep: $(VENV_DIR)/bin/activate
 		echo ""; \
 	fi
 	./run_multi_gpu_sweep.sh $(CONFIG) "$(PROJECT)" "$(ENTITY)"
+
+# Visualize UMAP embeddings from checkpoint
+visualize: $(VENV_DIR)/bin/activate
+	@echo "Visualizing UMAP embeddings..."
+	@if [ -z "$(RUN)" ]; then \
+		echo "Error: RUN parameter is required!"; \
+		echo "Usage: make visualize RUN=<wandb_run_name>"; \
+		echo "Example: make visualize RUN=20251228T030542_2556bb8_DSET_G1000L5P1PeUdirDt_L3E256H1MlpAgeluLnBiasD0WtEp10000Seed7828"; \
+		exit 1; \
+	fi
+	@CKPT_PATH="out/ckpt_$(RUN).pt"; \
+	if [ ! -f "$$CKPT_PATH" ]; then \
+		echo "Error: Checkpoint file not found: $$CKPT_PATH"; \
+		echo "Please check that the RUN name is correct and the checkpoint exists."; \
+		exit 1; \
+	fi; \
+	echo "  Checkpoint: $$CKPT_PATH"; \
+	if [ -n "$(DATA_DIR)" ]; then \
+		echo "  Data directory: $(DATA_DIR)"; \
+		echo "  Device: $(DEVICE)"; \
+		$(PYTHON) visualize_embeddings_umap.py \
+			--checkpoint "$$CKPT_PATH" \
+			--data_dir "$(DATA_DIR)" \
+			--device "$(DEVICE)"; \
+	else \
+		echo "  Data directory: (auto-detect from checkpoint)"; \
+		echo "  Device: $(DEVICE)"; \
+		$(PYTHON) visualize_embeddings_umap.py \
+			--checkpoint "$$CKPT_PATH" \
+			--device "$(DEVICE)"; \
+	fi
 
 # Clean up virtual environment
 clean:
