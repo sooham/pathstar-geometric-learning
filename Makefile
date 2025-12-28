@@ -94,10 +94,7 @@ multi-sweep: $(VENV_DIR)/bin/activate
 		echo "Continuing anyway..."; \
 		echo ""; \
 	fi
-	@ARGS="$(CONFIG)"; \
-	if [ -n "$(PROJECT)" ]; then ARGS="$$ARGS $(PROJECT)"; fi; \
-	if [ -n "$(ENTITY)" ]; then ARGS="$$ARGS $(ENTITY)"; fi; \
-	./run_multi_gpu_sweep.sh $$ARGS
+	./run_multi_gpu_sweep.sh $(CONFIG) "$(PROJECT)" "$(ENTITY)"
 
 # Clean up virtual environment
 clean:
