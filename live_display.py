@@ -251,6 +251,12 @@ class LiveTrainingPanel:
             title += f", Train N={train_dataset_size:,}, Eval N={eval_dataset_size:,}"
         title += ")"
 
+        title += "\n\n"
+
+        if meta.get('theoretical_min_loss'):
+            title += f"Theoretical Minimum Loss: {meta['theoretical_min_loss']:.8f}"
+
+
         metrics_table = Table(title=title, show_header=True, header_style="bold magenta")
         metrics_table.add_column("Pos", style="cyan", justify="center")
         metrics_table.add_column("Train Loss (TF)", style="red", justify="right")

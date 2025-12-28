@@ -2551,7 +2551,6 @@ def train(config=None):
     # Track running average of training loss for comparison with theoretical minimum
     running_loss_sum = 0.0
     running_loss_count = 0
-    epoch_loss_history = []
 
     # Track which phase we're in (edge or path)
     if default_config['interleave_dataset']:
@@ -2838,8 +2837,6 @@ def train(config=None):
             # Reset running average at epoch boundaries
             if iter_num > 0 and iter_num % meta['batches_per_epoch'] == 0:
                 epoch_avg_loss = running_loss_sum / running_loss_count
-                epoch_loss_history.append(epoch_avg_loss)
-                LiveTrainingPanel.CONSOLE.print(f"[yellow]Epoch {int(current_epoch)} complete: avg_loss={epoch_avg_loss:.6f} (theoretical_min={meta.get('theoretical_min_loss', 'N/A')})[/yellow]")
                 running_loss_sum = 0.0
                 running_loss_count = 0
             
