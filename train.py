@@ -31,16 +31,8 @@ from model import GPTConfig, GPT
 from pathstar import InWeightsPathStar, add_pause_tokens_to_batch, add_pause_tokens_to_edges
 from learning_rate_scheduler import get_lr, initialize_lr_scheduler
 
-# Rich imports
-from rich.console import Console, Group
-from rich.live import Live
-from rich.panel import Panel
-from rich.text import Text
-from rich.layout import Layout
-from rich.align import Align
-from rich.table import Table
-
-console = Console()
+from live_display import LiveTrainingPanel, get_rich_token_str
+from utils import clear_gpu_memory, get_git_commit_id, detect_device, set_dtype, compute_token_colors
 
 
 # GOOD
@@ -160,8 +152,7 @@ def get_default_config():
         'seed': 1337,
         'predict_direction_for_edge_task': True,
 
-        # console info
-        'console': console
+        'console': LiveTrainingPanel.CONSOLE
     }
 
 @torch.compile
@@ -345,64 +336,6 @@ def forward_with_scheduled_sampling(model, X, Y, meta, p_sub, label_smoothing=0.
     return logits, loss
 
 
-def get_rich_token_str(token, itos, meta):
-    """Helper to format a token with rich coloring based on training/validation splitting"""
-    # Ensure dictionary lookups work with numpy scalar types
-    token = int(token)
-    token_str = itos.get(token, str(token))
-
-    # meta['token_colors'] maps token_id -> ANSI escape code string
-    ansi_color = meta.get('token_colors', {}).get(token, '')
-    if not ansi_color:
-        return token_str
-
-    # Handle 256-color ANSI foreground codes like "\x1b[38;5;226m"
-    if ansi_color.startswith('\x1b[38;5;') and ansi_color.endswith('m'):
-        # Extract the color number between the prefix and suffix
-        color_num_str = ansi_color[7:-1]  # Skip '\x1b[38;5;' (7 chars) and 'm' (1 char)
-        try:
-            n = int(color_num_str)
-            return f"[color({n})]{token_str}[/]"
-        except ValueError:
-            return token_str
-
-    # Handle basic bright ANSI colors like "\x1b[91m"
-    if ansi_color.startswith('\x1b[') and ansi_color.endswith('m'):
-        code_str = ansi_color[2:-1]  # Skip '\x1b[' (2 chars) and 'm' (1 char)
-        try:
-            code = int(code_str)
-            basic = {91: "red", 92: "green", 93: "yellow", 94: "blue", 95: "magenta", 96: "cyan"}
-            if code in basic:
-                return f"[bold {basic[code]}]{token_str}[/]"
-        except ValueError:
-            return token_str
-
-    return token_str
-
-def format_training_slice(sequences, itos, meta, num_samples=10):
-    """Format a batch of sequences for display in Rich panel"""
-    lines = []
-    num_samples = min(num_samples, len(sequences))
-    
-    # Check if we have tensors or numpy arrays
-    if isinstance(sequences, torch.Tensor):
-        sequences_np = sequences.detach().cpu().numpy()
-    else:
-        sequences_np = sequences
-        
-    for i in range(num_samples):
-        seq = sequences_np[i]
-        token_strs = []
-        for token in seq:
-            # Handle potential padding/special tokens if needed, but for now just display
-            if token == -1: continue # Ignore masked tokens if any
-            token_strs.append(get_rich_token_str(token, itos, meta))
-        
-        seq_str = " ".join(token_strs)
-        lines.append(f"Sample {i}: {seq_str}")
-        
-    return "\n".join(lines)
-
 def create_attention_map_figures(model, X, itos, meta, num_samples=3):
     """
     Create attention map heatmaps for wandb logging.
@@ -504,151 +437,6 @@ def create_attention_map_figures(model, X, itos, meta, num_samples=3):
     
     return images
 
-def create_metrics_table(metrics, graph_length, iter_num, epoch, lr, tokens_per_sec=None, batch_size=None, edge_memorization_pct=None, train_dataset_size=None, eval_dataset_size=None, embedding_geometry=None):
-    """Create a Rich Table for per-token metrics (Train vs Val)"""
-    title = f"Per-Token Metrics (Iter {iter_num}, Epoch {epoch:.2f}, LR {lr:.2e}"
-    if batch_size is not None:
-        title += f", BS {batch_size}"
-    if tokens_per_sec is not None:
-        title += f", {tokens_per_sec:.2e} tok/s"
-    if edge_memorization_pct is not None:
-        title += f", Edge Mem: {edge_memorization_pct:.1f}%"
-    if train_dataset_size is not None and eval_dataset_size is not None:
-        title += f", Train N={train_dataset_size:,}, Eval N={eval_dataset_size:,}"
-    title += ")"
-    table = Table(title=title, show_header=True, header_style="bold magenta")
-    table.add_column("Pos", style="cyan", justify="center")
-    table.add_column("Train Loss (TF)", style="red", justify="right")
-    table.add_column("Val Loss (TF)", style="red", justify="right")
-    table.add_column("Train Acc (Autoregressive)", style="green", justify="right")
-    table.add_column("Val Acc (Autoregressive)", style="green", justify="right")
-    
-    # The live metrics panel has a fixed height in the UI; for long sequences the table will be
-    # visually truncated. To make it obvious we still compute all tokens, we display:
-    # - positions 1..9
-    # - an ellipsis row (if needed)
-    # - the final position (graph_length)
-    if graph_length <= 10:
-        display_positions = list(range(1, graph_length + 1))
-    else:
-        display_positions = list(range(1, 10)) + [graph_length]
-
-    last_display = None
-    for i in display_positions:
-        if last_display is not None and i - last_display > 1:
-            table.add_row("…", "…", "…", "…", "…")
-        t_loss = metrics.get('train_per_token', {}).get(i, float('nan'))
-        v_loss = metrics.get('val_per_token', {}).get(i, float('nan'))
-        t_acc = metrics.get('train_per_token_accuracy', {}).get(i, float('nan'))
-        v_acc = metrics.get('val_per_token_accuracy', {}).get(i, float('nan'))
-        
-        table.add_row(
-            str(i),
-            f"{t_loss:.4f}", f"{v_loss:.4f}",
-            f"{t_acc*100:.1f}%", f"{v_acc*100:.1f}%"
-        )
-        last_display = i
-    
-    return table
-
-
-def create_architecture_info_panel(config):
-    """Create a Rich Text display for architecture info"""
-    # Extract architecture parameters
-    n_layer = config.get('n_layer', '?')
-    n_embd = config.get('n_embd', '?')
-    n_head = config.get('n_head', '?')
-
-    num_pause = config.get('num_pause_tokens', 0)
-    activation = config.get('activation', 'GELU')
-    use_ln = config.get('use_layernorm', True)
-    use_bias = config.get('bias', False)
-    use_mlp = config.get('use_mlp', True)
-    dropout = config.get('dropout', 0.0)
-    embd_dropout = config.get('embd_dropout', 0.0)
-    
-    # Format labels
-    ln_label = "[green]LN[/green]" if use_ln else "[dim]no-LN[/dim]"
-    bias_label = "[green]Bias[/green]" if use_bias else "[dim]no-Bias[/dim]"
-    mlp_label = "[green]MLP[/green]" if use_mlp else "[dim]no-MLP[/dim]"
-
-    seed_label = config.get('seed', '?')
-    
-    # Dropout display
-    if dropout == embd_dropout:
-        dropout_str = f"D={dropout}"
-    else:
-        dropout_str = f"D={dropout}/ED={embd_dropout}"
-    
-    info_str = (
-        f"[bold cyan]Layers:[/bold cyan] {n_layer}  "
-        f"[bold cyan]Embd:[/bold cyan] {n_embd}  "
-        f"[bold cyan]Heads:[/bold cyan] {n_head}  "
-        f"[bold cyan]Pause:[/bold cyan] {num_pause}  "
-        f"[bold cyan]Act:[/bold cyan] {activation}  "
-        f"{mlp_label}  {ln_label}  {bias_label}  "
-        f"[dim]{dropout_str}[/dim] "
-        f"[dim]seed={seed_label}[/dim]"
-    )
-    
-    return Text.from_markup(info_str)
-
-
-def create_embedding_geometry_table(embedding_geometry, l):
-    """Create a Rich Table for embedding geometry cosine similarities"""
-    if embedding_geometry is None:
-        return None
-    
-    train_sims = embedding_geometry.get('train_similarities', {})
-    val_sims = embedding_geometry.get('val_similarities', {})
-    random_baseline = embedding_geometry.get('random_baseline', 0)
-    
-    table = Table(title=f"Embedding Cosine Similarity by Distance (baseline: {random_baseline:.4f})", 
-                  show_header=True, header_style="bold cyan")
-    table.add_column("Dist", style="cyan", justify="center", width=5)
-    table.add_column("Train", justify="center", width=10)
-    table.add_column("Val", justify="center", width=10)
-    table.add_column("Status", justify="left", width=12)
-    
-    # Get all distances, show up to l (path length)
-    all_distances = sorted(set(train_sims.keys()) | set(val_sims.keys()))
-    display_distances = [d for d in all_distances if d <= l]
-    
-    for dist in display_distances:
-        t_sims = train_sims.get(dist, [])
-        v_sims = val_sims.get(dist, [])
-        
-        t_mean = np.mean(t_sims) if t_sims else float('nan')
-        v_mean = np.mean(v_sims) if v_sims else float('nan')
-        
-        # Format with color coding
-        def format_sim(val, baseline):
-            if np.isnan(val):
-                return "-"
-            if val > baseline + 0.1:
-                return f"[green]{val:.4f}[/green]"
-            elif val < baseline - 0.1:
-                return f"[red]{val:.4f}[/red]"
-            else:
-                return f"[yellow]{val:.4f}[/yellow]"
-        
-        t_str = format_sim(t_mean, random_baseline)
-        v_str = format_sim(v_mean, random_baseline)
-        
-        # Status indicator
-        if dist == 0:
-            status = "✓ self" if abs(t_mean - 1.0) < 0.01 else "✗ self!"
-        elif dist == 1:
-            if t_mean > random_baseline + 0.1:
-                status = "✓ adjacent"
-            else:
-                status = "[red]✗ no struct[/red]"
-        else:
-            status = ""
-        
-        table.add_row(str(dist), t_str, v_str, status)
-    
-    return table
 
 def evaluate_edge_memorization(ctx, model, meta, edges_data_np, device, batch_size=512):
     """
@@ -888,7 +676,7 @@ def generate_samples_autoregressive(device, ctx, model, meta, data, data_size, s
     all_generated_tokens = np.concatenate(all_generated_tokens, axis=0)
     
     # Calculate accuracies
-    console.print(f"\nAutoregressive generation on {num_samples} {split_name} samples:")
+    LiveTrainingPanel.CONSOLE.print(f"\nAutoregressive generation on {num_samples} {split_name} samples:")
     accuracies = []
     for ground_truth, generated_tokens in zip(ground_truths, all_generated_tokens):
         # Calculate accuracy
@@ -897,38 +685,10 @@ def generate_samples_autoregressive(device, ctx, model, meta, data, data_size, s
     
     # Calculate average accuracy
     avg_accuracy = np.mean(accuracies)
-    console.print(f"  Average accuracy: {avg_accuracy*100:.1f}%")
-    console.print()  # Empty line for readability
+    LiveTrainingPanel.CONSOLE.print(f"  Average accuracy: {avg_accuracy*100:.1f}%")
+    LiveTrainingPanel.CONSOLE.print()  # Empty line for readability
     
     return avg_accuracy
-
-# GOOD
-def clear_gpu_memory():
-    if torch.cuda.is_available():
-        print("Clearing GPU memory...")
-        torch.cuda.empty_cache()
-        try:
-            torch.cuda.synchronize()
-            # Reset memory stats for clean monitoring
-            torch.cuda.reset_peak_memory_stats()
-            torch.cuda.reset_accumulated_memory_stats()
-        except Exception as e:
-            print(f"Warning during GPU memory clearing: {e}")
-
-def get_git_commit_id():
-    """Get the short git commit ID, or 'unknown' if not in a git repo."""
-    try:
-        result = subprocess.run(
-            ['git', 'rev-parse', '--short', 'HEAD'],
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
-        if result.returncode == 0:
-            return result.stdout.strip()
-    except Exception:
-        pass
-    return 'unknown'
 
 # GOOD
 def set_wandb_name(config):
@@ -983,68 +743,6 @@ def set_wandb_name(config):
             print(f"Set sweep run name: {custom_name}")
             return custom_name
 
-# GOOD
-def detect_device(config):
-    if config['device'] == 'auto':
-        if torch.cuda.is_available():
-            device = 'cuda'
-        elif torch.backends.mps.is_available():
-            device = 'mps'
-        else:
-            device = 'cpu'
-    else:
-        device = config['device']
-    
-    # Print device information
-    if device == 'cuda':
-
-        num_gpus = torch.cuda.device_count()
-        current_device = torch.cuda.current_device()
-        device_name = torch.cuda.get_device_name(current_device)
-        print(f"Using device: {device} (GPU {current_device}/{num_gpus-1}: {device_name})")
-        if 'CUDA_VISIBLE_DEVICES' in os.environ:
-            print(f"  CUDA_VISIBLE_DEVICES: {os.environ['CUDA_VISIBLE_DEVICES']}")
-    else:
-        print(f"Using device: {device}")
-    # Determine GPU ID for checkpoint naming
-    gpu_id = config.get('gpu_id')
-    if gpu_id is None:
-        cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', None)
-        if cuda_visible is not None:
-            gpu_id = cuda_visible.split(',')[0]
-        elif torch.cuda.is_available():
-            gpu_id = torch.cuda.current_device()
-        else:
-            gpu_id = 'cpu'
-    
-    
-    device_type = 'cuda' if 'cuda' in device else ('mps' if 'mps' in device else 'cpu')
-    return device, device_type, gpu_id
-
-def set_dtype(config):
-    torch.backends.cudnn.allow_tf32 = True
-    torch.backends.cuda.matmul.allow_tf32 = True
-    
-    # Auto-detect dtype with GPU-aware selection
-    if config['dtype'] == 'auto':
-        if torch.cuda.is_available():
-            gpu_name = torch.cuda.get_device_name(0).upper()
-            # RTX 30-series: use FP16 (optimized tensor cores, BF16 is ~50% slower)
-            # RTX 40-series, A100, H100: use BF16 (better numerical range)
-            if any(x in gpu_name for x in ['RTX 30', '3090', '3080', '3070', '3060']):
-                dtype = 'float16'
-                print(f"Using FP16 for optimal performance on {gpu_name}")
-            elif torch.cuda.is_bf16_supported():
-                dtype = 'bfloat16'
-                print(f"Using BF16 on {gpu_name}")
-            else:
-                dtype = 'float16'
-        else:
-            dtype = 'float16'
-    else:
-        dtype = config['dtype']
-    ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
-    return ptdtype, dtype
 
 def initalize_model(device, meta, config, checkpoint_filename):
     # Model initialization
@@ -1501,7 +1199,7 @@ def analyze_embedding_geometry(model, meta, paths_data_np, val_data_np, iter_num
     if random_sims:
         summary_lines.append(f"  [dim]Random baseline: {np.mean(random_sims):.4f}[/dim]")
     
-    console.print("\n".join(summary_lines))
+    LiveTrainingPanel.CONSOLE.print("\n".join(summary_lines))
     
     model.train()
     
@@ -1515,8 +1213,7 @@ def analyze_embedding_geometry(model, meta, paths_data_np, val_data_np, iter_num
     }
 
 
-# GOOD
-def evaluate(estimate_metrics, config, meta, iter_num, lr, ctx, device, model, val_data_np, paths_data_np, edges_data_np, print_samples=False, eval_layout_component=None, metrics_layout_component=None, tokens_per_sec=None, batch_size=None, train_dataset_size=None, eval_dataset_size=None, lr_scheduler_obj=None):
+def evaluate(estimate_metrics, config, meta, iter_num, lr, ctx, device, model, val_data_np, paths_data_np, edges_data_np, print_samples=False, live_panel=None, tokens_per_sec=None, batch_size=None, train_dataset_size=None, eval_dataset_size=None, lr_scheduler_obj=None):
     # Compute metrics for both splits
     val_metrics = estimate_metrics('val', print_samples)
     train_metrics = estimate_metrics('train', False) # Don't print train samples here
@@ -1561,62 +1258,44 @@ def evaluate(estimate_metrics, config, meta, iter_num, lr, ctx, device, model, v
                 out_dir=config.get('out_dir', 'out')
             )
         except Exception as e:
-            console.print(f"[yellow]Warning: Embedding geometry analysis failed: {e}[/yellow]")
+            LiveTrainingPanel.CONSOLE.print(f"[yellow]Warning: Embedding geometry analysis failed: {e}[/yellow]")
     
-    # Update Live display if new samples were generated
-    if 'generated_text' in losses and losses['generated_text'] and eval_layout_component:
-        eval_layout_component.update(Panel(losses['generated_text'], title="Evaluation Examples", border_style="blue"))
-
-    # Update metrics display
-    if metrics_layout_component:
-        metrics_table = create_metrics_table(
-            losses,
-            graph_length,
-            iter_num,
-            current_epoch,
-            lr,
-            tokens_per_sec,
-            batch_size,
-            edge_memorization_pct,
-            train_dataset_size=train_dataset_size,
-            eval_dataset_size=eval_dataset_size,
-            embedding_geometry=embedding_geometry_results,
-        )
-        
-        # Create embedding geometry table if available
-        emb_table = create_embedding_geometry_table(embedding_geometry_results, meta['l']) if embedding_geometry_results else None
-        
-        # Combine tables using Group
-        if emb_table:
-            combined = Group(metrics_table, Text(""), emb_table)
-        else:
-            combined = metrics_table
-        
-        metrics_layout_component.update(Panel(Align.center(combined), title="Validation Metrics", border_style="magenta"))
-
+    live_panel.update_metrics_table(
+        losses,
+        graph_length,
+        iter_num,
+        current_epoch,
+        lr,
+        tokens_per_sec,
+        batch_size,
+        edge_memorization_pct,
+        train_dataset_size=train_dataset_size,
+        eval_dataset_size=eval_dataset_size,
+        embedding_geometry_results=embedding_geometry_results,
+    )
     
-    if 'val_per_token' in losses:
-        # console.print("  Val per-token losses:")
-        if graph_length <= 9:
-            per_token_str = ", ".join([f"tok{i}: {losses['val_per_token'].get(i, float('nan')):.4f}"
-                                       for i in range(1, graph_length + 1)])
-        else:
-            head = ", ".join([f"tok{i}: {losses['val_per_token'].get(i, float('nan')):.4f}"
-                              for i in range(1, 10)])
-            tail = f"tok{graph_length}: {losses['val_per_token'].get(graph_length, float('nan')):.4f}"
-            per_token_str = f"{head}, …, {tail}"
-        # console.print(f"    {per_token_str}")
+    # if 'val_per_token' in losses:
+    #     # console.print("  Val per-token losses:")
+    #     if graph_length <= 9:
+    #         per_token_str = ", ".join([f"tok{i}: {losses['val_per_token'].get(i, float('nan')):.4f}"
+    #                                    for i in range(1, graph_length + 1)])
+    #     else:
+    #         head = ", ".join([f"tok{i}: {losses['val_per_token'].get(i, float('nan')):.4f}"
+    #                           for i in range(1, 10)])
+    #         tail = f"tok{graph_length}: {losses['val_per_token'].get(graph_length, float('nan')):.4f}"
+    #         # per_token_str = f"{head}, …, {tail}"
+    #     # console.print(f"    {per_token_str}")
     
-    if 'val_per_token_accuracy' in losses:
-        # console.print("  Val per-token accuracies (autoregressive):")
-        if graph_length <= 9:
-            per_token_acc_str = ", ".join([f"tok{i}: {losses['val_per_token_accuracy'].get(i, float('nan'))*100:.1f}%"
-                                           for i in range(1, graph_length + 1)])
-        else:
-            head = ", ".join([f"tok{i}: {losses['val_per_token_accuracy'].get(i, float('nan'))*100:.1f}%"
-                              for i in range(1, 10)])
-            tail = f"tok{graph_length}: {losses['val_per_token_accuracy'].get(graph_length, float('nan'))*100:.1f}%"
-            per_token_acc_str = f"{head}, …, {tail}"
+    # if 'val_per_token_accuracy' in losses:
+    #     # console.print("  Val per-token accuracies (autoregressive):")
+    #     if graph_length <= 9:
+    #         per_token_acc_str = ", ".join([f"tok{i}: {losses['val_per_token_accuracy'].get(i, float('nan'))*100:.1f}%"
+    #                                        for i in range(1, graph_length + 1)])
+        # else:
+        #     head = ", ".join([f"tok{i}: {losses['val_per_token_accuracy'].get(i, float('nan'))*100:.1f}%"
+        #                       for i in range(1, 10)])
+        #     tail = f"tok{graph_length}: {losses['val_per_token_accuracy'].get(graph_length, float('nan'))*100:.1f}%"
+        #     per_token_acc_str = f"{head}, …, {tail}"
         # console.print(f"    {per_token_acc_str}")
     
     
@@ -1721,7 +1400,7 @@ def evaluate(estimate_metrics, config, meta, iter_num, lr, ctx, device, model, v
         # Save LR scheduler state if using ReduceLROnPlateau
         if lr_scheduler_obj is not None:
             checkpoint_data['lr_scheduler'] = lr_scheduler_obj.state_dict()
-        console.print(f"saving checkpoint to {config['out_dir']}/{meta['checkpoint_filename']}")
+        LiveTrainingPanel.CONSOLE.print(f"saving checkpoint to {config['out_dir']}/{meta['checkpoint_filename']}")
         torch.save(checkpoint_data, os.path.join(config['out_dir'], meta['checkpoint_filename']))
     
     # Return validation loss for LR schedulers like ReduceLROnPlateau
@@ -1770,118 +1449,6 @@ def determine_dataset_in_device_size(device, device_type, paths_data, edges_data
         return dataset_reserved_memory
     return 0
 
-def compute_token_colors(paths_data, val_data, meta):
-    """Compute ANSI color codes for tokens based on their depth and train/val split"""
-    train_tokens = set(np.unique(paths_data))
-    val_tokens = set(np.unique(val_data))
-    
-    # Extract metadata for coloring
-    root_vertex = meta['root_vertex']
-    special_tokens = set(meta['special_tokens'].values())
-    
-    # Build a mapping from each token to its distance from root
-    token_to_depth = {}
-    
-    # Reshape data to get sequences (paths_data is a flat memmap, need to reshape)
-    # Calculate sequence length from metadata
-    # NOTE: Use block_size_base (stored length WITHOUT pause tokens) since we're working with raw stored data
-    block_size_base = meta['block_size_base']
-    seq_length = block_size_base + 1  # block_size is context + targets - 1, so full sequence is block_size + 1
-    
-    # Reshape paths_data and val_data into sequences
-    paths_sequences = paths_data.reshape(-1, seq_length)
-    val_sequences = val_data.reshape(-1, seq_length)
-    
-    # Process training paths to determine depth
-    for path_seq in paths_sequences:
-        # Skip PATH token and leaf, find the actual path
-        path_tokens = [t for t in path_seq[2:] if t not in special_tokens]
-        if len(path_tokens) > 0:
-            # First token after special tokens should be leaf, last should be root
-            for i, token in enumerate(path_tokens):
-                # Distance from root: 0 for root, increases towards leaf
-                depth = len(path_tokens) - 1 - i
-                token_int = int(token)  # Convert to Python int
-                if token_int not in token_to_depth:
-                    token_to_depth[token_int] = depth
-    
-    # Process validation paths
-    for path_seq in val_sequences:
-        path_tokens = [t for t in path_seq[2:] if t not in special_tokens]
-        if len(path_tokens) > 0:
-            for i, token in enumerate(path_tokens):
-                depth = len(path_tokens) - 1 - i
-                token_int = int(token)  # Convert to Python int
-                if token_int not in token_to_depth:
-                    token_to_depth[token_int] = depth
-    
-    # Determine max depth for normalization
-    max_depth = max(token_to_depth.values()) if token_to_depth else 1
-    
-    # ANSI color codes - extended palette for finer gradients
-    # Training path colors (RED at leaf -> YELLOW at root)
-    RED = '\033[91m'           # Bright red
-    ORANGE_RED = '\033[38;5;202m'  # Orange-red
-    ORANGE = '\033[38;5;208m'      # Orange
-    YELLOW_ORANGE = '\033[38;5;214m'  # Yellow-orange
-    
-    # Validation path colors (GREEN at leaf -> YELLOW at root)
-    GREEN = '\033[92m'         # Bright green
-    LIME = '\033[38;5;154m'    # Lime green
-    YELLOW_GREEN = '\033[38;5;190m'  # Yellow-green
-    LIGHT_YELLOW = '\033[38;5;226m'  # Light yellow
-    
-    YELLOW = '\033[93m'        # Yellow
-    RESET = '\033[0m'
-    
-    token_colors = {}
-    
-    # Convert train_tokens and val_tokens to Python ints
-    train_tokens_int = {int(t) for t in train_tokens}
-    val_tokens_int = {int(t) for t in val_tokens}
-    
-    # Color each token based on its role and depth with fine-grained blending
-    for token in train_tokens_int | val_tokens_int:
-        # Skip special tokens (no color)
-        if token in special_tokens:
-            continue
-        
-        # Root is always yellow (both train and val)
-        if token == root_vertex:
-            token_colors[token] = YELLOW
-        else:
-            depth = token_to_depth.get(token, 0)
-            # Normalize depth: 0.0 at root, 1.0 at leaf
-            normalized_depth = 1.0 - (depth / max_depth if max_depth > 0 else 0.0)
-            
-            # Determine if this token appears in validation paths
-            is_val_token = token in val_tokens_int
-            
-            # Fine-grained color blending based on depth
-            # normalized_depth ranges from 0.0 (root) to 1.0 (leaf)
-            
-            if is_val_token:
-                # Validation: GREEN (at leaf) -> YELLOW (at root)
-                if normalized_depth >= 0.875:
-                    token_colors[token] = GREEN  # Leaf - bright green
-                elif normalized_depth >= 0.625:
-                    token_colors[token] = LIME  # Lime green
-                elif normalized_depth >= 0.375:
-                    token_colors[token] = YELLOW_GREEN  # Yellow-green
-                elif normalized_depth >= 0.125:
-                    token_colors[token] = LIGHT_YELLOW  # Light yellow
-            else:
-                # Training: RED (at leaf) -> YELLOW (at root)
-                if normalized_depth >= 0.875:
-                    token_colors[token] = RED  # Leaf - bright red
-                elif normalized_depth >= 0.625:
-                    token_colors[token] = ORANGE_RED  # Orange-red
-                elif normalized_depth >= 0.375:
-                    token_colors[token] = ORANGE  # Orange
-                elif normalized_depth >= 0.125:
-                    token_colors[token] = YELLOW_ORANGE  # Yellow-orange
-    
-    return token_colors, RESET
 
 def train(config=None):
     """
@@ -2185,7 +1752,7 @@ def train(config=None):
         # Load LR scheduler state if available and using ReduceLROnPlateau
         if lr_scheduler_obj is not None and 'lr_scheduler' in checkpoint:
             lr_scheduler_obj.load_state_dict(checkpoint['lr_scheduler'])
-            console.print(f"[cyan]Loaded LR scheduler state (current_lr={lr_scheduler_obj.current_lr:.2e})[/cyan]")
+            LiveTrainingPanel.CONSOLE.print(f"[cyan]Loaded LR scheduler state (current_lr={lr_scheduler_obj.current_lr:.2e})[/cyan]")
     checkpoint = None
 
     meta['optimizer'] = optimizer
@@ -2870,14 +2437,16 @@ def train(config=None):
         model.train()
         return out
     
-    # Training loop with interleaved edge and path training
-    t0 = time.time()
+    
+    # Setup live display
+    live_panel = LiveTrainingPanel(default_config)
+
     
     # Track running average of training loss for comparison with theoretical minimum
     running_loss_sum = 0.0
     running_loss_count = 0
     epoch_loss_history = []
-    
+
     # Track which phase we're in (edge or path)
     if default_config['interleave_dataset']:
         current_phase = 'combined'
@@ -2892,42 +2461,10 @@ def train(config=None):
         else:
             X, Y = get_batch('paths')
     
-    # Live display for evaluation examples (optional - controlled by live_display config)
-    use_live_display = default_config.get('live_display', True)
-    
-    if use_live_display:
-        layout = Layout()
-        show_training_slices = default_config.get('show_training_slices', False)
-        show_debug_masking = default_config.get('debug_masking', False)
-        
-        # Build layout based on enabled features
-        layout_components = [
-            Layout(name="architecture", size=3),  # Compact architecture info
-            Layout(name="metrics", size=14),  # Fixed size for metrics table
-            Layout(name="evaluation"),
-        ]
-        if show_training_slices:
-            layout_components.append(Layout(name="training"))
-        if show_debug_masking:
-            layout_components.append(Layout(name="mask", size=10))
-        
-        layout.split_column(*layout_components)
-        
-        # Initialize architecture panel with config info (static, doesn't change during training)
-        arch_info = create_architecture_info_panel(default_config)
-        layout["architecture"].update(Panel(Align.center(arch_info), title="Architecture", border_style="cyan"))
-        layout["metrics"].update(Panel("Waiting for first evaluation...", title="Validation Metrics", border_style="magenta"))
-        layout["evaluation"].update(Panel("Waiting for first evaluation...", title="Evaluation Examples", border_style="blue"))
-        if show_training_slices:
-            layout["training"].update(Panel("Waiting for first training batch...", title="Training Slice (10 samples)", border_style="green"))
-        if show_debug_masking:
-            layout["mask"].update(Panel("Waiting for first mask debug...", title="Mask Debug", border_style="yellow"))
-        live_context = Live(layout, console=console, refresh_per_second=0.1)
-    else:
-        layout = None
-        live_context = nullcontext()
 
-    with live_context:
+    with live_panel.context:
+        # Training loop with interleaved edge and path training
+        t0 = time.time()
         while True:
             # Set learning rate based on scheduler
             lr = get_lr(iter_num, warmup_iters, lr_decay_iters, default_config, lr_scheduler_obj=lr_scheduler_obj)
@@ -2961,8 +2498,7 @@ def train(config=None):
                     paths_data_np,
                     edges_data_np,
                     print_samples,
-                    eval_layout_component=layout["evaluation"] if use_live_display else None,
-                    metrics_layout_component=layout["metrics"] if use_live_display else None,
+                    live_panel=live_panel,
                     tokens_per_sec=current_tokens_per_sec,
                     batch_size=train_batch_size,
                     train_dataset_size=train_total_dataset_size,
@@ -2976,14 +2512,14 @@ def train(config=None):
                     
                     # Early termination if LR has dropped below threshold (LR exhausted)
                     if lr_scheduler_obj.is_lr_exhausted():
-                        console.print(f"[yellow]Learning rate exhausted! LR={lr_scheduler_obj.current_lr:.2e} < 1e-8[/yellow]")
-                        console.print(f"[yellow]Terminating training early at iter {iter_num}[/yellow]")
+                        LiveTrainingPanel.CONSOLE.print(f"[yellow]Learning rate exhausted! LR={lr_scheduler_obj.current_lr:.2e} < 1e-8[/yellow]")
+                        LiveTrainingPanel.CONSOLE.print(f"[yellow]Terminating training early at iter {iter_num}[/yellow]")
                         break
                 
                 # Early termination if validation loss falls below target threshold
                 if default_config['target_val_loss'] is not None and val_loss < default_config['target_val_loss']:
-                    console.print(f"[green]Target validation loss achieved! val_loss={val_loss:.6f} < target={default_config['target_val_loss']:.6f}[/green]")
-                    console.print(f"[green]Terminating training early at iter {iter_num}[/green]")
+                    LiveTrainingPanel.CONSOLE.print(f"[green]Target validation loss achieved! val_loss={val_loss:.6f} < target={default_config['target_val_loss']:.6f}[/green]")
+                    LiveTrainingPanel.CONSOLE.print(f"[green]Terminating training early at iter {iter_num}[/green]")
                     break
             
             if iter_num == 0 and default_config['eval_only']:
@@ -3098,7 +2634,7 @@ def train(config=None):
             if iter_num > 0 and iter_num % meta['batches_per_epoch'] == 0:
                 epoch_avg_loss = running_loss_sum / running_loss_count
                 epoch_loss_history.append(epoch_avg_loss)
-                console.print(f"[yellow]Epoch {int(current_epoch)} complete: avg_loss={epoch_avg_loss:.6f} (theoretical_min={meta.get('theoretical_min_loss', 'N/A')})[/yellow]")
+                LiveTrainingPanel.CONSOLE.print(f"[yellow]Epoch {int(current_epoch)} complete: avg_loss={epoch_avg_loss:.6f} (theoretical_min={meta.get('theoretical_min_loss', 'N/A')})[/yellow]")
                 running_loss_sum = 0.0
                 running_loss_count = 0
             
@@ -3113,7 +2649,7 @@ def train(config=None):
                 
                 # Calculate running average
                 running_avg_loss = running_loss_sum / running_loss_count if running_loss_count > 0 else 0.0
-                
+
                 if default_config['wandb_log']:
                     wandb.log({
                         'train/loss/overall': lossf,
@@ -3129,16 +2665,7 @@ def train(config=None):
                 
                 # Update training slice panel (only if live display and show_training_slices are enabled)
                 # Only update every vis_interval to save sync/formatting time
-                if use_live_display and iter_num % default_config['vis_interval'] == 0:
-                    if default_config.get('show_training_slices', False):
-                        # Reconstruct full sequence for visualization: X + last token of Y
-                        # Note: Y has masking (-1) applied, so if the last token is masked, it won't show, 
-                        # but for path tasks the last token (LEAF) is not masked.
-                        full_batch = torch.cat([X, Y[:, -1:]], dim=1)
-                        training_slice_str = format_training_slice(full_batch, itos, meta, num_samples=10)
-                        layout["training"].update(Panel(training_slice_str, title=f"Training Slice (Iter {iter_num})", border_style="green"))
-                    if default_config.get('debug_masking') and last_mask_debug_str is not None:
-                        layout["mask"].update(Panel(last_mask_debug_str, title=f"Mask Debug (Iter {iter_num})", border_style="yellow"))
+                live_panel.update_train(X, Y, iter_num, meta, last_mask_debug_str=last_mask_debug_str)
                 
                 # Log attention maps to wandb (expensive, so use separate interval)
                 if default_config['wandb_log'] and default_config.get('log_attention_maps', False):
@@ -3150,7 +2677,7 @@ def train(config=None):
                             )
                             wandb.log(attn_images, step=iter_num)
                         except Exception as e:
-                            console.print(f"[yellow]Warning: Failed to log attention maps: {e}[/yellow]")
+                            LiveTrainingPanel.CONSOLE.print(f"[yellow]Warning: Failed to log attention maps: {e}[/yellow]")
                 
                 # Log activation mean/variance per layer (collected during forward pass)
                 if default_config['wandb_log'] and last_activation_stats is not None:
@@ -3158,7 +2685,7 @@ def train(config=None):
                         activation_log = {f'activation/{k}': v for k, v in last_activation_stats.items()}
                         wandb.log(activation_log, step=iter_num)
                     except Exception as e:
-                        console.print(f"[yellow]Warning: Failed to log activation stats: {e}[/yellow]")
+                        LiveTrainingPanel.CONSOLE.print(f"[yellow]Warning: Failed to log activation stats: {e}[/yellow]")
             
             iter_num += 1
             
@@ -3166,7 +2693,7 @@ def train(config=None):
                 break
     
     # Cleanup and finalization
-    console.print("Finalizing training run...")
+    LiveTrainingPanel.CONSOLE.print("Finalizing training run...")
     
     # Clear GPU memory before finishing
     if device_type == 'cuda':
@@ -3174,7 +2701,7 @@ def train(config=None):
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
         except Exception as e:
-            console.print(f"Warning during GPU cleanup: {e}")
+            LiveTrainingPanel.CONSOLE.print(f"Warning during GPU cleanup: {e}")
     
     # Only call wandb.finish() if we initialized wandb ourselves (not in sweep mode)
     # In sweep mode, the agent handles finishing the run
@@ -3185,7 +2712,7 @@ def train(config=None):
             wandb.finish()
         # In sweep mode, don't call finish - let the agent handle it
     
-    console.print("Training complete!")
+    LiveTrainingPanel.CONSOLE.print("Training complete!")
 
 
 def sweep_train():
