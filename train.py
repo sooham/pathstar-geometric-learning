@@ -1696,6 +1696,8 @@ def train(config=None):
 
 
     ptdtype, dtype = set_dtype(default_config)
+    if default_config['compile'] and device_type == 'cuda':
+        torch._dynamo.config.capture_scalar_outputs = True
 
     ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
     
