@@ -70,7 +70,7 @@ def get_default_config():
         'debug_masking': False,          # If True, show target masks applied to Y
         'debug_masking_samples': 2,      # How many batch rows to show
         'debug_masking_max_len': 32,     # Max tokens to show per row
-        'detect_anomaly': False,         # If True, enable PyTorch anomaly detection (slow but thorough)
+        'detect_anomaly': True,         # If True, enable PyTorch anomaly detection (slow but thorough)
         'check_nan_interval': 50,        # Check for NaNs every N iterations (0 = disabled)
         
         # Dataset generation parameters
@@ -2698,6 +2698,32 @@ def train(config=None):
                     if micro_step == steps - 1:
                         last_logits = logits_step
                 loss = loss / steps
+                
+                # CHECK FOR NaNs IMMEDIATELY AFTER FORWARD PASS (before backward!)
+                # This catches NaNs before they crash the backward pass
+                if torch.isnan(loss) or torch.isinf(loss):
+                    LiveTrainingPanel.CONSOLE.print(f"[red]🔥 NaN/Inf DETECTED in loss at iter {iter_num}, micro_step {micro_step}![/red]")
+                    LiveTrainingPanel.CONSOLE.print(f"[red]Loss value: {loss.item()}[/red]")
+                    LiveTrainingPanel.CONSOLE.print(f"[red]Phase: {current_phase if not default_config['interleave_dataset'] else 'combined'}[/red]")
+                    # Run full diagnostic
+                    nan_report = check_for_nans(model, optimizer, loss * steps, logits_step, X, Y, iter_num, 
+                                               phase=current_phase if not default_config['interleave_dataset'] else 'combined')
+                    if nan_report and default_config['wandb_log']:
+                        wandb.log({f'nan_detection/{k}': v for k, v in nan_report.items() if not isinstance(v, list)})
+                    raise ValueError(f"NaN/Inf detected in loss at iteration {iter_num}. Training stopped to prevent gradient corruption.")
+                
+                if logits_step is not None and (torch.isnan(logits_step).any() or torch.isinf(logits_step).any()):
+                    LiveTrainingPanel.CONSOLE.print(f"[red]🔥 NaN/Inf DETECTED in logits at iter {iter_num}, micro_step {micro_step}![/red]")
+                    nan_count = torch.isnan(logits_step).sum().item() if torch.isnan(logits_step).any() else 0
+                    inf_count = torch.isinf(logits_step).sum().item() if torch.isinf(logits_step).any() else 0
+                    LiveTrainingPanel.CONSOLE.print(f"[red]NaN count: {nan_count}, Inf count: {inf_count}[/red]")
+                    LiveTrainingPanel.CONSOLE.print(f"[red]Phase: {current_phase if not default_config['interleave_dataset'] else 'combined'}[/red]")
+                    # Run full diagnostic
+                    nan_report = check_for_nans(model, optimizer, loss * steps, logits_step, X, Y, iter_num, 
+                                               phase=current_phase if not default_config['interleave_dataset'] else 'combined')
+                    if nan_report and default_config['wandb_log']:
+                        wandb.log({f'nan_detection/{k}': v for k, v in nan_report.items() if not isinstance(v, list)})
+                    raise ValueError(f"NaN/Inf detected in logits at iteration {iter_num}. Training stopped to prevent gradient corruption.")
                 
                 # Prefetch next batch while backward pass runs (overlap I/O with compute)
                 if micro_step < steps - 1:
