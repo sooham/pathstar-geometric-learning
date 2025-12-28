@@ -18,14 +18,15 @@ help:
 	@echo ""
 	@echo "Arguments (optional):"
 	@echo "  CONFIG=<file>       - Sweep config file (default: sweep_config.yaml)"
-	@echo "  PROJECT=<name>      - WandB project name (default: pathstar_sweep_dataset)"
-	@echo "  ENTITY=<name>       - WandB entity name (optional)"
+	@echo "  PROJECT=<name>      - WandB project name (optional, uses YAML value if not specified)"
+	@echo "  ENTITY=<name>       - WandB entity name (optional, uses YAML value if not specified)"
 	@echo "  COUNT=<num>         - Number of runs for single sweep (optional, auto-calculated for grid)"
 	@echo ""
 	@echo "Examples:"
 	@echo "  make setup"
-	@echo "  make sweep CONFIG=test_final.yaml PROJECT=my_project"
-	@echo "  make multi-sweep CONFIG=test_final.yaml PROJECT=my_project ENTITY=my_team"
+	@echo "  make sweep CONFIG=test_final.yaml"
+	@echo "  make multi-sweep CONFIG=test_final.yaml ENTITY=my_team"
+	@echo "  make sweep CONFIG=test_final.yaml PROJECT=my_project  # Override YAML project"
 	@echo ""
 
 # Variables with defaults
@@ -33,7 +34,7 @@ VENV_DIR = venv
 PYTHON = $(VENV_DIR)/bin/python3
 PIP = $(VENV_DIR)/bin/pip
 CONFIG ?= sweep_config.yaml
-PROJECT ?= pathstar_sweep_dataset
+PROJECT ?=
 ENTITY ?=
 COUNT ?=
 
@@ -61,7 +62,7 @@ $(VENV_DIR)/bin/activate: requirements.txt
 sweep: $(VENV_DIR)/bin/activate
 	@echo "Running single GPU sweep..."
 	@echo "  Config: $(CONFIG)"
-	@echo "  Project: $(PROJECT)"
+	@if [ -n "$(PROJECT)" ]; then echo "  Project: $(PROJECT) (override)"; else echo "  Project: (from YAML)"; fi
 	@if [ -n "$(ENTITY)" ]; then echo "  Entity: $(ENTITY)"; fi
 	@if [ -n "$(COUNT)" ]; then echo "  Count: $(COUNT)"; fi
 	@echo ""
@@ -72,7 +73,7 @@ sweep: $(VENV_DIR)/bin/activate
 	fi
 	$(PYTHON) run_sweep.py \
 		--sweep_config $(CONFIG) \
-		--project $(PROJECT) \
+		$(if $(PROJECT),--project $(PROJECT),) \
 		$(if $(ENTITY),--entity $(ENTITY),) \
 		$(if $(COUNT),--count $(COUNT),)
 
@@ -80,7 +81,7 @@ sweep: $(VENV_DIR)/bin/activate
 multi-sweep: $(VENV_DIR)/bin/activate
 	@echo "Running multi-GPU sweep..."
 	@echo "  Config: $(CONFIG)"
-	@echo "  Project: $(PROJECT)"
+	@if [ -n "$(PROJECT)" ]; then echo "  Project: $(PROJECT) (override)"; else echo "  Project: (from YAML)"; fi
 	@if [ -n "$(ENTITY)" ]; then echo "  Entity: $(ENTITY)"; fi
 	@echo ""
 	@if [ ! -f "$(CONFIG)" ]; then \
@@ -93,7 +94,10 @@ multi-sweep: $(VENV_DIR)/bin/activate
 		echo "Continuing anyway..."; \
 		echo ""; \
 	fi
-	./run_multi_gpu_sweep.sh $(CONFIG) $(PROJECT) $(ENTITY)
+	@ARGS="$(CONFIG)"; \
+	if [ -n "$(PROJECT)" ]; then ARGS="$$ARGS $(PROJECT)"; fi; \
+	if [ -n "$(ENTITY)" ]; then ARGS="$$ARGS $(ENTITY)"; fi; \
+	./run_multi_gpu_sweep.sh $$ARGS
 
 # Clean up virtual environment
 clean:
