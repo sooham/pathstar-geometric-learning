@@ -1709,7 +1709,7 @@ def train(config=None):
     ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
     
     os.makedirs(default_config['out_dir'], exist_ok=True)
-    checkpoint_filename = f'ckpt_{custom_name}_{gpu_id}.pt' if custom_name else "ckpt.pt"
+    checkpoint_filename = f'ckpt_{custom_name}.pt' if custom_name else "ckpt.pt"
     meta["checkpoint_filename"] = checkpoint_filename
     print(f"Checkpoint will be saved as: {checkpoint_filename}")
 
