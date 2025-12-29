@@ -537,7 +537,9 @@ def visualize_paths_in_umap(embeddings, labels, meta, save_dir='out', prefix='em
         fig, ax = plt.subplots(figsize=(14, 12))
         
         # Generate distinct colors for each path
-        colors_list = cm.get_cmap('tab20' if num_paths_to_show <= 20 else 'hsv')(np.linspace(0, 1, num_paths_to_show))
+        cmap_name = 'tab20' if num_paths_to_show <= 20 else 'hsv'
+        cmap = plt.get_cmap(cmap_name)
+        colors_list = cmap(np.linspace(0, 1, num_paths_to_show))
         
         # Plot background: all node tokens in gray
         ax.scatter(
