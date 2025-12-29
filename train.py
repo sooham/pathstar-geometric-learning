@@ -1506,7 +1506,7 @@ def evaluate(estimate_metrics, config, meta, iter_num, lr, ctx, device, model, v
         # Save LR scheduler state if using ReduceLROnPlateau
         if lr_scheduler_obj is not None:
             checkpoint_data['lr_scheduler'] = lr_scheduler_obj.state_dict()
-        LiveTrainingPanel.CONSOLE.print(f"saving checkpoint to {config['out_dir']}/{meta['checkpoint_filename']}")
+        LiveTrainingPanel.CONSOLE.print(f"saving checkpoint to {config['out_dir']}/{meta['checkpoint_filename']} ... loss {losses['val']}")
         torch.save(checkpoint_data, os.path.join(config['out_dir'], meta['checkpoint_filename']))
     
     # Return validation loss for LR schedulers like ReduceLROnPlateau
