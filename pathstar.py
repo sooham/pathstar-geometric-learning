@@ -698,13 +698,13 @@ class InWeightsPathStar:
         # - predict_direction_for_edge_task=True:  [EDGE] u v -> predict direction, so context is 1 + 2
         # - predict_direction_for_edge_task=False: [EDGE] u (dir) -> predict v, so context is 1 + (dir) + 1
         if predict_direction_for_edge_task:
-            edge_context_length = 1 + 2  # EDGE + u + v
+            edge_context_length = 3  # EDGE + u + v
         else:
-            edge_context_length = 1 + (1 if use_directional_tokens else 0) + 1
+            edge_context_length = 2 + (1 if use_directional_tokens else 0) # EDGE + u + (dir optional)
         
         # path_context_length_base = PATH prefix (conditional) + leaf (NO pause tokens)
         # The full path_context_length = path_context_length_base + num_pause_tokens (added at runtime)
-        path_context_length_base = 1 + 1  # PATH + leaf
+        path_context_length_base = 2  # PATH + leaf
         
         # Note: path_seq_len is the stored sequence length (WITHOUT pause tokens).
         # At runtime, the actual sequence length = path_seq_len + num_pause_tokens
@@ -714,20 +714,25 @@ class InWeightsPathStar:
             'vocab_size': vocab_size,
             'itos': itos,
             'stoi': stoi,
+
             'd': self.d,
             'l': self.l,
+
             'total_vertices': self.num_vertices,
             'total_edges': self.num_graph_edges,
             'pause_token': self.SPECIAL_TOKENS["PAUSE"],
             'pad_token': self.SPECIAL_TOKENS["PAD"],
             'special_tokens': self.SPECIAL_TOKENS,
+
             # NOTE: num_pause_tokens is NOT stored - it's a runtime config parameter
             'root_vertex': self.v_root,
             'leaf_vertices': self.v_leaf,
+
             'vertices': self.vertices,
             'holdout_percentage': self.holdout_percentage,
             'train_leaves': self.train_leaves,
             'holdout_leaves': self.holdout_leaves,
+            'paths_by_leaf': self.paths_by_leaf,  # Full mapping from leaf to path (after randomization)
             'use_undirected': use_undirected,
             'use_directional_tokens': use_directional_tokens,
             'use_task_tokens_in_path': use_task_tokens_in_path,
@@ -745,13 +750,17 @@ class InWeightsPathStar:
             # path_context_length_base does NOT include pause tokens
             'path_context_length_base': path_context_length_base,
             # block_size_base is WITHOUT pause tokens - actual block_size = block_size_base + num_pause_tokens
+            # we derive the correct block size based on the full sequence in train.py
             'block_size_base': path_seq_len - 1,
             'num_train_path_samples': num_train_path_samples,
             'num_val_path_samples': num_val_path_samples,
             'total_edge_size': num_edge_samples,
             'predict_direction_for_edge_task': predict_direction_for_edge_task
         }
-        
+        # 3 saved datasets
+        # 1. paths   (training)
+        # 2. edges
+        # 3. paths (validation)
         meta['PATHS_DATASET_SIZE'] = paths_data.shape[0]
         meta['EDGES_DATASET_SIZE'] = edges_data.shape[0]
         meta['VAL_DATASET_SIZE'] = val_data.shape[0]
