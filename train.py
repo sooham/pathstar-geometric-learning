@@ -1565,7 +1565,7 @@ def train(config=None):
     """
 
     default_config = get_default_config()
-    
+
     # Clear GPU memory at the start of training run
     clear_gpu_memory()
     
@@ -1585,6 +1585,20 @@ def train(config=None):
         # Update default_config with any overrides from configurator
         for k in config_keys:
             default_config[k] = globals()[k]
+
+    # Set random seed and backend configurations
+    random.seed(config['seed'])
+    torch.manual_seed(config['seed'])
+    np.random.seed(config['seed'])
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(default_config['seed'])
+        torch.cuda.manual_seed_all(default_config['seed'])  # for multi-GPU
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
+
+    
     
     custom_name = set_wandb_name(default_config)
     if default_config['wandb_run_name'] is None:
@@ -1691,18 +1705,6 @@ def train(config=None):
         torch.autograd.set_detect_anomaly(True)
         LiveTrainingPanel.CONSOLE.print("[yellow]⚠️  Anomaly detection ENABLED - training will be slower but NaN sources will be caught[/yellow]")
     
-    # Set random seed and backend configurations
-    random.seed(config['seed'])
-    torch.manual_seed(config['seed'])
-    np.random.seed(config['seed'])
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(default_config['seed'])
-        torch.cuda.manual_seed_all(default_config['seed'])  # for multi-GPU
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-        torch.backends.cuda.enable_flash_sdp(False)
-        torch.backends.cuda.enable_mem_efficient_sdp(False)
-
 
     ptdtype, dtype = set_dtype(default_config)
 
