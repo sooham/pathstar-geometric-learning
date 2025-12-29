@@ -1021,6 +1021,30 @@ def check_for_nans(model, optimizer, loss, logits, X, Y, iter_num, phase='unknow
     
     return None
 
+def compute_path_similarities(paths, result_dict, meta, similarity_matrix, token_to_idx):
+    """
+    Compute pairwise similarities between nodes at different distances within paths.
+
+    paths: list of lists , each list is a path from root to leaf i.e [root, n_1, n_2, ..., leaf]
+    results_dict: dictionary to mutate to store the similarities by distance
+    meta: metadata dictionary
+    similarity_matrix: matrix of similarities between all nodes (num_nodes, num_nodes)
+    token_to_idx: mapping from token to index in similarity matrix
+    """
+    for path in paths:
+        assert len(path) == meta['l']
+        # path is [root, n_1, n_2, ..., leaf] with length l
+        for i in range(len(path)):
+            for j in range(i, len(path)):
+                dist = j - i  # Graph distance within the path
+                token_i = path[i]
+                token_j = path[j]
+                
+                if token_i in token_to_idx and token_j in token_to_idx:
+                    idx_i = token_to_idx[token_i]
+                    idx_j = token_to_idx[token_j]
+                    sim = similarity_matrix[idx_i, idx_j].item()
+                    result_dict[dist].append(sim)
 
 def analyze_embedding_geometry(model, meta, paths_data_np, val_data_np, iter_num, config, out_dir='out'):
     """
@@ -1043,12 +1067,6 @@ def analyze_embedding_geometry(model, meta, paths_data_np, val_data_np, iter_num
     """
     model.eval()
     E = model.transformer.wte.weight.detach().cpu()
-    
-    # Get metadata
-    l = meta['l']
-    special_tokens = meta['special_tokens']
-    num_special_tokens = len(special_tokens)
-    use_task_tokens_in_path = meta.get('use_task_tokens_in_path', False)
     
     # Calculate sequence dimensions from meta
     # NOTE: Use block_size_base since paths_data_np and val_data_np are raw stored data (WITHOUT pause tokens)
@@ -1080,7 +1098,7 @@ def analyze_embedding_geometry(model, meta, paths_data_np, val_data_np, iter_num
         
         # Filter out special tokens (GT, PAD, etc.) to get just node tokens
         # Node tokens are >= num_special_tokens
-        node_tokens = [t for t in path_portion if t >= num_special_tokens]
+        node_tokens = [t for t in path_portion if t in meta['vertices']]
         
         return node_tokens
     
@@ -1095,11 +1113,12 @@ def analyze_embedding_geometry(model, meta, paths_data_np, val_data_np, iter_num
         path_nodes = extract_path_nodes(val_data[i], meta)
         val_paths.append(path_nodes)
     
-    # Get all unique node tokens for similarity matrix
+    # Get all unique node tokens for similarity matrix (sorted for deterministic ordering)
     all_node_tokens = set()
     for path in train_paths + val_paths:
         all_node_tokens.update(path)
-    all_node_tokens = sorted(list(all_node_tokens))
+    all_node_tokens = sorted(list(all_node_tokens))  # Sort to ensure deterministic ordering
+    assert len(all_node_tokens) == meta['num_vertices']
     
     # Compute embeddings for all node tokens
     node_embeddings = E[all_node_tokens]  # (num_nodes, n_embd)
@@ -1119,24 +1138,8 @@ def analyze_embedding_geometry(model, meta, paths_data_np, val_data_np, iter_num
         'val': defaultdict(list),
     }
     
-    def compute_path_similarities(paths, result_dict):
-        """Compute pairwise similarities between nodes at different distances within paths."""
-        for path in paths:
-            # path is [root, n_1, n_2, ..., leaf] with length l
-            for i in range(len(path)):
-                for j in range(i, len(path)):
-                    dist = j - i  # Graph distance within the path
-                    token_i = path[i]
-                    token_j = path[j]
-                    
-                    if token_i in token_to_idx and token_j in token_to_idx:
-                        idx_i = token_to_idx[token_i]
-                        idx_j = token_to_idx[token_j]
-                        sim = sim_matrix[idx_i, idx_j].item()
-                        result_dict[dist].append(sim)
-    
-    compute_path_similarities(train_paths, results['train'])
-    compute_path_similarities(val_paths, results['val'])
+    compute_path_similarities(train_paths, results['train'], meta, sim_matrix, token_to_idx)
+    compute_path_similarities(val_paths, results['val'], meta, sim_matrix, token_to_idx)
     
     # Compute cross-path similarities (nodes at same position but different spokes)
     # This measures how similar nodes at the same depth are across different paths
@@ -1486,6 +1489,11 @@ def evaluate(estimate_metrics, config, meta, iter_num, lr, ctx, device, model, v
     if save_checkpoint and iter_num > 0:
         # Exclude non-serializable objects (like console) from saved config
         serializable_config = {k: v for k, v in config.items() if k != 'console'}
+        
+        # Save only specific meta keys
+        meta_keys_to_save = ['train_leaves', 'holdout_leaves', 'paths_by_leaf', 'd', 'l', 'vocab_size', 'special_tokens', 'root_vertex', 'itos', 'stoi']
+        meta_subset = {k: meta[k] for k in meta_keys_to_save if k in meta}
+        
         checkpoint_data = {
             'model': model.state_dict(),
             'optimizer': meta['optimizer'].state_dict(),
@@ -1493,6 +1501,7 @@ def evaluate(estimate_metrics, config, meta, iter_num, lr, ctx, device, model, v
             'iter_num': iter_num,
             'best_val_loss': meta['best_val_loss'],
             'config': serializable_config,
+            'meta': meta_subset,  # Save only the specified meta keys
         }
         # Save LR scheduler state if using ReduceLROnPlateau
         if lr_scheduler_obj is not None:
