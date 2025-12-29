@@ -1,4 +1,4 @@
-.PHONY: help setup venv sweep multi-sweep visualize clean
+.PHONY: help setup venv sweep multi-sweep visualize clean viz
 
 # Default target
 help:
@@ -116,6 +116,7 @@ multi-sweep: $(VENV_DIR)/bin/activate
 	./run_multi_gpu_sweep.sh $(CONFIG) "$(PROJECT)" "$(ENTITY)"
 
 # Visualize UMAP embeddings from checkpoint
+viz: visualize
 visualize: $(VENV_DIR)/bin/activate
 	@echo "Visualizing UMAP embeddings..."
 	@if [ -z "$(RUN)" ]; then \
@@ -124,7 +125,7 @@ visualize: $(VENV_DIR)/bin/activate
 		echo "Example: make visualize RUN=20251228T030542_2556bb8_DSET_G1000L5P1PeUdirDt_L3E256H1MlpAgeluLnBiasD0WtEp10000Seed7828"; \
 		exit 1; \
 	fi
-	@CKPT_PATH="out/ckpt_$(RUN).pt"; \
+	@CKPT_PATH="out_2/ckpt_$(RUN).pt"; \
 	if [ ! -f "$$CKPT_PATH" ]; then \
 		echo "Error: Checkpoint file not found: $$CKPT_PATH"; \
 		echo "Please check that the RUN name is correct and the checkpoint exists."; \
@@ -138,12 +139,14 @@ visualize: $(VENV_DIR)/bin/activate
 			--checkpoint "$$CKPT_PATH" \
 			--data_dir "$(DATA_DIR)" \
 			--device "$(DEVICE)"; \
+			--save_dir "visualizations/"; \
 	else \
 		echo "  Data directory: (auto-detect from checkpoint)"; \
 		echo "  Device: $(DEVICE)"; \
 		$(PYTHON) visualize_embeddings_umap.py \
 			--checkpoint "$$CKPT_PATH" \
 			--device "$(DEVICE)"; \
+			--save_dir "visualizations/"; \
 	fi
 
 # Clean up virtual environment
