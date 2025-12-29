@@ -125,7 +125,8 @@ visualize: $(VENV_DIR)/bin/activate
 		echo "Example: make visualize RUN=20251228T030542_2556bb8_DSET_G1000L5P1PeUdirDt_L3E256H1MlpAgeluLnBiasD0WtEp10000Seed7828"; \
 		exit 1; \
 	fi
-	@CKPT_PATH="out_2/ckpt_$(RUN).pt"; \
+	@FOLDER=$${FOLDER:-out_tiny}; \
+	CKPT_PATH="$$FOLDER/ckpt_$(RUN).pt"; \
 	if [ ! -f "$$CKPT_PATH" ]; then \
 		echo "Error: Checkpoint file not found: $$CKPT_PATH"; \
 		echo "Please check that the RUN name is correct and the checkpoint exists."; \
@@ -138,15 +139,15 @@ visualize: $(VENV_DIR)/bin/activate
 		$(PYTHON) visualize_embeddings_umap.py \
 			--checkpoint "$$CKPT_PATH" \
 			--data_dir "$(DATA_DIR)" \
-			--device "$(DEVICE)"; \
-			--save_dir "visualizations/"; \
+			--device "$(DEVICE)" \
+			--save_dir "visualizations/$(RUN)"; \
 	else \
 		echo "  Data directory: (auto-detect from checkpoint)"; \
 		echo "  Device: $(DEVICE)"; \
 		$(PYTHON) visualize_embeddings_umap.py \
 			--checkpoint "$$CKPT_PATH" \
-			--device "$(DEVICE)"; \
-			--save_dir "visualizations/"; \
+			--device "$(DEVICE)" \
+			--save_dir "visualizations/$(RUN)"; \
 	fi
 
 # Clean up virtual environment
@@ -155,3 +156,17 @@ clean:
 	rm -rf $(VENV_DIR)
 	@echo "Cleanup complete!"
 
+# Copy a zip file from VastAI instance via SCP
+# Usage: make copy-zip NAME=<filename> HOST=<vastai_host>
+# Example: make copy-zip NAME=results HOST=ssh6.vast.ai -p 29299
+copy-zip:
+	@if [ -z "$(NAME)" ]; then \
+		echo "Error: NAME parameter is required!"; \
+		echo "Usage: make copy-zip NAME=<filename>"; \
+		exit 1; \
+	fi
+	@echo "Copying $(NAME).zip from VastAI instance..."
+	@echo "  Source: root@vastai:/workspace/pathstar-geometric-learning/$(NAME).zip"
+	@echo "  Destination: ./$(NAME).zip"
+	scp root@vastai:/workspace/pathstar-geometric-learning/$(NAME).zip ./$(NAME).zip
+	@echo "Copy complete!"
