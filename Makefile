@@ -70,6 +70,12 @@ $(VENV_DIR)/bin/activate: requirements.txt
 		echo "Detected Ubuntu - creating ~/.no_auto_tmux to disable auto-tmux..."; \
 		touch ~/.no_auto_tmux; \
 	fi
+	@echo "Configuring git..."
+	@git config user.email "rafizsooham@gmail.com"
+	@git config user.name "sooham"
+	@git config pull.rebase true
+	@echo "Git configured with user.email=rafizsooham@gmail.com and user.name=sooham"
+
 
 # Single GPU sweep
 sweep: $(VENV_DIR)/bin/activate
