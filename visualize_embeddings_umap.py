@@ -1,16 +1,26 @@
 """
 Visualize token embeddings from a trained GPT model checkpoint using UMAP.
 
-This script loads a checkpoint and creates multiple UMAP visualizations:
+This script loads a checkpoint (which now includes metadata) and creates multiple UMAP visualizations:
+
+Standard visualizations:
 1. All embeddings colored by token type (special vs node)
-2. Node embeddings colored by depth in the path structure
-3. Node embeddings with annotations for special tokens
+2. Node embeddings colored by token ID
+3. 3D UMAP visualization
+4. Node embeddings colored by similarity to root
+5. Comprehensive summary figure
+
+Path-based visualizations (if paths_by_leaf is in checkpoint metadata):
+6. Sample of training paths with distinct colors
+7. Path membership count heatmap
+8. Train vs holdout path visualization
+9. Depth in path structure visualization
 
 Usage:
     python visualize_embeddings_umap.py --checkpoint out/ckpt_xxx.pt
     
-Or run with defaults:
-    python visualize_embeddings_umap.py
+With custom save directory:
+    python visualize_embeddings_umap.py --checkpoint out/ckpt_xxx.pt --save_dir visualizations/
 """
 
 import argparse
@@ -20,6 +30,7 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap
+import matplotlib.cm as cm
 
 from model import GPTConfig, GPT
 from umap_utils import apply_umap, plot_umap, umap_with_annotations
@@ -37,6 +48,7 @@ def load_checkpoint_and_model(checkpoint_path, device='cpu'):
         model: Loaded GPT model
         checkpoint: Full checkpoint dict
         config: Training config from checkpoint
+        meta: Metadata dict from checkpoint (contains paths_by_leaf, train_leaves, etc.)
     """
     print(f"Loading checkpoint from: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device)
@@ -44,6 +56,10 @@ def load_checkpoint_and_model(checkpoint_path, device='cpu'):
     # Extract model arguments
     model_args = checkpoint['model_args']
     config = checkpoint.get('config', {})
+    meta = checkpoint.get('meta', {})
+
+    if meta is None:
+        raise ValueError("No metadata found in checkpoint")
     
     print(f"Model args: {model_args}")
     
@@ -70,7 +86,22 @@ def load_checkpoint_and_model(checkpoint_path, device='cpu'):
     print(f"  - Layers: {gptconf.n_layer}")
     print(f"  - Heads: {gptconf.n_head}")
     
-    return model, checkpoint, config
+    if meta:
+        print(f"\nMetadata loaded from checkpoint:")
+        print(f"  - d (spokes): {meta.get('d', 'N/A')}")
+        print(f"  - l (length): {meta.get('l', 'N/A')}")
+        print(f"  - vocab_size: {meta.get('vocab_size', 'N/A')}")
+        print(f"  - root_vertex: {meta.get('root_vertex', 'N/A')}")
+        if 'paths_by_leaf' in meta:
+            print(f"  - paths_by_leaf: Available ({len(meta['paths_by_leaf'])} paths)")
+        if 'train_leaves' in meta:
+            print(f"  - train_leaves: {len(meta['train_leaves'])} leaves")
+        if 'holdout_leaves' in meta:
+            print(f"  - holdout_leaves: {len(meta['holdout_leaves'])} leaves")
+    else:
+        print("\nWarning: No metadata found in checkpoint")
+    
+    return model, checkpoint, config, meta
 
 
 def load_metadata(data_dir):
@@ -426,20 +457,422 @@ def visualize_all_embeddings(embeddings, labels, save_dir='out', prefix='embeddi
     return reduced_all
 
 
+def visualize_paths_in_umap(embeddings, labels, meta, save_dir='out', prefix='embedding_umap'):
+    """
+    Visualize embeddings with each path colored distinctly using path information from metadata.
+    
+    Args:
+        embeddings: numpy array of shape (vocab_size, n_embd)
+        labels: Dict with labeling information
+        meta: Metadata dictionary containing path information
+        save_dir: Directory to save plots
+        prefix: Prefix for saved files
+    """
+    if meta is None or not meta:
+        print("Skipping path-based visualization: No metadata available")
+        return
+    
+    # Check if path information is available
+    paths_by_leaf = meta.get('paths_by_leaf', None)
+    train_leaves = meta.get('train_leaves', set())
+    holdout_leaves = meta.get('holdout_leaves', set())
+    root_vertex = meta.get('root_vertex', None)
+    
+    if paths_by_leaf is None:
+        print("Skipping path-based visualization: 'paths_by_leaf' not available in metadata")
+        return
+    
+    if root_vertex is None:
+        print("Warning: 'root_vertex' not found in metadata")
+    
+    print("\n=== Path-Based Visualization ===")
+    print(f"  Train leaves: {len(train_leaves)}")
+    print(f"  Holdout leaves: {len(holdout_leaves)}")
+    print(f"  Total paths: {len(paths_by_leaf)}")
+    print(f"  Root vertex: {root_vertex}")
+    
+    os.makedirs(save_dir, exist_ok=True)
+    
+    vocab_size = embeddings.shape[0]
+    node_mask = ~labels['is_special']
+    special_mask = labels['is_special']
+    
+    # Compute UMAP projection
+    print("  Computing UMAP projection...")
+    reduced_all = apply_umap(
+        embeddings, 
+        n_components=2, 
+        n_neighbors=30, 
+        min_dist=0.1,
+        random_state=42
+    )
+    
+    # Create a mapping from token to path indices it belongs to
+    token_to_paths = {}
+    for leaf_token, path_tokens in paths_by_leaf.items():
+        for token in path_tokens:
+            if token not in token_to_paths:
+                token_to_paths[token] = []
+            token_to_paths[token].append(leaf_token)
+    
+    # Separate train and holdout paths
+    train_path_leaves = [leaf for leaf in paths_by_leaf.keys() if leaf in train_leaves]
+    holdout_path_leaves = [leaf for leaf in paths_by_leaf.keys() if leaf in holdout_leaves]
+    
+    print(f"  Paths in training: {len(train_path_leaves)}")
+    print(f"  Paths in holdout: {len(holdout_path_leaves)}")
+    
+    # ============================================================
+    # Visualization 1: Sample of paths with distinct colors
+    # ============================================================
+    max_paths_to_show = 20  # Limit to avoid color confusion
+    
+    if len(train_path_leaves) > 0:
+        print(f"\n  [1/4] Creating visualization: Sample of training paths with distinct colors...")
+        
+        # Sample a subset of paths to visualize
+        num_paths_to_show = min(max_paths_to_show, len(train_path_leaves))
+        sampled_leaves = np.random.choice(train_path_leaves, size=num_paths_to_show, replace=False)
+        
+        fig, ax = plt.subplots(figsize=(14, 12))
+        
+        # Generate distinct colors for each path
+        colors_list = cm.get_cmap('tab20' if num_paths_to_show <= 20 else 'hsv')(np.linspace(0, 1, num_paths_to_show))
+        
+        # Plot background: all node tokens in gray
+        ax.scatter(
+            reduced_all[node_mask, 0],
+            reduced_all[node_mask, 1],
+            c='lightgray', alpha=0.2, s=10, label='Other nodes', zorder=1
+        )
+        
+        # Plot each path with a distinct color
+        for path_idx, leaf_token in enumerate(sampled_leaves):
+            path_tokens = paths_by_leaf[leaf_token]
+            path_mask = np.array([t in path_tokens for t in range(vocab_size)])
+            
+            if path_mask.any():
+                color = colors_list[path_idx]
+                ax.scatter(
+                    reduced_all[path_mask, 0],
+                    reduced_all[path_mask, 1],
+                    c=[color], alpha=0.8, s=50, 
+                    label=f'Path to leaf {leaf_token}',
+                    edgecolors='black', linewidths=0.5,
+                    zorder=3
+                )
+        
+        # Highlight root if available
+        if root_vertex is not None and 0 <= root_vertex < vocab_size:
+            ax.scatter(
+                reduced_all[root_vertex, 0],
+                reduced_all[root_vertex, 1],
+                c='black', s=300, marker='X', 
+                label=f'Root ({root_vertex})',
+                edgecolors='white', linewidths=2,
+                zorder=10
+            )
+        
+        # Plot special tokens
+        ax.scatter(
+            reduced_all[special_mask, 0],
+            reduced_all[special_mask, 1],
+            c='red', alpha=0.6, s=100, marker='*',
+            label='Special tokens',
+            zorder=2
+        )
+        
+        ax.set_xlabel('UMAP 1', fontsize=12)
+        ax.set_ylabel('UMAP 2', fontsize=12)
+        ax.set_title(f'Sample of {num_paths_to_show} Training Paths (Distinct Colors)', fontsize=14)
+        ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8, ncol=1)
+        ax.grid(True, alpha=0.3)
+        
+        path1 = os.path.join(save_dir, f'{prefix}_paths_distinct.png')
+        fig.savefig(path1, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        print(f"    Saved: {path1}")
+    
+    # ============================================================
+    # Visualization 2: Heatmap showing path membership count
+    # ============================================================
+    print(f"  [2/4] Creating visualization: Path membership heatmap...")
+    
+    # Count how many paths each token belongs to
+    path_membership_count = np.zeros(vocab_size, dtype=int)
+    for token, path_list in token_to_paths.items():
+        if 0 <= token < vocab_size:
+            path_membership_count[token] = len(path_list)
+    
+    fig, ax = plt.subplots(figsize=(12, 10))
+    
+    # Plot nodes colored by path membership count
+    node_counts = path_membership_count[node_mask]
+    scatter = ax.scatter(
+        reduced_all[node_mask, 0],
+        reduced_all[node_mask, 1],
+        c=node_counts,
+        cmap='YlOrRd',
+        alpha=0.7, s=30,
+        vmin=0, vmax=max(node_counts.max(), 1)
+    )
+    plt.colorbar(scatter, ax=ax, label='Number of Paths Containing Token')
+    
+    # Highlight root
+    if root_vertex is not None and 0 <= root_vertex < vocab_size:
+        ax.scatter(
+            reduced_all[root_vertex, 0],
+            reduced_all[root_vertex, 1],
+            c='black', s=300, marker='X',
+            label=f'Root (in {path_membership_count[root_vertex]} paths)',
+            edgecolors='white', linewidths=2,
+            zorder=10
+        )
+    
+    # Plot special tokens
+    ax.scatter(
+        reduced_all[special_mask, 0],
+        reduced_all[special_mask, 1],
+        c='blue', alpha=0.6, s=100, marker='*',
+        label='Special tokens',
+        zorder=5
+    )
+    
+    ax.set_xlabel('UMAP 1', fontsize=12)
+    ax.set_ylabel('UMAP 2', fontsize=12)
+    ax.set_title('Token Embeddings: Path Membership Count', fontsize=14)
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.3)
+    
+    path2 = os.path.join(save_dir, f'{prefix}_path_membership.png')
+    fig.savefig(path2, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"    Saved: {path2}")
+    
+    # ============================================================
+    # Visualization 3: Train vs Holdout paths
+    # ============================================================
+    print(f"  [3/4] Creating visualization: Train vs Holdout paths...")
+    
+    fig, ax = plt.subplots(figsize=(12, 10))
+    
+    # Create masks for train and holdout tokens
+    train_path_tokens = set()
+    for leaf in train_path_leaves:
+        train_path_tokens.update(paths_by_leaf[leaf])
+    
+    holdout_path_tokens = set()
+    for leaf in holdout_path_leaves:
+        holdout_path_tokens.update(paths_by_leaf[leaf])
+    
+    # Tokens only in training paths
+    train_only_mask = np.array([
+        (t in train_path_tokens and t not in holdout_path_tokens and not labels['is_special'][t])
+        for t in range(vocab_size)
+    ])
+    
+    # Tokens only in holdout paths
+    holdout_only_mask = np.array([
+        (t in holdout_path_tokens and t not in train_path_tokens and not labels['is_special'][t])
+        for t in range(vocab_size)
+    ])
+    
+    # Tokens in both (shared nodes like root)
+    shared_mask = np.array([
+        (t in train_path_tokens and t in holdout_path_tokens and not labels['is_special'][t])
+        for t in range(vocab_size)
+    ])
+    
+    # Other nodes
+    other_mask = np.array([
+        (t not in train_path_tokens and t not in holdout_path_tokens and not labels['is_special'][t])
+        for t in range(vocab_size)
+    ])
+    
+    # Plot each category
+    if other_mask.any():
+        ax.scatter(
+            reduced_all[other_mask, 0],
+            reduced_all[other_mask, 1],
+            c='lightgray', alpha=0.2, s=10,
+            label=f'Other nodes ({other_mask.sum()})',
+            zorder=1
+        )
+    
+    if train_only_mask.any():
+        ax.scatter(
+            reduced_all[train_only_mask, 0],
+            reduced_all[train_only_mask, 1],
+            c='steelblue', alpha=0.6, s=40,
+            label=f'Train-only paths ({train_only_mask.sum()})',
+            zorder=3
+        )
+    
+    if holdout_only_mask.any():
+        ax.scatter(
+            reduced_all[holdout_only_mask, 0],
+            reduced_all[holdout_only_mask, 1],
+            c='orange', alpha=0.6, s=40,
+            label=f'Holdout-only paths ({holdout_only_mask.sum()})',
+            zorder=3
+        )
+    
+    if shared_mask.any():
+        ax.scatter(
+            reduced_all[shared_mask, 0],
+            reduced_all[shared_mask, 1],
+            c='green', alpha=0.8, s=60,
+            label=f'Shared nodes ({shared_mask.sum()})',
+            edgecolors='black', linewidths=0.5,
+            zorder=5
+        )
+    
+    # Highlight root
+    if root_vertex is not None and 0 <= root_vertex < vocab_size:
+        ax.scatter(
+            reduced_all[root_vertex, 0],
+            reduced_all[root_vertex, 1],
+            c='black', s=300, marker='X',
+            label=f'Root',
+            edgecolors='white', linewidths=2,
+            zorder=10
+        )
+    
+    # Plot special tokens
+    ax.scatter(
+        reduced_all[special_mask, 0],
+        reduced_all[special_mask, 1],
+        c='red', alpha=0.6, s=100, marker='*',
+        label='Special tokens',
+        zorder=2
+    )
+    
+    ax.set_xlabel('UMAP 1', fontsize=12)
+    ax.set_ylabel('UMAP 2', fontsize=12)
+    ax.set_title('Token Embeddings: Train vs Holdout Paths', fontsize=14)
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.3)
+    
+    path3 = os.path.join(save_dir, f'{prefix}_train_vs_holdout.png')
+    fig.savefig(path3, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"    Saved: {path3}")
+    
+    # ============================================================
+    # Visualization 4: Depth in path structure
+    # ============================================================
+    print(f"  [4/4] Creating visualization: Depth in path structure...")
+    
+    # Calculate depth for each token (distance from root along path)
+    token_depths = np.full(vocab_size, -1, dtype=int)
+    
+    if root_vertex is not None:
+        token_depths[root_vertex] = 0
+        
+        # For each path, assign depths
+        for leaf_token, path_tokens in paths_by_leaf.items():
+            for depth, token in enumerate(path_tokens):
+                if 0 <= token < vocab_size:
+                    # If token already has a depth assigned, take the minimum
+                    # (tokens can appear at different depths in different paths)
+                    if token_depths[token] == -1:
+                        token_depths[token] = depth
+                    else:
+                        token_depths[token] = min(token_depths[token], depth)
+    
+    fig, ax = plt.subplots(figsize=(12, 10))
+    
+    # Filter to nodes with assigned depth
+    has_depth_mask = (token_depths >= 0) & node_mask
+    no_depth_mask = (token_depths < 0) & node_mask
+    
+    if no_depth_mask.any():
+        ax.scatter(
+            reduced_all[no_depth_mask, 0],
+            reduced_all[no_depth_mask, 1],
+            c='lightgray', alpha=0.2, s=10,
+            label='Unknown depth',
+            zorder=1
+        )
+    
+    if has_depth_mask.any():
+        depths = token_depths[has_depth_mask]
+        scatter = ax.scatter(
+            reduced_all[has_depth_mask, 0],
+            reduced_all[has_depth_mask, 1],
+            c=depths,
+            cmap='viridis',
+            alpha=0.7, s=40,
+            vmin=0, vmax=depths.max()
+        )
+        plt.colorbar(scatter, ax=ax, label='Depth (Distance from Root)')
+    
+    # Highlight root
+    if root_vertex is not None and 0 <= root_vertex < vocab_size:
+        ax.scatter(
+            reduced_all[root_vertex, 0],
+            reduced_all[root_vertex, 1],
+            c='black', s=300, marker='X',
+            label='Root (depth=0)',
+            edgecolors='white', linewidths=2,
+            zorder=10
+        )
+    
+    # Plot special tokens
+    ax.scatter(
+        reduced_all[special_mask, 0],
+        reduced_all[special_mask, 1],
+        c='red', alpha=0.6, s=100, marker='*',
+        label='Special tokens',
+        zorder=5
+    )
+    
+    ax.set_xlabel('UMAP 1', fontsize=12)
+    ax.set_ylabel('UMAP 2', fontsize=12)
+    ax.set_title('Token Embeddings: Depth in Path Structure', fontsize=14)
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.3)
+    
+    path4 = os.path.join(save_dir, f'{prefix}_depth.png')
+    fig.savefig(path4, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"    Saved: {path4}")
+    
+    # Print summary statistics
+    print("\n  === Path Statistics ===")
+    print(f"  Root appears in {path_membership_count[root_vertex] if root_vertex is not None else 0} paths")
+    print(f"  Train-only tokens: {train_only_mask.sum()}")
+    print(f"  Holdout-only tokens: {holdout_only_mask.sum()}")
+    print(f"  Shared tokens: {shared_mask.sum()}")
+    print(f"  Max path membership: {path_membership_count.max()}")
+    print(f"  Max depth: {token_depths.max()}")
+    print("  =======================\n")
+
+
 def main():
-    parser = argparse.ArgumentParser(description='Visualize GPT token embeddings using UMAP')
-    parser.add_argument('--checkpoint', type=str, 
-                        default='out/ckpt_20251222T203000_fce0632_DSET_G1000L5P5PeUdirTtDt_L5E128H1MlpAgeluLnBiasD0WtEp15000Seed9004_2.pt',
-                        help='Path to checkpoint file')
-    parser.add_argument('--data_dir', type=str,
-                        default='data/inweights_pathstar_v4001_pet_elv2_plplain_d1000_l5_p5_undirected_dt_tt',
-                        help='Path to data directory containing meta.pkl')
+    parser = argparse.ArgumentParser(
+        description='Visualize GPT token embeddings using UMAP',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Basic usage with checkpoint
+  python visualize_embeddings_umap.py --checkpoint out/ckpt_xxx.pt
+  
+  # With custom output directory
+  python visualize_embeddings_umap.py --checkpoint out/ckpt_xxx.pt --save_dir visualizations/
+  
+  # With custom prefix for output files
+  python visualize_embeddings_umap.py --checkpoint out/ckpt_xxx.pt --prefix my_embeddings
+        """
+    )
+    parser.add_argument('--checkpoint', type=str, required=True,
+                        help='Path to checkpoint file (.pt)')
     parser.add_argument('--device', type=str, default='cpu',
-                        help='Device to load model on')
+                        help='Device to load model on (cpu, cuda, mps)')
     parser.add_argument('--save_dir', type=str, default='out',
                         help='Directory to save visualizations')
-    parser.add_argument('--prefix', type=str, default='embedding_umap',
-                        help='Prefix for saved files')
+    parser.add_argument('--prefix', type=str, default=None,
+                        help='Prefix for saved files (default: auto-generated from checkpoint name)')
     
     args = parser.parse_args()
     
@@ -447,17 +880,18 @@ def main():
     print("Token Embedding UMAP Visualization")
     print("=" * 60)
     
-    # Load checkpoint and model
-    model, checkpoint, config = load_checkpoint_and_model(args.checkpoint, args.device)
+    # Auto-generate prefix from checkpoint filename if not provided
+    if args.prefix is None:
+        # Extract filename without extension
+        checkpoint_basename = os.path.basename(args.checkpoint)
+        if checkpoint_basename.endswith('.pt'):
+            args.prefix = checkpoint_basename[:-3]  # Remove .pt extension
+        else:
+            args.prefix = checkpoint_basename
+        print(f"\nAuto-generated prefix: {args.prefix}")
     
-    # Load metadata
-    meta = load_metadata(args.data_dir)
-    if meta:
-        print(f"\nDataset info from metadata:")
-        print(f"  - d (spokes): {meta.get('d', 'N/A')}")
-        print(f"  - l (length): {meta.get('l', 'N/A')}")
-        print(f"  - vocab_size: {meta.get('vocab_size', 'N/A')}")
-        print(f"  - Special tokens: {list(meta.get('special_tokens', {}).keys())}")
+    # Load checkpoint and model (meta is now extracted from checkpoint)
+    model, checkpoint, config, meta = load_checkpoint_and_model(args.checkpoint, args.device)
     
     # Extract embeddings
     embeddings = extract_embeddings(model)
@@ -470,13 +904,25 @@ def main():
     print(f"  - Special tokens: {labels['is_special'].sum()}")
     print(f"  - Node tokens: {(~labels['is_special']).sum()}")
     
-    # Create visualizations
+    # Create standard visualizations
     visualize_all_embeddings(
         embeddings, 
         labels, 
         save_dir=args.save_dir,
         prefix=args.prefix
     )
+    
+    # Create path-based visualizations if metadata is available
+    if meta and 'paths_by_leaf' in meta:
+        visualize_paths_in_umap(
+            embeddings,
+            labels,
+            meta,
+            save_dir=args.save_dir,
+            prefix=args.prefix
+        )
+    else:
+        print("\nSkipping path-based visualizations: 'paths_by_leaf' not found in checkpoint metadata")
     
     print("\n" + "=" * 60)
     print("Visualization complete!")
