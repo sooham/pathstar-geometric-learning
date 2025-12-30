@@ -1366,6 +1366,7 @@ def evaluate(estimate_metrics, config, meta, iter_num, lr, ctx, device, model, v
         iter_num,
         current_epoch,
         lr,
+        meta,
         tokens_per_sec,
         batch_size,
         edge_memorization_pct,
