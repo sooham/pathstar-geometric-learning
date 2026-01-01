@@ -125,7 +125,7 @@ visualize: $(VENV_DIR)/bin/activate
 		echo "Example: make visualize RUN=20251228T030542_2556bb8_DSET_G1000L5P1PeUdirDt_L3E256H1MlpAgeluLnBiasD0WtEp10000Seed7828"; \
 		exit 1; \
 	fi
-	@FOLDER=$${FOLDER:-out_tiny}; \
+	@FOLDER=$${FOLDER:-out}; \
 	CKPT_PATH="$$FOLDER/ckpt_$(RUN).pt"; \
 	if [ ! -f "$$CKPT_PATH" ]; then \
 		echo "Error: Checkpoint file not found: $$CKPT_PATH"; \
