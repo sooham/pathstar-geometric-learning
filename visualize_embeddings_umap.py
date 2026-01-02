@@ -85,6 +85,13 @@ def load_checkpoint_and_model(checkpoint_path, device='cpu'):
         if k.startswith(unwanted_prefix):
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
     
+    # Remove neighborhood register tensors (these are computed/registered separately)
+    neighborhood_keys = ['neighborhood_tensor', 'neighborhood_sizes_tensor', 'inv_neighborhood_sizes_tensor']
+    for k in neighborhood_keys:
+        if k in state_dict:
+            state_dict.pop(k)
+            print(f"  Removed '{k}' from state dict (not a model parameter)")
+    
     model.load_state_dict(state_dict)
     model.to(device)
     model.eval()
@@ -634,25 +641,26 @@ def visualize_paths_in_umap(embeddings, labels, meta, save_dir='out', prefix='em
     # Separate train and holdout paths
     train_path_leaves = [leaf for leaf in paths_by_leaf.keys() if leaf in train_leaves]
     holdout_path_leaves = [leaf for leaf in paths_by_leaf.keys() if leaf in holdout_leaves]
+    all_leaves = train_path_leaves + holdout_path_leaves
     
     # Sample paths consistently with a fixed seed
     max_paths_to_show = 20
-    num_paths_for_viz = min(5, len(train_path_leaves))  # For detailed visualizations
-    num_paths_to_show = min(max_paths_to_show, len(train_path_leaves))  # For sampled paths viz
+    num_paths_for_viz = min(5, len(all_leaves))  # For detailed visualizations
+    num_paths_to_show = min(max_paths_to_show, len(all_leaves))  # For sampled paths viz
     
     np.random.seed(42)  # Fixed seed for reproducibility
     
     # Sample paths for detailed analysis (5 paths)
     sampled_leaves_5 = []
     if num_paths_for_viz > 0:
-        sampled_leaves_5 = np.random.choice(train_path_leaves, size=num_paths_for_viz, replace=False).tolist()
+        sampled_leaves_5 = np.random.choice(all_leaves, size=num_paths_for_viz, replace=False).tolist()
     
     # Sample paths for the larger visualization (up to 20 paths)
     sampled_leaves_20 = []
     if num_paths_to_show > 0:
         # Reuse the same seed to ensure the first 5 are the same
         np.random.seed(42)
-        sampled_leaves_20 = np.random.choice(train_path_leaves, size=num_paths_to_show, replace=False).tolist()
+        sampled_leaves_20 = np.random.choice(all_leaves, size=num_paths_to_show, replace=False).tolist()
     
     # Create color mapping: leaf_id -> color
     # The first 5 paths get distinct colors, rest cycle through the same colors
