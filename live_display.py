@@ -238,7 +238,7 @@ class LiveTrainingPanel:
         return Text.from_markup(info_str)
 
 
-    def update_metrics_table(self, metrics, graph_length, iter_num, epoch, lr, meta, tokens_per_sec=None, batch_size=None, edge_memorization_pct=None, train_dataset_size=None, eval_dataset_size=None, embedding_geometry_results=None):
+    def update_metrics_table(self, metrics, graph_length, iter_num, epoch, lr, meta, tokens_per_sec=None, batch_size=None, edge_memorization_pct=None, train_dataset_size=None, eval_dataset_size=None, embedding_geometry_results=None, mean_cosine_distance=None):
         """Create a Rich Table for per-token metrics (Train vs Val)"""
 
         if 'generated_text' in metrics and metrics['generated_text'] and self.evaluation is not None:
@@ -263,6 +263,9 @@ class LiveTrainingPanel:
 
         if meta.get('theoretical_min_loss'):
             title += f"Theoretical Minimum Loss: {meta['theoretical_min_loss']:.8f}"
+        
+        if mean_cosine_distance is not None:
+            title += f"\nMean Cosine Distance (embeddings): {mean_cosine_distance:.4f}"
 
 
         metrics_table = Table(title=title, show_header=True, header_style="bold magenta")

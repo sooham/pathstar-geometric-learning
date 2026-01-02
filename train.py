@@ -1050,6 +1050,161 @@ def compute_path_similarities(paths, result_dict, meta, similarity_matrix, token
                     sim = similarity_matrix[idx_i, idx_j].item()
                     result_dict[dist].append(sim)
 
+def compute_mean_cosine_distance(model, meta):
+    """
+    Compute the mean pairwise cosine distance between all node embeddings.
+    
+    This metric tracks the global clustering of embeddings. As training progresses
+    and "Geometric Memory" forms, embeddings organize into a lower-dimensional 
+    structure (manifold), causing them to become more aligned and this metric to decrease.
+    
+    At initialization (random embeddings), cosine similarities ≈ 0, so distance ≈ 1.
+    As learning progresses, embeddings align and the mean distance decreases.
+    
+    Mathematical Definition:
+        Mean Cosine Distance = (1 / (N(N-1))) * Σ_i Σ_{j≠i} (1 - cos_sim(v_i, v_j))
+    
+    Args:
+        model: The GPT model with embeddings
+        meta: Metadata dict containing vertex information
+        
+    Returns:
+        float: Mean cosine distance across all pairs of distinct node embeddings
+    """
+    model.eval()
+    with torch.no_grad():
+        # Get all node embeddings (excluding special tokens)
+        E = model.transformer.wte.weight.detach().cpu()  # (vocab_size, n_embd)
+        
+        # Extract only the graph node embeddings (vertices)
+        # meta['vertices'] contains the token IDs for actual graph nodes
+        node_tokens = sorted(list(meta['vertices']))
+        E_nodes = E[node_tokens]  # (num_nodes, n_embd)
+        
+        num_nodes = E_nodes.shape[0]
+        
+        # Edge case: need at least 2 nodes for pairwise distance
+        if num_nodes < 2:
+            return 0.0
+        
+        # Step 1: Normalize embeddings to unit vectors (L2 norm)
+        E_norm = F.normalize(E_nodes, p=2, dim=1)  # (num_nodes, n_embd)
+        
+        # Step 2: Compute cosine similarity matrix: S = E_norm · E_norm^T
+        S = torch.mm(E_norm, E_norm.t())  # (num_nodes, num_nodes)
+        
+        # Step 3: Compute cosine distance matrix: D = 1 - S
+        D = 1.0 - S
+        
+        # Step 4: Mask diagonal (self-distances are 0 and shouldn't contribute)
+        # We'll extract only the upper triangle (excluding diagonal)
+        mask = torch.triu(torch.ones_like(D, dtype=torch.bool), diagonal=1)
+        
+        # Step 5: Calculate mean of off-diagonal elements
+        # Number of unique pairs: N(N-1)/2, but we compute over full N(N-1) by using upper triangle
+        distances = D[mask]  # Extract upper triangle values
+        mean_cosine_distance = distances.mean().item()
+        
+    model.train()
+    return mean_cosine_distance
+
+
+def plot_pairwise_cosine_similarity_matrix(model, meta, iter_num, config, out_dir='out'):
+    """
+    Plot the pairwise cosine similarity matrix of node embeddings as a heatmap.
+    
+    This diagnostic plot (similar to Figure 24 in PathStar paper Appendix C.3) helps
+    distinguish between:
+    - Associative memory: Heatmap looks like adjacency matrix (hot on edges only)
+    - Geometric memory: Heatmap shows gradients/ripples (multi-hop similarity fading)
+    
+    Args:
+        model: The GPT model with embeddings
+        meta: Metadata dict containing vertex information and adjacency info
+        iter_num: Current iteration number (for plot title and filename)
+        config: Training configuration dict
+        out_dir: Output directory for saving plots
+        
+    Returns:
+        str: Path to saved plot file
+    """
+    model.eval()
+    with torch.no_grad():
+        # Get all node embeddings (excluding special tokens)
+        E = model.transformer.wte.weight.detach().cpu()  # (vocab_size, n_embd)
+        
+        # Extract only the graph node embeddings (vertices)
+        node_tokens = sorted(list(meta['vertices']))
+        E_nodes = E[node_tokens]  # (num_nodes, n_embd)
+        
+        num_nodes = E_nodes.shape[0]
+        
+        # Normalize embeddings to unit vectors
+        E_norm = F.normalize(E_nodes, p=2, dim=1)  # (num_nodes, n_embd)
+        
+        # Compute cosine similarity matrix: S = E_norm · E_norm^T
+        S = torch.mm(E_norm, E_norm.t()).cpu().numpy()  # (num_nodes, num_nodes)
+    
+    model.train()
+    
+    # Create figure with appropriate size based on number of nodes
+    # For large graphs, use smaller pixel-per-node ratio
+    if num_nodes <= 50:
+        figsize = (12, 10)
+        show_ticks = True
+    elif num_nodes <= 200:
+        figsize = (14, 12)
+        show_ticks = False
+    else:
+        figsize = (16, 14)
+        show_ticks = False
+    
+    fig, ax = plt.subplots(figsize=figsize)
+    
+    # Plot heatmap
+    im = ax.imshow(S, cmap='viridis', aspect='auto', vmin=-1, vmax=1, interpolation='nearest')
+    
+    # Add colorbar
+    cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label('Cosine Similarity', rotation=270, labelpad=20, fontsize=11)
+    
+    # Set title with iteration info
+    current_epoch = iter_num / meta['batches_per_epoch']
+    ax.set_title(f'Pairwise Cosine Similarity Matrix (Iter {iter_num}, Epoch {current_epoch:.1f})\n'
+                 f'{num_nodes} nodes | Mean Distance: {1.0 - S[np.triu_indices(num_nodes, k=1)].mean():.4f}',
+                 fontsize=13, pad=10)
+    
+    ax.set_xlabel('Node Index', fontsize=11)
+    ax.set_ylabel('Node Index', fontsize=11)
+    
+    # Show tick labels only for small graphs
+    if show_ticks and num_nodes <= 50:
+        ax.set_xticks(range(0, num_nodes, max(1, num_nodes // 20)))
+        ax.set_yticks(range(0, num_nodes, max(1, num_nodes // 20)))
+    else:
+        # Show fewer ticks for large graphs
+        tick_spacing = max(1, num_nodes // 10)
+        ax.set_xticks(range(0, num_nodes, tick_spacing))
+        ax.set_yticks(range(0, num_nodes, tick_spacing))
+    
+    # Add grid for readability (optional, can be removed if too cluttered)
+    if num_nodes <= 50:
+        ax.grid(False)
+    
+    plt.tight_layout()
+    
+    # Save to file
+    os.makedirs(out_dir, exist_ok=True)
+    plot_path = os.path.join(out_dir, f'cosine_similarity_matrix_iter_{iter_num}.png')
+    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+    
+    plt.close(fig)
+    
+    LiveTrainingPanel.CONSOLE.print(f"[cyan]Saved cosine similarity matrix plot: {plot_path}[/cyan]")
+    
+    return plot_path
+
+
 def analyze_embedding_geometry(model, meta, paths_data_np, val_data_np, iter_num, config, out_dir='out'):
     """
     Analyze if path structure is reflected in embedding space.
@@ -1385,6 +1540,20 @@ def evaluate(estimate_metrics, config, meta, iter_num, lr, ctx, device, model, v
     #     eval_batch_size=int(config.get('eval_batch_size', 512)),
     # )
     
+    # Compute mean cosine distance metric (lightweight, always computed)
+    mean_cosine_distance = compute_mean_cosine_distance(model, meta)
+    
+    # Plot pairwise cosine similarity matrix (at every eval_interval)
+    # This helps diagnose associative vs geometric memory (see PathStar paper Figure 24)
+    cosine_similarity_plot_path = None
+    try:
+        cosine_similarity_plot_path = plot_pairwise_cosine_similarity_matrix(
+            model, meta, iter_num, config,
+            out_dir=config.get('out_dir', 'out')
+        )
+    except Exception as e:
+        LiveTrainingPanel.CONSOLE.print(f"[yellow]Warning: Cosine similarity matrix plot failed: {e}[/yellow]")
+    
     # Evaluate edge memorization
     edge_memorization_pct = None
     if config['show_edge_memorization_metrics']:
@@ -1404,6 +1573,9 @@ def evaluate(estimate_metrics, config, meta, iter_num, lr, ctx, device, model, v
         except Exception as e:
             LiveTrainingPanel.CONSOLE.print(f"[yellow]Warning: Embedding geometry analysis failed: {e}[/yellow]")
     
+    # Print mean cosine distance to console
+    LiveTrainingPanel.CONSOLE.print(f"[cyan]Mean Cosine Distance (embeddings): {mean_cosine_distance:.4f}[/cyan]")
+    
     live_panel.update_metrics_table(
         losses,
         graph_length,
@@ -1417,6 +1589,7 @@ def evaluate(estimate_metrics, config, meta, iter_num, lr, ctx, device, model, v
         train_dataset_size=train_dataset_size,
         eval_dataset_size=eval_dataset_size,
         embedding_geometry_results=embedding_geometry_results,
+        mean_cosine_distance=mean_cosine_distance,
     )
     
     # if 'val_per_token' in losses:
@@ -1519,6 +1692,13 @@ def evaluate(estimate_metrics, config, meta, iter_num, lr, ctx, device, model, v
                 total_norm += p.data.norm(2).item() ** 2
         total_norm = total_norm ** 0.5
         log_dict['model/weight_norm'] = total_norm
+        
+        # Log mean cosine distance (global embedding clustering metric)
+        log_dict['embedding_geometry/mean_cosine_distance'] = mean_cosine_distance
+        
+        # Log cosine similarity matrix plot to wandb
+        if cosine_similarity_plot_path and os.path.exists(cosine_similarity_plot_path):
+            log_dict['embedding_geometry/cosine_similarity_matrix'] = wandb.Image(cosine_similarity_plot_path)
         
         wandb.log(log_dict, step=iter_num)
     
@@ -2629,6 +2809,20 @@ def train(config=None):
                         break
                 else:
                     # Edge-only mode: No validation set, but we can still evaluate edge memorization
+                    # Compute mean cosine distance metric (lightweight, always computed)
+                    mean_cosine_distance = compute_mean_cosine_distance(model, meta)
+                    LiveTrainingPanel.CONSOLE.print(f"[cyan]Mean Cosine Distance (embeddings): {mean_cosine_distance:.4f}[/cyan]")
+                    
+                    # Plot pairwise cosine similarity matrix (at every eval_interval)
+                    cosine_similarity_plot_path = None
+                    try:
+                        cosine_similarity_plot_path = plot_pairwise_cosine_similarity_matrix(
+                            model, meta, iter_num, default_config,
+                            out_dir=default_config.get('out_dir', 'out')
+                        )
+                    except Exception as e:
+                        LiveTrainingPanel.CONSOLE.print(f"[yellow]Warning: Cosine similarity matrix plot failed: {e}[/yellow]")
+                    
                     if default_config['show_edge_memorization_metrics']:
                         LiveTrainingPanel.CONSOLE.print(f"\n[cyan]Evaluating edge memorization (edge_only mode, iter {iter_num})...[/cyan]")
                         edge_memorization_pct = evaluate_edge_memorization(
@@ -2641,34 +2835,55 @@ def train(config=None):
                         # Log to wandb
                         if default_config['wandb_log']:
                             current_epoch = iter_num / meta['batches_per_epoch']
-                            wandb.log({
+                            log_dict_edge = {
                                 'edge_memorization_pct': edge_memorization_pct,
+                                'embedding_geometry/mean_cosine_distance': mean_cosine_distance,
                                 'iter': iter_num,
                                 'epoch': round(current_epoch, 4),
                                 'lr': lr,
-                            }, step=iter_num)
+                            }
+                            # Add cosine similarity matrix plot
+                            if cosine_similarity_plot_path and os.path.exists(cosine_similarity_plot_path):
+                                log_dict_edge['embedding_geometry/cosine_similarity_matrix'] = wandb.Image(cosine_similarity_plot_path)
+                            wandb.log(log_dict_edge, step=iter_num)
+                    else:
+                        # Still log mean cosine distance even if not showing edge memorization
+                        if default_config['wandb_log']:
+                            current_epoch = iter_num / meta['batches_per_epoch']
+                            log_dict_edge = {
+                                'embedding_geometry/mean_cosine_distance': mean_cosine_distance,
+                                'iter': iter_num,
+                                'epoch': round(current_epoch, 4),
+                                'lr': lr,
+                            }
+                            # Add cosine similarity matrix plot
+                            if cosine_similarity_plot_path and os.path.exists(cosine_similarity_plot_path):
+                                log_dict_edge['embedding_geometry/cosine_similarity_matrix'] = wandb.Image(cosine_similarity_plot_path)
+                            wandb.log(log_dict_edge, step=iter_num)
                         
-                        # Update live panel with edge memorization info
-                        if 'dt' in locals() and dt > 0 and 'steps' in locals():
-                            current_tokens_per_sec = (train_batch_size * steps * meta['block_size']) / dt
-                        else:
-                            current_tokens_per_sec = None
-                        
-                        # Create a minimal metrics dict for edge_only mode
-                        edge_only_metrics = {}
-                        live_panel.update_metrics_table(
-                            edge_only_metrics,
-                            graph_length,
-                            iter_num,
-                            current_epoch,
-                            lr,
-                            meta,
-                            current_tokens_per_sec,
-                            train_batch_size,
-                            edge_memorization_pct,
-                            train_dataset_size=combined_size,
-                            eval_dataset_size=0,  # No validation in edge_only mode
-                        )
+                    # Update live panel with edge memorization info
+                    if 'dt' in locals() and dt > 0 and 'steps' in locals():
+                        current_tokens_per_sec = (train_batch_size * steps * meta['block_size']) / dt
+                    else:
+                        current_tokens_per_sec = None
+                    
+                    # Create a minimal metrics dict for edge_only mode
+                    edge_only_metrics = {}
+                    edge_memorization_pct = edge_memorization_pct if default_config['show_edge_memorization_metrics'] else None
+                    live_panel.update_metrics_table(
+                        edge_only_metrics,
+                        graph_length,
+                        iter_num,
+                        current_epoch,
+                        lr,
+                        meta,
+                        current_tokens_per_sec,
+                        train_batch_size,
+                        edge_memorization_pct,
+                        train_dataset_size=combined_size,
+                        eval_dataset_size=0,  # No validation in edge_only mode
+                        mean_cosine_distance=mean_cosine_distance,
+                    )
             
             if iter_num == 0 and default_config['eval_only']:
                 break
@@ -2821,6 +3036,9 @@ def train(config=None):
             if iter_num % default_config['log_interval'] == 0:
                 tokens_per_sec = (X.numel() * steps) / dt
                 
+                # Compute mean cosine distance during training (at log intervals)
+                train_mean_cosine_distance = compute_mean_cosine_distance(model, meta)
+                
                 # DEBUG: Count how many edge vs path samples in this batch
                 EDGE_token = meta['special_tokens']['EDGE']
                 PATH_token = meta['special_tokens']['PATH']
@@ -2847,6 +3065,7 @@ def train(config=None):
                         'train/batch_composition/num_edges': num_edges_in_batch,
                         'train/batch_composition/num_paths': num_paths_in_batch,
                         'train/optimal_loss': meta['theoretical_min_loss'],
+                        'train/embedding_geometry/mean_cosine_distance': train_mean_cosine_distance,
                         'iter': iter_num,
                         "epoch": round(current_epoch, 4),
                         'tokens_per_sec': tokens_per_sec,
