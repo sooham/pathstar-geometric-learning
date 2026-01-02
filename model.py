@@ -160,7 +160,7 @@ class GPTConfig:
     # regularization
     dropout: float = 0.0  # Dropout for attention, MLP, and residual connections
     embd_dropout: float = 0.0  # Dropout applied after embedding layer (tok_emb + pos_emb)
-    weight_tying: bool = False
+    weight_tying: bool = True
 
     # ML features
     activation: str = 'GELU'
