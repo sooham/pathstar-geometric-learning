@@ -764,6 +764,7 @@ def initalize_model(device, meta, config, checkpoint_filename):
     iter_num = 0
     meta['best_val_loss'] = float('inf')
     meta['best_train_loss'] = float('inf')
+    meta['best_mean_cosine_distance'] = float('inf')  # Track lowest mean cosine distance for edge_only mode
     if config['init_from'] == 'scratch':
         print("Initializing a new model from scratch")
         if meta['vocab_size'] is None:
@@ -790,6 +791,7 @@ def initalize_model(device, meta, config, checkpoint_filename):
         iter_num = checkpoint['iter_num']
         meta['best_val_loss'] = checkpoint.get('best_val_loss', float('inf'))
         meta['best_train_loss'] = checkpoint.get('best_train_loss', float('inf'))
+        meta['best_mean_cosine_distance'] = checkpoint.get('best_mean_cosine_distance', float('inf'))
     
     if meta['block_size'] < model.config.block_size:
         model.crop_block_size(meta['block_size'])
@@ -1499,6 +1501,7 @@ def checkpoint_model(model, meta, config, iter_num, loss_value, loss_type='val',
         'iter_num': iter_num,
         'best_val_loss': meta.get('best_val_loss', float('inf')),
         'best_train_loss': meta.get('best_train_loss', float('inf')),
+        'best_mean_cosine_distance': meta.get('best_mean_cosine_distance', float('inf')),
         'config': serializable_config,
         'meta': meta_subset,  # Save only the specified meta keys
     }
@@ -1706,7 +1709,7 @@ def evaluate(estimate_metrics, config, meta, iter_num, lr, ctx, device, model, v
     # During sweeps, only save best checkpoint to reduce I/O overhead
     # In standalone mode, save based on always_save_checkpoint config
     save_checkpoint = False
-    if losses['val'] <= meta['best_val_loss']:
+    if losses['val'] < meta['best_val_loss']:
         meta['best_val_loss'] = losses['val']
         save_checkpoint = True
     elif not is_sweep_mode and config['always_save_checkpoint']:
@@ -2813,6 +2816,30 @@ def train(config=None):
                     mean_cosine_distance = compute_mean_cosine_distance(model, meta)
                     LiveTrainingPanel.CONSOLE.print(f"[cyan]Mean Cosine Distance (embeddings): {mean_cosine_distance:.4f}[/cyan]")
                     
+                    # Check if this is a new lowest mean cosine distance and save special checkpoint
+                    if mean_cosine_distance < meta['best_mean_cosine_distance']:
+                        old_best = meta['best_mean_cosine_distance']
+                        meta['best_mean_cosine_distance'] = mean_cosine_distance
+                        LiveTrainingPanel.CONSOLE.print(f"[green]New lowest mean cosine distance: {mean_cosine_distance:.6f} (previous: {old_best:.6f})[/green]")
+                        
+                        # Save special checkpoint with "lowest_energy" suffix
+                        # Create a modified checkpoint filename
+                        base_checkpoint_filename = meta['checkpoint_filename']
+                        if base_checkpoint_filename.endswith('.pt'):
+                            lowest_energy_filename = base_checkpoint_filename[:-3] + '_lowest_energy.pt'
+                        else:
+                            lowest_energy_filename = base_checkpoint_filename + '_lowest_energy'
+                        
+                        # Temporarily modify meta to use special filename
+                        original_checkpoint_filename = meta['checkpoint_filename']
+                        meta['checkpoint_filename'] = lowest_energy_filename
+                        
+                        checkpoint_model(model, meta, default_config, iter_num, mean_cosine_distance, 
+                                       loss_type='mean_cosine_distance', lr_scheduler_obj=lr_scheduler_obj)
+                        
+                        # Restore original checkpoint filename
+                        meta['checkpoint_filename'] = original_checkpoint_filename
+                    
                     # Plot pairwise cosine similarity matrix (at every eval_interval)
                     cosine_similarity_plot_path = None
                     try:
@@ -3083,7 +3110,7 @@ def train(config=None):
                     save_checkpoint = False
                     
                     # Check if this is a new best training loss
-                    if lossf <= meta['best_train_loss']:
+                    if lossf < meta['best_train_loss']:
                         meta['best_train_loss'] = lossf
                         save_checkpoint = True
                     elif not is_sweep_mode and default_config['always_save_checkpoint']:
