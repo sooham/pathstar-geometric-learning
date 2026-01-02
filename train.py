@@ -1,6 +1,6 @@
 """
 This training script runs on a single GPU and supports wandb sweeps.
-This version handles separate edge and path datasets with interleaved training.
+Trains on a combined dataset of edges and paths with interleaved sampling.
 
 To run standalone:
 $ python train.py --batch_size=32 --compile=False
@@ -65,7 +65,7 @@ def get_default_config():
         'attention_map_samples': 3,  # Number of samples to visualize
         'log_activation_stats': True,  # If True, log activation mean/variance per layer to wandb
         'analyze_embedding_geometry': False,  # If True, compute and log embedding geometry metrics during eval
-        'show_edge_memorization_metrics': False, # If True, show and log % of edges memorized by model
+        'show_edge_memorization_metrics': False, # If True, show and log % of edges memorized by model (works in both normal and edge_only modes)
         # Debugging
         'debug_masking': False,          # If True, show target masks applied to Y
         'debug_masking_samples': 2,      # How many batch rows to show
@@ -100,8 +100,6 @@ def get_default_config():
         #   batch_size * gradient_accumulation_steps.
         # Keep this <= the auto-computed value to avoid OOM.
         'batch_size': None,
-        'edge_iterations_per_epoch': 10,  # Number of iterations on edges per epoch
-        'path_iterations_per_epoch': 10,  # Number of iterations on paths per epoch
         'epochs': 1000,
         # Early termination when val loss falls below this threshold (None = disabled)
         'target_val_loss': None,
@@ -116,11 +114,12 @@ def get_default_config():
         'dropout': 0.0,  # Dropout for attention, MLP, and residual connections
         'use_layernorm': True,
         'use_mlp': True,
+        'use_pos_embeddings': True,  # If True, use positional embeddings. If False, no positional information
         'activation': 'GELU',
         'embd_dropout': 0.0,
         'holdout_percentage': 0.0, # Percentage of paths to hold out for validation
-        'interleave_dataset': False, # If True, combines edges and paths into a single training dataset
-        'balance_interleaved_datasets': True, # If True, upsample smaller dataset to match larger when interleaving
+        'balance_interleaved_datasets': True, # If True, upsample smaller dataset (paths) to match larger (edges)
+        'edge_only': False, # If True, train only on edges (no paths, no validation)
         'bias': False,
         
         # Optimization
@@ -709,6 +708,7 @@ def set_wandb_name(config):
             model_bias_label = "Bias" if config["bias"] else ""
             model_ln_label = "Ln" if config["use_layernorm"] else ""
             model_mlp_label = "Mlp" if config["use_mlp"] else ""
+            model_pos_label = "" if config.get("use_pos_embeddings", True) else "NoPos"
             activation = "A" + ((config["activation"] ) if config["activation"] else "").lower()
             # Include both dropout values if they differ, otherwise just one
             if config['dropout'] == config['embd_dropout']:
@@ -735,6 +735,7 @@ def set_wandb_name(config):
                 f"{activation}"
                 f"{model_ln_label}"
                 f"{model_bias_label}"
+                f"{model_pos_label}"
                 f"{dropout_label}"
                 f"{wd_label}"
                 f"{wt_label}"
@@ -756,11 +757,13 @@ def initalize_model(device, meta, config, checkpoint_filename):
         bias=config['bias'],
         vocab_size=None,
         dropout=config['dropout'],
-        embd_dropout=config['embd_dropout']
+        embd_dropout=config['embd_dropout'],
+        use_pos_embeddings=config['use_pos_embeddings']
     )
     checkpoint = None
     iter_num = 0
     meta['best_val_loss'] = float('inf')
+    meta['best_train_loss'] = float('inf')
     if config['init_from'] == 'scratch':
         print("Initializing a new model from scratch")
         if meta['vocab_size'] is None:
@@ -773,7 +776,7 @@ def initalize_model(device, meta, config, checkpoint_filename):
         ckpt_path = os.path.join(config['out_dir'], checkpoint_filename)
         checkpoint = torch.load(ckpt_path, map_location=device)
         checkpoint_model_args = checkpoint['model_args']
-        for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size', 'dropout', 'embd_dropout']:
+        for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size', 'dropout', 'embd_dropout', 'use_pos_embeddings']:
             if k in checkpoint_model_args:
                 model_args[k] = checkpoint_model_args[k]
         gptconf = GPTConfig(**model_args)
@@ -785,7 +788,8 @@ def initalize_model(device, meta, config, checkpoint_filename):
                 state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
         model.load_state_dict(state_dict)
         iter_num = checkpoint['iter_num']
-        meta['best_val_loss'] = checkpoint['best_val_loss']
+        meta['best_val_loss'] = checkpoint.get('best_val_loss', float('inf'))
+        meta['best_train_loss'] = checkpoint.get('best_train_loss', float('inf'))
     
     if meta['block_size'] < model.config.block_size:
         model.crop_block_size(meta['block_size'])
@@ -821,8 +825,8 @@ def calculate_optimal_batch_size_for_training(model, block_size, vocab_size, dev
         if target_batch_size is not None:
             # For CPU/MPS, cap batch size to dataset size to avoid batch_size > dataset_size
             # We maintain a minimum of 500 for efficiency on very small datasets.
-            return min(2000, target_batch_size)
-        return 2000  # Default for non-CUDA
+            return min(3800, target_batch_size)
+        return 3800  # Default for non-CUDA
     
     # Get GPU memory info
     torch.cuda.empty_cache()
@@ -1313,6 +1317,46 @@ def analyze_embedding_geometry(model, meta, paths_data_np, val_data_np, iter_num
     }
 
 
+def checkpoint_model(model, meta, config, iter_num, loss_value, loss_type='val', lr_scheduler_obj=None):
+    """
+    Save model checkpoint to disk.
+    
+    Args:
+        model: The GPT model to checkpoint
+        meta: Metadata dict containing optimizer, model_args, etc.
+        config: Training configuration dict
+        iter_num: Current iteration number
+        loss_value: Loss value to log with checkpoint
+        loss_type: Type of loss ('val' or 'train') for logging message
+        lr_scheduler_obj: Optional LR scheduler to save state
+    """
+    # Exclude non-serializable objects (like console) from saved config
+    serializable_config = {k: v for k, v in config.items() if k != 'console'}
+    
+    # Save only specific meta keys
+    meta_keys_to_save = ['train_leaves', 'holdout_leaves', 'paths_by_leaf', 'd', 'l', 'vocab_size', 'special_tokens', 'root_vertex', 'itos', 'stoi']
+    meta_subset = {k: meta[k] for k in meta_keys_to_save if k in meta}
+    
+    checkpoint_data = {
+        'model': model.state_dict(),
+        'optimizer': meta['optimizer'].state_dict(),
+        'model_args': meta['model_args'],
+        'iter_num': iter_num,
+        'best_val_loss': meta.get('best_val_loss', float('inf')),
+        'best_train_loss': meta.get('best_train_loss', float('inf')),
+        'config': serializable_config,
+        'meta': meta_subset,  # Save only the specified meta keys
+    }
+    
+    # Save LR scheduler state if using ReduceLROnPlateau
+    if lr_scheduler_obj is not None:
+        checkpoint_data['lr_scheduler'] = lr_scheduler_obj.state_dict()
+    
+    checkpoint_path = os.path.join(config['out_dir'], meta['checkpoint_filename'])
+    LiveTrainingPanel.CONSOLE.print(f"saving checkpoint to {checkpoint_path} ... {loss_type}_loss {loss_value:.6f}")
+    torch.save(checkpoint_data, checkpoint_path)
+
+
 def evaluate(estimate_metrics, config, meta, iter_num, lr, ctx, device, model, val_data_np, paths_data_np, edges_data_np, print_samples=False, live_panel=None, tokens_per_sec=None, batch_size=None, train_dataset_size=None, eval_dataset_size=None, lr_scheduler_obj=None):
     # Compute metrics for both splits
     val_metrics = estimate_metrics('val', print_samples)
@@ -1478,37 +1522,18 @@ def evaluate(estimate_metrics, config, meta, iter_num, lr, ctx, device, model, v
         
         wandb.log(log_dict, step=iter_num)
     
+    # Checkpointing logic for normal mode (with validation)
     # During sweeps, only save best checkpoint to reduce I/O overhead
     # In standalone mode, save based on always_save_checkpoint config
     save_checkpoint = False
-    if losses['val'] < meta['best_val_loss']:
+    if losses['val'] <= meta['best_val_loss']:
         meta['best_val_loss'] = losses['val']
         save_checkpoint = True
     elif not is_sweep_mode and config['always_save_checkpoint']:
         save_checkpoint = True
     
     if save_checkpoint and iter_num > 0:
-        # Exclude non-serializable objects (like console) from saved config
-        serializable_config = {k: v for k, v in config.items() if k != 'console'}
-        
-        # Save only specific meta keys
-        meta_keys_to_save = ['train_leaves', 'holdout_leaves', 'paths_by_leaf', 'd', 'l', 'vocab_size', 'special_tokens', 'root_vertex', 'itos', 'stoi']
-        meta_subset = {k: meta[k] for k in meta_keys_to_save if k in meta}
-        
-        checkpoint_data = {
-            'model': model.state_dict(),
-            'optimizer': meta['optimizer'].state_dict(),
-            'model_args': meta['model_args'],
-            'iter_num': iter_num,
-            'best_val_loss': meta['best_val_loss'],
-            'config': serializable_config,
-            'meta': meta_subset,  # Save only the specified meta keys
-        }
-        # Save LR scheduler state if using ReduceLROnPlateau
-        if lr_scheduler_obj is not None:
-            checkpoint_data['lr_scheduler'] = lr_scheduler_obj.state_dict()
-        LiveTrainingPanel.CONSOLE.print(f"saving checkpoint to {config['out_dir']}/{meta['checkpoint_filename']} ... loss {losses['val']}")
-        torch.save(checkpoint_data, os.path.join(config['out_dir'], meta['checkpoint_filename']))
+        checkpoint_model(model, meta, config, iter_num, losses['val'], loss_type='val', lr_scheduler_obj=lr_scheduler_obj)
     
     # Return validation loss for LR schedulers like ReduceLROnPlateau
     return losses['val']
@@ -1601,7 +1626,13 @@ def train(config=None):
 
     
     
-    custom_name = set_wandb_name(default_config)
+    if default_config['init_from'] == 'resume':
+        custom_name = default_config['wandb_run_name']
+        wandb.run.name = custom_name
+        print(f"Resuming wandb run: {custom_name}")
+    else:
+        custom_name = set_wandb_name(default_config)
+
     if default_config['wandb_run_name'] is None:
         default_config['wandb_run_name'] = custom_name
 
@@ -1667,7 +1698,13 @@ def train(config=None):
     edges_size = meta['EDGES_DATASET_SIZE']
     VAL_DATASET_SIZE = meta['VAL_DATASET_SIZE']
     
-    if default_config['interleave_dataset']:
+    if default_config['edge_only']:
+        print(f"Training dataset composition (EDGE ONLY):")
+        print(f"  Edges: {edges_size}")
+        print(f"  Paths: SKIPPED (edge_only=True)")
+        print(f"  Validation: DISABLED (edge_only=True)")
+        print(f"  Total: {edges_size} samples (100% edges)")
+    else:
         print(f"Training dataset composition (INTERLEAVED):")
         print(f"  Paths (original): {paths_size}")
         print(f"  Edges: {edges_size}")
@@ -1676,27 +1713,17 @@ def train(config=None):
             print(f"  Total Combined: {edges_size * 2} samples (50% paths, 50% edges)")
         else:
             print(f"  Total Combined: {paths_size + edges_size} samples ({paths_size} paths, {edges_size} edges)")
-    else:
-        print(f"Training dataset composition:")
-        print(f"  Paths: {paths_size} (no replication)")
-        print(f"  Edges: {edges_size}")
-        print(f"  Total: {paths_size + edges_size} samples")
     
     # Log scheduled sampling configuration
     p_sub = default_config.get('p_autoregressive_substitution', 0.0)
     if p_sub > 0:
-        if default_config['interleave_dataset']:
-            print(f"\n=== Scheduled Sampling (Autoregressive Substitution) ===")
-            print(f"  p_autoregressive_substitution: {p_sub}")
-            print(f"  PATH sequences: With probability {p_sub}, teacher-forced tokens will be")
-            print(f"                  substituted with model predictions during training.")
-            print(f"  EDGE sequences: Always use pure teacher forcing (no substitution).")
-            print(f"  Note: This may slow down training but improves inference robustness.")
-            print(f"=========================================================\n")
-        else:
-            print(f"\n[Warning] p_autoregressive_substitution={p_sub} is set but will be ignored.")
-            print(f"          Scheduled sampling requires: interleave_dataset=True")
-            print(f"          Current: interleave_dataset={default_config['interleave_dataset']}\n")
+        print(f"\n=== Scheduled Sampling (Autoregressive Substitution) ===")
+        print(f"  p_autoregressive_substitution: {p_sub}")
+        print(f"  PATH sequences: With probability {p_sub}, teacher-forced tokens will be")
+        print(f"                  substituted with model predictions during training.")
+        print(f"  EDGE sequences: Always use pure teacher forcing (no substitution).")
+        print(f"  Note: This may slow down training but improves inference robustness.")
+        print(f"=========================================================\n")
 
     # Auto-detect device
     device, device_type, gpu_id = detect_device(default_config)
@@ -1732,10 +1759,15 @@ def train(config=None):
     edges_data = edges_data.reshape(edges_size, edges_seq_length)
     val_data = val_data.reshape(VAL_DATASET_SIZE, val_seq_length)
 
-    # If interleaving, we will combine datasets later, but need to consider this for memory
-    combined_data = None
-    combined_size = 0
-    if default_config['interleave_dataset']:
+    # Combine datasets for training
+    if default_config['edge_only']:
+        # Edge-only mode: use only edges, no paths
+        # Make a copy to avoid read-only array issues during shuffling
+        combined_data = edges_data.copy()
+        combined_size = edges_size
+        print(f"Using edge-only dataset: {combined_size} samples")
+    else:
+        # Interleaved mode: combine paths and edges
         # Optionally balance datasets by upsampling paths to match edges
         # Note: edges_size >= paths_size always holds for PathStar graphs
         # Uses deterministic duplication (tiling) rather than random sampling to avoid noise
@@ -1754,20 +1786,22 @@ def train(config=None):
                 print(f"Skipping dataset balancing (paths: {paths_size}, edges: {edges_size})")
             paths_data_balanced = paths_data
 
-        # Concatenate paths and edges
+        # Concatenate paths and edges (creates a new array)
         combined_data = np.concatenate((paths_data_balanced, edges_data), axis=0)
         combined_size = combined_data.shape[0]
-        # Shuffle the combined data initially
-        np.random.shuffle(combined_data)
-        
-        # Calculate memory for combined dataset (pass empty array for edges to reuse function)
-        dataset_reserved_memory = determine_dataset_in_device_size(device, device_type, combined_data, np.array([]), val_data)
-        
-        # Target batch size is the combined size
-        target_bs_ref = combined_size
+    
+    # Shuffle the combined data initially
+    np.random.shuffle(combined_data)
+    
+    # Calculate memory for combined dataset
+    # In edge_only mode, we don't load validation data to GPU
+    if default_config['edge_only']:
+        dataset_reserved_memory = determine_dataset_in_device_size(device, device_type, combined_data, np.array([]), np.array([]))
     else:
-        dataset_reserved_memory = determine_dataset_in_device_size(device, device_type, paths_data, edges_data, val_data)
-        target_bs_ref = edges_size
+        dataset_reserved_memory = determine_dataset_in_device_size(device, device_type, combined_data, np.array([]), val_data)
+    
+    # Target batch size is the combined size
+    target_bs_ref = combined_size
 
     train_batch_size = calculate_optimal_batch_size_for_training(
         model, meta['block_size'], meta['randomize_vocab_size'], device, dtype,
@@ -1804,36 +1838,15 @@ def train(config=None):
     # Calculate training iteration parameters
     VAL_DATASET_SIZE = meta['VAL_DATASET_SIZE']
     
-    if default_config['interleave_dataset']:
-        # In interleaved mode, epoch is 1 pass over combined dataset
-        batches_per_epoch = int(np.ceil(combined_size / (train_batch_size * default_config['gradient_accumulation_steps'])))
-        max_iters = default_config['epochs'] * batches_per_epoch
-        
-        print(f"\n=== Training Schedule (Interleaved) ===")
-        print(f"Total samples: {combined_size}")
-        print(f"Batches per epoch: {batches_per_epoch}")
-        print(f"Total iterations: {max_iters}")
-        print(f"=========================\n")
-        
-    else:
-        # Calculate iterations per epoch for edges and paths
-        edge_iterations_per_epoch = default_config['edge_iterations_per_epoch']
-        path_iterations_per_epoch = default_config['path_iterations_per_epoch']
-        
-        # Calculate batches per dataset
-        edge_batches_per_iteration = int(np.ceil(edges_size / (train_batch_size * default_config['gradient_accumulation_steps'])))
-        path_batches_per_iteration = int(np.ceil(paths_size / (train_batch_size * default_config['gradient_accumulation_steps'])))
-        
-        print(f"\n=== Training Schedule ===")
-        print(f"Edge batches per iteration: {edge_batches_per_iteration}")
-        print(f"Path batches per iteration: {path_batches_per_iteration}")
-        print(f"Edge iterations per epoch: {edge_iterations_per_epoch}")
-        print(f"Path iterations per epoch: {path_iterations_per_epoch}")
-        print(f"=========================\n")
-
-        # One epoch = A edge iterations + B path iterations
-        batches_per_epoch = edge_iterations_per_epoch * edge_batches_per_iteration + path_iterations_per_epoch * path_batches_per_iteration
-        max_iters = default_config['epochs'] * batches_per_epoch
+    # In interleaved mode, epoch is 1 pass over combined dataset
+    batches_per_epoch = int(np.ceil(combined_size / (train_batch_size * default_config['gradient_accumulation_steps'])))
+    max_iters = default_config['epochs'] * batches_per_epoch
+    
+    print(f"\n=== Training Schedule (Interleaved) ===")
+    print(f"Total samples: {combined_size}")
+    print(f"Batches per epoch: {batches_per_epoch}")
+    print(f"Total iterations: {max_iters}")
+    print(f"=========================\n")
 
     meta['max_iters'] = max_iters
     meta['batches_per_epoch'] = batches_per_epoch
@@ -1871,7 +1884,6 @@ def train(config=None):
         if lr_scheduler_obj is not None and 'lr_scheduler' in checkpoint:
             lr_scheduler_obj.load_state_dict(checkpoint['lr_scheduler'])
             LiveTrainingPanel.CONSOLE.print(f"[cyan]Loaded LR scheduler state (current_lr={lr_scheduler_obj.current_lr:.2e})[/cyan]")
-    checkpoint = None
 
     meta['optimizer'] = optimizer
     
@@ -1893,7 +1905,10 @@ def train(config=None):
         )
     
     # Init tracking variables
-    iter_num = 0
+    if default_config['init_from'] == 'resume':
+        iter_num = checkpoint['iter_num']
+    else:
+        iter_num = 0
 
     # Calculate and log theoretical minimum loss
     if default_config['wandb_log'] and wandb.run is not None:
@@ -1902,12 +1917,15 @@ def train(config=None):
         predict_dir = default_config.get('predict_direction_for_edge_task', True)
         
         # Calculate N_paths and N_edges effective samples based on sampling strategy
-        if default_config['interleave_dataset'] and default_config.get('balance_interleaved_datasets', True) and paths_size < edges_size:
+        if default_config['edge_only']:
+            n_path_samples = 0  # No paths in edge_only mode
+            n_edge_samples = edges_size
+        elif default_config.get('balance_interleaved_datasets', True) and paths_size < edges_size:
             n_path_samples = edges_size # Effective samples due to upsampling
+            n_edge_samples = edges_size # Edges are never upsampled
         else:
-            n_path_samples = paths_size 
-            
-        n_edge_samples = edges_size # Edges are never upsampled
+            n_path_samples = paths_size
+            n_edge_samples = edges_size # Edges are never upsampled
         
         # Calculate total tokens contributing to loss
         # Paths: 'path_target_length' tokens per sample (loss contribution is 0)
@@ -2112,29 +2130,28 @@ def train(config=None):
         return X, Y
 
     # Create tensors and load to GPU if pre-calculated decision indicates they fit
-    # If interleaving, combined_data is already prepared
     # NOTE: preprocess_dataset adds pause tokens at runtime based on config
-    if default_config['interleave_dataset']:
-        paths_X, paths_Y = None, None
-        edges_X, edges_Y = None, None
-        print(f"Pre-processing combined dataset (adding {num_pause_tokens} pause tokens)...")
-        combined_X, combined_Y = preprocess_dataset(combined_data, dataset_type='combined')
-        print(f"Created pre-processed combined tensors: X={combined_X.shape}, Y={combined_Y.shape}, dtype={storage_dtype}")
+    print(f"Pre-processing combined dataset (adding {num_pause_tokens} pause tokens)...")
+    if default_config['edge_only']:
+        # In edge_only mode, combined_data contains only edges
+        combined_X, combined_Y = preprocess_dataset(combined_data, dataset_type='edges')
     else:
-        print(f"Pre-processing separate datasets (adding {num_pause_tokens} pause tokens)...")
-        paths_X, paths_Y = preprocess_dataset(paths_data, dataset_type='paths')
-        edges_X, edges_Y = preprocess_dataset(edges_data, dataset_type='edges')
-        combined_X, combined_Y = None, None
-        print(f"Created pre-processed path tensors: X={paths_X.shape}, Y={paths_Y.shape}")
+        # In interleaved mode, combined_data contains both paths and edges
+        combined_X, combined_Y = preprocess_dataset(combined_data, dataset_type='combined')
+    print(f"Created pre-processed combined tensors: X={combined_X.shape}, Y={combined_Y.shape}, dtype={storage_dtype}")
     
-    # Store validation data with optimized dtype too (though less critical)
+    # Store validation data with optimized dtype (skip in edge_only mode)
     # NOTE: Validation data also needs pause tokens added
-    val_data_with_pause = torch.from_numpy(val_data.astype(np.int64))
-    if num_pause_tokens > 0:
-        val_data_with_pause = add_pause_tokens_to_batch(
-            val_data_with_pause, num_pause_tokens, pause_token_id
-        )
-    val_data_tensor = val_data_with_pause.to(storage_dtype)
+    if default_config['edge_only']:
+        val_data_tensor = None
+        print("Skipping validation data preprocessing (edge_only=True)")
+    else:
+        val_data_with_pause = torch.from_numpy(val_data.astype(np.int64))
+        if num_pause_tokens > 0:
+            val_data_with_pause = add_pause_tokens_to_batch(
+                val_data_with_pause, num_pause_tokens, pause_token_id
+            )
+        val_data_tensor = val_data_with_pause.to(storage_dtype)
     
     datasets_on_gpu = False
     if device_type == 'cuda':
@@ -2143,45 +2160,28 @@ def train(config=None):
             print(f"\n=== Loading Datasets to GPU ===")
             print(f"Reserved memory: {dataset_reserved_memory / 1e9:.3f} GB")
             print("✓ Loading datasets to GPU for faster training")
-            if default_config['interleave_dataset']:
-                combined_X = combined_X.pin_memory().to(device, non_blocking=True)
-                combined_Y = combined_Y.pin_memory().to(device, non_blocking=True)
-            else:
-                paths_X = paths_X.pin_memory().to(device, non_blocking=True)
-                paths_Y = paths_Y.pin_memory().to(device, non_blocking=True)
-                edges_X = edges_X.pin_memory().to(device, non_blocking=True)
-                edges_Y = edges_Y.pin_memory().to(device, non_blocking=True)
-            val_data_tensor = val_data_tensor.pin_memory().to(device, non_blocking=True)
+            combined_X = combined_X.pin_memory().to(device, non_blocking=True)
+            combined_Y = combined_Y.pin_memory().to(device, non_blocking=True)
+            if val_data_tensor is not None:
+                val_data_tensor = val_data_tensor.pin_memory().to(device, non_blocking=True)
             datasets_on_gpu = True
             print(f"===================================\n")
         else:
             print(f"\n=== Dataset Loading Decision ===")
             print("✗ Datasets will stay on CPU (will transfer batches on-demand)")
-            # Should we pin memory on CPU? Yes, always good for transfer
-            if default_config['interleave_dataset']:
-                combined_X = combined_X.pin_memory()
-                combined_Y = combined_Y.pin_memory()
-            else:
-                paths_X = paths_X.pin_memory()
-                paths_Y = paths_Y.pin_memory()
-                edges_X = edges_X.pin_memory()
-                edges_Y = edges_Y.pin_memory()
+            # Pin memory on CPU for faster transfers
+            combined_X = combined_X.pin_memory()
+            combined_Y = combined_Y.pin_memory()
             print(f"===================================\n")
             datasets_on_gpu = False
     else:
         # For non-CUDA devices, always keep on CPU or move to device as appropriate
-        # On MPS, memory is unified, so .to(device) is practically zero-copy for large tensors?
-        # Actually explicitly moving to mps device is good if it fits.
+        # On MPS, memory is unified, so .to(device) is practically zero-copy for large tensors
         if device_type != 'cpu':
-            if default_config['interleave_dataset']:
-                combined_X = combined_X.to(device)
-                combined_Y = combined_Y.to(device)
-            else:
-                paths_X = paths_X.to(device)
-                paths_Y = paths_Y.to(device)
-                edges_X = edges_X.to(device)
-                edges_Y = edges_Y.to(device)
-            val_data_tensor = val_data_tensor.to(device)
+            combined_X = combined_X.to(device)
+            combined_Y = combined_Y.to(device)
+            if val_data_tensor is not None:
+                val_data_tensor = val_data_tensor.to(device)
             datasets_on_gpu = True
         else:
             datasets_on_gpu = False
@@ -2192,34 +2192,24 @@ def train(config=None):
     val_data_np = val_data
     
     # Initialize epoch indices for sampling without replacement
-    if default_config['interleave_dataset']:
-        paths_epoch_indices = None
-        edges_epoch_indices = None 
-        combined_epoch_indices = np.arange(combined_size)
-        # Perform initial shuffle once
-        np.random.shuffle(combined_epoch_indices)
-    else:
-        paths_epoch_indices = np.arange(paths_size)
-        edges_epoch_indices = np.arange(edges_size)
-        # Perform initial shuffle once for each dataset
-        np.random.shuffle(paths_epoch_indices)
-        np.random.shuffle(edges_epoch_indices)
-        
-    val_epoch_indices = np.arange(VAL_DATASET_SIZE)
-    # Perform initial shuffle for validation
-    np.random.shuffle(val_epoch_indices)
+    combined_epoch_indices = np.arange(combined_size)
+    # Perform initial shuffle once
+    np.random.shuffle(combined_epoch_indices)
     
-    paths_batch_idx = 0
-    edges_batch_idx = 0
     combined_batch_idx = 0
-    val_batch_idx = 0
-    
-    # Track whether we've completed at least one full pass through each dataset
-    # This is used to determine shuffling strategy
-    paths_epoch_completed = False
-    edges_epoch_completed = False
     combined_epoch_completed = False
-    val_epoch_completed = False
+    
+    # Initialize validation indices (skip in edge_only mode)
+    if not default_config['edge_only']:
+        val_epoch_indices = np.arange(VAL_DATASET_SIZE)
+        # Perform initial shuffle for validation
+        np.random.shuffle(val_epoch_indices)
+        val_batch_idx = 0
+        val_epoch_completed = False
+    else:
+        val_epoch_indices = None
+        val_batch_idx = 0
+        val_epoch_completed = False
     
     # DONE
     # Updated get_batch to use pre-processed tensors and handle dtype casting
@@ -2338,26 +2328,12 @@ def train(config=None):
         return y
 
     def get_batch(dataset):
-        """Sample a batch from the edge dataset"""
-        nonlocal edges_batch_idx, edges_epoch_indices, paths_batch_idx, paths_epoch_indices, val_batch_idx, val_epoch_indices, combined_batch_idx, combined_epoch_indices
-        nonlocal paths_epoch_completed, edges_epoch_completed, combined_epoch_completed, val_epoch_completed
+        """Sample a batch from the combined or validation dataset"""
+        nonlocal val_batch_idx, val_epoch_indices, combined_batch_idx, combined_epoch_indices
+        nonlocal combined_epoch_completed, val_epoch_completed
         nonlocal last_mask_debug_str
 
-        if dataset == 'edges':
-            batch_idx = edges_batch_idx
-            epoch_indices = edges_epoch_indices
-            dataset_size = edges_size
-            X_source = edges_X
-            Y_source = edges_Y
-            epoch_completed = edges_epoch_completed
-        elif dataset == 'paths':
-            batch_idx = paths_batch_idx
-            epoch_indices = paths_epoch_indices
-            dataset_size = paths_size
-            X_source = paths_X
-            Y_source = paths_Y
-            epoch_completed = paths_epoch_completed
-        elif dataset == 'combined':
+        if dataset == 'combined':
             batch_idx = combined_batch_idx
             epoch_indices = combined_epoch_indices
             dataset_size = combined_size
@@ -2365,6 +2341,8 @@ def train(config=None):
             Y_source = combined_Y
             epoch_completed = combined_epoch_completed
         elif dataset == 'val':
+            if default_config['edge_only']:
+                raise ValueError("Validation dataset not available in edge_only mode")
             # Validation logic remains largely same but we need to handle X/Y/Masking dynamically or pre-process it too.
             # For simplicity, we'll keep dynamic slicing for val since it's infrequent
             # But let's use the optimized storage tensor
@@ -2398,20 +2376,14 @@ def train(config=None):
         else:
             batch_idx = batch_idx + 1
 
-        if dataset == 'edges':
-            edges_batch_idx = batch_idx
-            edges_epoch_completed = epoch_completed
-        elif dataset == 'paths':
-            paths_batch_idx = batch_idx
-            paths_epoch_completed = epoch_completed
-        elif dataset == 'combined':
+        if dataset == 'combined':
             combined_batch_idx = batch_idx
             combined_epoch_completed = epoch_completed
         elif dataset == 'val':
             val_batch_idx = batch_idx
             val_epoch_completed = epoch_completed
         else:
-            raise ValueError("This should not happen")
+            raise ValueError("Invalid dataset type")
 
 
         if dataset == 'val':
@@ -2457,14 +2429,17 @@ def train(config=None):
         x = x.to(torch.long)
         y = y.to(torch.long)
 
-        # Apply task-specific masking (edge/path/combined).
+        # Apply task-specific masking
+        # In edge_only mode, all combined data is edges
+        mask_dataset_type = 'edges' if (dataset == 'combined' and default_config['edge_only']) else dataset
+        
         if default_config.get('debug_masking') and (iter_num % default_config.get('log_interval', 100) == 0):
             y_before = y.clone()
-            y_after = apply_task_specific_target_mask(x, y, dataset)
-            last_mask_debug_str = _format_mask_debug(x, y_before, y_after, dataset)
+            y_after = apply_task_specific_target_mask(x, y, mask_dataset_type)
+            last_mask_debug_str = _format_mask_debug(x, y_before, y_after, mask_dataset_type)
             y = y_after
         else:
-            y = apply_task_specific_target_mask(x, y, dataset)
+            y = apply_task_specific_target_mask(x, y, mask_dataset_type)
         
         return x, y
     
@@ -2499,8 +2474,8 @@ def train(config=None):
             if split == 'val':
                 X, Y = get_batch('val')
             else:
-                # Manual sampling for training paths to safely handle interleaved case
-                # and ensures we only evaluate on paths
+                # Manual sampling for training paths to ensure we only evaluate on paths
+                # (not edges) even though training uses combined dataset
                 idx = np.random.randint(0, data_size, train_batch_size)
                 batch = torch.from_numpy(data_source_raw[idx].astype(np.int64))
                 # Add pause tokens to raw batch (stored data doesn't have them)
@@ -2564,23 +2539,12 @@ def train(config=None):
     running_loss_sum = 0.0
     running_loss_count = 0
 
-    # Track which phase we're in (edge or path)
-    if default_config['interleave_dataset']:
-        current_phase = 'combined'
-        X, Y = get_batch('combined')
-    else:   
-        current_phase = 'edge'  # Start with edges
-        phase_iteration_count = 0
-        
-        # Initialize with first batch
-        if current_phase == 'edge':
-            X, Y = get_batch('edges')
-        else:
-            X, Y = get_batch('paths')
+    # Initialize with first batch from combined dataset
+    X, Y = get_batch('combined')
     
 
     with live_panel.context:
-        # Training loop with interleaved edge and path training
+        # Training loop
         t0 = time.time()
         while True:
             # Set learning rate based on scheduler
@@ -2591,91 +2555,126 @@ def train(config=None):
             
             # Evaluate
             if iter_num % default_config['eval_interval'] == 0:
-                print_samples = iter_num % default_config['print_eval_interval'] == 0
-                # Calculate tokens_per_sec for display if available
-                current_tokens_per_sec = None
-                if 'dt' in locals() and dt > 0:
-                     # Re-calculate or use stored value. We need 'steps' and 'block_size'
-                     # 'steps' is defined below but used from previous iter effectively? 
-                     # Actually 'steps' is defined in the loop. For iter_num > 0 it should be available.
-                     if 'steps' in locals():
-                         current_tokens_per_sec = (train_batch_size * steps * meta['block_size']) / dt
-                
-                train_total_dataset_size = combined_size if default_config['interleave_dataset'] else (paths_size + edges_size)
-                val_loss = evaluate(
-                    estimate_metrics,
-                    default_config,
-                    meta,
-                    iter_num,
-                    lr,
-                    ctx,
-                    device,
-                    model,
-                    val_data_np,
-                    paths_data_np,
-                    edges_data_np,
-                    print_samples,
-                    live_panel=live_panel,
-                    tokens_per_sec=current_tokens_per_sec,
-                    batch_size=train_batch_size,
-                    train_dataset_size=train_total_dataset_size,
-                    eval_dataset_size=VAL_DATASET_SIZE,
-                    lr_scheduler_obj=lr_scheduler_obj,
-                )
-                
-                # Update ReduceLROnPlateau scheduler if being used
-                if lr_scheduler_obj is not None:
-                    lr_scheduler_obj.step(val_loss, iter_num)
+                if not default_config['edge_only']:
+                    # Full evaluation mode (paths + edges)
+                    print_samples = iter_num % default_config['print_eval_interval'] == 0
+                    # Calculate tokens_per_sec for display if available
+                    current_tokens_per_sec = None
+                    if 'dt' in locals() and dt > 0:
+                         # Re-calculate or use stored value. We need 'steps' and 'block_size'
+                         # 'steps' is defined below but used from previous iter effectively? 
+                         # Actually 'steps' is defined in the loop. For iter_num > 0 it should be available.
+                         if 'steps' in locals():
+                             current_tokens_per_sec = (train_batch_size * steps * meta['block_size']) / dt
                     
-                    # Early termination if LR has dropped below threshold (LR exhausted)
-                    if lr_scheduler_obj.is_lr_exhausted():
-                        LiveTrainingPanel.CONSOLE.print(f"[yellow]Learning rate exhausted! LR={lr_scheduler_obj.current_lr:.2e} < 1e-8[/yellow]")
-                        LiveTrainingPanel.CONSOLE.print(f"[yellow]Terminating training early at iter {iter_num}[/yellow]")
+                    train_total_dataset_size = combined_size
+                    val_loss = evaluate(
+                        estimate_metrics,
+                        default_config,
+                        meta,
+                        iter_num,
+                        lr,
+                        ctx,
+                        device,
+                        model,
+                        val_data_np,
+                        paths_data_np,
+                        edges_data_np,
+                        print_samples,
+                        live_panel=live_panel,
+                        tokens_per_sec=current_tokens_per_sec,
+                        batch_size=train_batch_size,
+                        train_dataset_size=train_total_dataset_size,
+                        eval_dataset_size=VAL_DATASET_SIZE,
+                        lr_scheduler_obj=lr_scheduler_obj,
+                    )
+                    
+                    # Update ReduceLROnPlateau scheduler if being used
+                    if lr_scheduler_obj is not None:
+                        lr_scheduler_obj.step(val_loss, iter_num)
+                        
+                        # Early termination if LR has dropped below threshold (LR exhausted)
+                        if lr_scheduler_obj.is_lr_exhausted():
+                            LiveTrainingPanel.CONSOLE.print(f"[yellow]Learning rate exhausted! LR={lr_scheduler_obj.current_lr:.2e} < 1e-8[/yellow]")
+                            LiveTrainingPanel.CONSOLE.print(f"[yellow]Terminating training early at iter {iter_num}[/yellow]")
+                            
+                            # Log early termination event to wandb
+                            if default_config['wandb_log'] and wandb.run is not None:
+                                wandb.log({
+                                    'early_termination/triggered': True,
+                                    'early_termination/reason': 'lr_exhausted',
+                                    'early_termination/iter': iter_num,
+                                    'early_termination/final_lr': lr_scheduler_obj.current_lr,
+                                    'early_termination/epoch': iter_num / meta['batches_per_epoch'],
+                                }, step=iter_num)
+                            
+                            break
+                    
+                    # Early termination if validation loss falls below target threshold
+                    if default_config['target_val_loss'] is not None and val_loss < default_config['target_val_loss']:
+                        LiveTrainingPanel.CONSOLE.print(f"[green]Target validation loss achieved! val_loss={val_loss:.6f} < target={default_config['target_val_loss']:.6f}[/green]")
+                        LiveTrainingPanel.CONSOLE.print(f"[green]Terminating training early at iter {iter_num}[/green]")
                         
                         # Log early termination event to wandb
                         if default_config['wandb_log'] and wandb.run is not None:
                             wandb.log({
                                 'early_termination/triggered': True,
-                                'early_termination/reason': 'lr_exhausted',
+                                'early_termination/reason': 'target_val_loss_achieved',
                                 'early_termination/iter': iter_num,
-                                'early_termination/final_lr': lr_scheduler_obj.current_lr,
+                                'early_termination/val_loss': val_loss,
+                                'early_termination/target_val_loss': default_config['target_val_loss'],
                                 'early_termination/epoch': iter_num / meta['batches_per_epoch'],
                             }, step=iter_num)
                         
                         break
-                
-                # Early termination if validation loss falls below target threshold
-                if default_config['target_val_loss'] is not None and val_loss < default_config['target_val_loss']:
-                    LiveTrainingPanel.CONSOLE.print(f"[green]Target validation loss achieved! val_loss={val_loss:.6f} < target={default_config['target_val_loss']:.6f}[/green]")
-                    LiveTrainingPanel.CONSOLE.print(f"[green]Terminating training early at iter {iter_num}[/green]")
-                    
-                    # Log early termination event to wandb
-                    if default_config['wandb_log'] and wandb.run is not None:
-                        wandb.log({
-                            'early_termination/triggered': True,
-                            'early_termination/reason': 'target_val_loss_achieved',
-                            'early_termination/iter': iter_num,
-                            'early_termination/val_loss': val_loss,
-                            'early_termination/target_val_loss': default_config['target_val_loss'],
-                            'early_termination/epoch': iter_num / meta['batches_per_epoch'],
-                        }, step=iter_num)
-                    
-                    break
+                else:
+                    # Edge-only mode: No validation set, but we can still evaluate edge memorization
+                    if default_config['show_edge_memorization_metrics']:
+                        LiveTrainingPanel.CONSOLE.print(f"\n[cyan]Evaluating edge memorization (edge_only mode, iter {iter_num})...[/cyan]")
+                        edge_memorization_pct = evaluate_edge_memorization(
+                            ctx, model, meta, edges_data_np, device,
+                            batch_size=int(default_config.get('edge_eval_batch_size', 512)),
+                        )
+                        
+                        LiveTrainingPanel.CONSOLE.print(f"[cyan]Edge memorization: {edge_memorization_pct:.2f}%[/cyan]")
+                        
+                        # Log to wandb
+                        if default_config['wandb_log']:
+                            current_epoch = iter_num / meta['batches_per_epoch']
+                            wandb.log({
+                                'edge_memorization_pct': edge_memorization_pct,
+                                'iter': iter_num,
+                                'epoch': round(current_epoch, 4),
+                                'lr': lr,
+                            }, step=iter_num)
+                        
+                        # Update live panel with edge memorization info
+                        if 'dt' in locals() and dt > 0 and 'steps' in locals():
+                            current_tokens_per_sec = (train_batch_size * steps * meta['block_size']) / dt
+                        else:
+                            current_tokens_per_sec = None
+                        
+                        # Create a minimal metrics dict for edge_only mode
+                        edge_only_metrics = {}
+                        live_panel.update_metrics_table(
+                            edge_only_metrics,
+                            graph_length,
+                            iter_num,
+                            current_epoch,
+                            lr,
+                            meta,
+                            current_tokens_per_sec,
+                            train_batch_size,
+                            edge_memorization_pct,
+                            train_dataset_size=combined_size,
+                            eval_dataset_size=0,  # No validation in edge_only mode
+                        )
             
             if iter_num == 0 and default_config['eval_only']:
                 break
             
             # Forward backward update with batch prefetching for better GPU utilization
-            if default_config['interleave_dataset']:
-                cur_batch_size = 1 # Not really used in this loop structure for steps calc 
-                # For combined, we don't have "batches per iteration" concept in the same way
-                # We just iterate
-                # But steps likely refers to gradient accumulation steps
-                pass
-            else:
-                cur_batch_size = ( edge_batches_per_iteration if current_phase == 'edge' else path_batches_per_iteration)   
-                
-            steps = min(default_config['gradient_accumulation_steps'], cur_batch_size) if not default_config['interleave_dataset'] else default_config['gradient_accumulation_steps']
+            steps = default_config['gradient_accumulation_steps']
 
             # Track activation stats on the last micro_step only (to avoid overhead)
             track_stats = default_config.get('log_activation_stats', True)
@@ -2685,7 +2684,7 @@ def train(config=None):
             for micro_step in range(steps):
                 # Use scheduled sampling for PATH tasks if p_autoregressive_substitution > 0
                 p_sub = default_config.get('p_autoregressive_substitution', 0.0)
-                if p_sub > 0 and default_config['interleave_dataset']:
+                if p_sub > 0:
                     # Scheduled sampling: substitute teacher-forced tokens with model predictions
                     # for PATH sequences (EDGE sequences still use pure teacher forcing)
                     logits_step, loss = forward_with_scheduled_sampling(
@@ -2715,10 +2714,10 @@ def train(config=None):
                 if torch.isnan(loss) or torch.isinf(loss):
                     LiveTrainingPanel.CONSOLE.print(f"[red]🔥 NaN/Inf DETECTED in loss at iter {iter_num}, micro_step {micro_step}![/red]")
                     LiveTrainingPanel.CONSOLE.print(f"[red]Loss value: {loss.item()}[/red]")
-                    LiveTrainingPanel.CONSOLE.print(f"[red]Phase: {current_phase if not default_config['interleave_dataset'] else 'combined'}[/red]")
+                    LiveTrainingPanel.CONSOLE.print(f"[red]Phase: combined[/red]")
                     # Run full diagnostic
                     nan_report = check_for_nans(model, optimizer, loss * steps, logits_step, X, Y, iter_num, 
-                                               phase=current_phase if not default_config['interleave_dataset'] else 'combined')
+                                               phase='combined')
                     if nan_report and default_config['wandb_log']:
                         wandb.log({f'nan_detection/{k}': v for k, v in nan_report.items() if not isinstance(v, list)})
                     raise ValueError(f"NaN/Inf detected in loss at iteration {iter_num}. Training stopped to prevent gradient corruption.")
@@ -2728,23 +2727,17 @@ def train(config=None):
                     nan_count = torch.isnan(logits_step).sum().item() if torch.isnan(logits_step).any() else 0
                     inf_count = torch.isinf(logits_step).sum().item() if torch.isinf(logits_step).any() else 0
                     LiveTrainingPanel.CONSOLE.print(f"[red]NaN count: {nan_count}, Inf count: {inf_count}[/red]")
-                    LiveTrainingPanel.CONSOLE.print(f"[red]Phase: {current_phase if not default_config['interleave_dataset'] else 'combined'}[/red]")
+                    LiveTrainingPanel.CONSOLE.print(f"[red]Phase: combined[/red]")
                     # Run full diagnostic
                     nan_report = check_for_nans(model, optimizer, loss * steps, logits_step, X, Y, iter_num, 
-                                               phase=current_phase if not default_config['interleave_dataset'] else 'combined')
+                                               phase='combined')
                     if nan_report and default_config['wandb_log']:
                         wandb.log({f'nan_detection/{k}': v for k, v in nan_report.items() if not isinstance(v, list)})
                     raise ValueError(f"NaN/Inf detected in logits at iteration {iter_num}. Training stopped to prevent gradient corruption.")
                 
                 # Prefetch next batch while backward pass runs (overlap I/O with compute)
                 if micro_step < steps - 1:
-                    if default_config['interleave_dataset']:
-                        X_next, Y_next = get_batch('combined')
-                    else: 
-                        if current_phase == 'edge':
-                            X_next, Y_next = get_batch('edges')
-                        else:
-                            X_next, Y_next = get_batch('paths')
+                    X_next, Y_next = get_batch('combined')
                 
                 scaler.scale(loss).backward()
                 
@@ -2752,34 +2745,8 @@ def train(config=None):
                 if micro_step < steps - 1:
                     X, Y = X_next, Y_next
             
-            # Determine next batch based on interleaving schedule
-            if not default_config['interleave_dataset']:
-                # Check if we've completed the current phase's iterations
-                if current_phase == 'edge':
-                    phase_iteration_count += 1
-                    if phase_iteration_count >= edge_iterations_per_epoch * edge_batches_per_iteration:
-                        # Switch to path phase
-                        current_phase = 'path'
-                        phase_iteration_count = 0
-                        # Reset batch indices for new phase
-                        paths_batch_idx = 0
-                else:  # path phase
-                    phase_iteration_count += 1
-                    if phase_iteration_count >= path_iterations_per_epoch * path_batches_per_iteration:
-                        # Switch back to edge phase (new epoch)
-                        current_phase = 'edge'
-                        phase_iteration_count = 0
-                        # Reset batch indices for new phase
-                        edges_batch_idx = 0
-            
             # Get batch for next iteration
-            if default_config['interleave_dataset']:
-                X, Y = get_batch('combined')
-            else:
-                if current_phase == 'edge':
-                    X, Y = get_batch('edges')
-                else:
-                    X, Y = get_batch('paths')
+            X, Y = get_batch('combined')
             
             # Clip gradients
             if default_config['grad_clip'] != 0.0:
@@ -2790,7 +2757,7 @@ def train(config=None):
             check_nan_interval = default_config.get('check_nan_interval', 0)
             cached_nan_report = None
             if check_nan_interval > 0 and iter_num % check_nan_interval == 0:
-                cached_nan_report = check_for_nans(model, optimizer, loss * steps, last_logits, X, Y, iter_num, phase=current_phase if not default_config['interleave_dataset'] else 'combined')
+                cached_nan_report = check_for_nans(model, optimizer, loss * steps, last_logits, X, Y, iter_num, phase='combined')
             
             # Compute gradient statistics BEFORE optimizer step (for logging)
             # Cache these values since gradients will be cleared after optimizer step
@@ -2888,7 +2855,24 @@ def train(config=None):
                 
                 # Update training slice panel (only if live display and show_training_slices are enabled)
                 # Only update every vis_interval to save sync/formatting time
-                live_panel.update_train(X, Y, iter_num, meta, last_mask_debug_str=last_mask_debug_str)
+                live_panel.update_train(X, Y, iter_num, meta, last_mask_debug_str=last_mask_debug_str, loss=lossf)
+                
+                # Checkpointing for edge_only mode (based on training loss)
+                # In edge_only mode, there's no validation set, so checkpoint based on best training loss
+                if default_config['edge_only'] and iter_num > 0:
+                    is_sweep_mode = wandb.run is not None and hasattr(wandb.run, 'sweep_id') and wandb.run.sweep_id is not None
+                    save_checkpoint = False
+                    
+                    # Check if this is a new best training loss
+                    if lossf <= meta['best_train_loss']:
+                        meta['best_train_loss'] = lossf
+                        save_checkpoint = True
+                    elif not is_sweep_mode and default_config['always_save_checkpoint']:
+                        # In standalone mode, save every checkpoint if always_save_checkpoint is True
+                        save_checkpoint = True
+                    
+                    if save_checkpoint:
+                        checkpoint_model(model, meta, default_config, iter_num, lossf, loss_type='train', lr_scheduler_obj=lr_scheduler_obj)
                 
                 # Log attention maps to wandb (expensive, so use separate interval)
                 if default_config['wandb_log'] and default_config.get('log_attention_maps', False):

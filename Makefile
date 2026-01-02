@@ -140,14 +140,16 @@ visualize: $(VENV_DIR)/bin/activate
 			--checkpoint "$$CKPT_PATH" \
 			--data_dir "$(DATA_DIR)" \
 			--device "$(DEVICE)" \
-			--save_dir "visualizations/$(RUN)"; \
+			--save_dir "visualizations/$(RUN)" \
+			$(if $(INCLUDE_ROOT),--include-root,); \
 	else \
 		echo "  Data directory: (auto-detect from checkpoint)"; \
 		echo "  Device: $(DEVICE)"; \
 		$(PYTHON) visualize_embeddings_umap.py \
 			--checkpoint "$$CKPT_PATH" \
 			--device "$(DEVICE)" \
-			--save_dir "visualizations/$(RUN)"; \
+			--save_dir "visualizations/$(RUN)" \
+			$(if $(INCLUDE_ROOT),--include-root,); \
 	fi
 
 # Clean up virtual environment
