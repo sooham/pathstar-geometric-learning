@@ -196,8 +196,8 @@ class GPT(nn.Module):
 
         # Precompute neighborhood information for efficient loss computation
         self.use_neighborhood_loss = False
-        self.neighborhood_tensor = None
-        self.neighborhood_sizes_tensor = None
+        # Note: neighborhood_tensor, neighborhood_sizes_tensor, and inv_neighborhood_sizes_tensor
+        # are registered as buffers in _precompute_neighborhood_info() if needed
         if meta is not None:
             self._precompute_neighborhood_info()
 
@@ -250,9 +250,17 @@ class GPT(nn.Module):
             if num_neighbors > 0:
                 neighborhood_tensor[node_idx, :num_neighbors] = torch.tensor(neighbor_list, dtype=torch.long)
         
+        # Precompute inverse of neighborhood sizes for efficient KL divergence computation
+        # Use float type since we'll use this in division
+        inv_neighborhood_sizes_tensor = torch.zeros(vocab_size, dtype=torch.float32)
+        # Only compute inverse for nodes with neighbors (avoid division by zero)
+        nonzero_mask = neighborhood_sizes_tensor > 0
+        inv_neighborhood_sizes_tensor[nonzero_mask] = 1.0 / neighborhood_sizes_tensor[nonzero_mask].float()
+        
         # Register as buffers so they move to the correct device with the model
         self.register_buffer('neighborhood_tensor', neighborhood_tensor)
         self.register_buffer('neighborhood_sizes_tensor', neighborhood_sizes_tensor)
+        self.register_buffer('inv_neighborhood_sizes_tensor', inv_neighborhood_sizes_tensor)
         
         print(f"Precomputed neighborhood info: {len(adj_list)} nodes, max {max_neighbors} neighbors per node")
         print(f"Using neighborhood-based KL divergence loss for EDGE tasks")
@@ -414,43 +422,48 @@ class GPT(nn.Module):
             # Get neighborhoods for each source node
             neighborhoods = self.neighborhood_tensor[source_nodes]  # Shape: (num_edge_samples, max_neighbors)
             neighborhood_sizes = self.neighborhood_sizes_tensor[source_nodes]  # Shape: (num_edge_samples,)
+            inv_neighborhood_sizes = self.inv_neighborhood_sizes_tensor[source_nodes]  # Shape: (num_edge_samples,)
             
             # Compute model's distribution Q from logits
             Q = F.softmax(edge_logits, dim=1)  # Shape: (num_edge_samples, vocab_size)
             
-            # Compute KL divergence for each edge sample
-            # Vectorized where possible, but loop needed due to variable neighborhood sizes
-            for i in range(len(edge_indices)):
-                num_neighbors = neighborhood_sizes[i].item()
-                if num_neighbors == 0:
-                    source_node = source_nodes[i].item()
-                    raise ValueError(f"Node {source_node} appears in EDGE task but has zero neighbors in adjacency list")
-                
-                # Get valid neighbors (exclude padding -1)
-                neighbors = neighborhoods[i, :num_neighbors]  # Shape: (num_neighbors,)
-                
-                # Uniform probability for each neighbor
-                p_uniform = 1.0 / num_neighbors
-                
-                # Get model's probabilities for neighbors
-                q_neighbors = Q[i, neighbors]  # Shape: (num_neighbors,)
-                
-                # Compute KL(P || Q) = sum(P(x) * log(P(x) / Q(x)))
-                # Since P is uniform over N neighbors:
-                #   KL = sum_{x in neighbors} (1/N) * log((1/N) / Q(x))
-                #      = sum_{x in neighbors} (1/N) * (log(1/N) - log(Q(x)))
-                #      = (1/N) * N * log(1/N) - (1/N) * sum_{x in neighbors} log(Q(x))
-                #      = log(1/N) - (1/N) * sum log(Q(x))
-                # 
-                # Note: log(1/N) is negative (entropy term)
-                # The loss will be MINIMIZED during training, making Q approach P
-                # Add small epsilon to Q to avoid log(0)
-                epsilon = 1e-10
-                log_p_uniform = torch.log(torch.tensor(p_uniform, device=device))
-                kl_loss = log_p_uniform - p_uniform * torch.sum(torch.log(q_neighbors + epsilon))
-                
-                total_loss += kl_loss
-                loss_count += 1
+            # Compute KL divergence for all edge samples (vectorized)
+            # Check for zero neighbors (vectorized)
+            if (neighborhood_sizes == 0).any():
+                bad_nodes = source_nodes[neighborhood_sizes == 0]
+                raise ValueError(f"Nodes {bad_nodes.tolist()} appear in EDGE task but have zero neighbors")
+            
+            # Create mask for valid neighbors
+            valid_mask = (neighborhoods >= 0)  # Shape: (num_edge_samples, max_neighbors)
+            
+            # Clamp neighborhoods to valid range for safe indexing
+            neighborhoods_clamped = torch.clamp(neighborhoods, min=0)
+            
+            # Batch gather Q probabilities using advanced indexing
+            batch_idx = torch.arange(len(edge_indices), device=device).unsqueeze(1).expand_as(neighborhoods_clamped)
+            q_all_neighbors = Q[batch_idx, neighborhoods_clamped]  # (num_edge_samples, max_neighbors)
+            
+            # Apply epsilon for numerical stability ONLY to valid neighbors
+            # Then compute log and mask invalid entries to 0
+            epsilon = 1e-10
+            log_q_valid = torch.log(q_all_neighbors + epsilon)  # Apply epsilon to all (including clamped)
+            log_q_masked = log_q_valid.masked_fill(~valid_mask, 0.0)  # Zero out invalid neighbors
+            
+            # Sum log(Q) over valid neighbors only
+            sum_log_q = log_q_masked.sum(dim=1)  # Shape: (num_edge_samples,)
+            
+            # Use precomputed inverse of neighborhood sizes (used twice in KL formula)
+            # inv_neighborhood_sizes already loaded from buffer above
+            
+            # Vectorized KL divergence: KL = log(1/N) - (1/N) * sum log(Q(x))
+            # Note: log(1/N) is negative (entropy term)
+            # The loss will be MINIMIZED during training, making Q approach P
+            log_p_uniform = torch.log(inv_neighborhood_sizes)  # (num_edge_samples,)
+            kl_losses = log_p_uniform - inv_neighborhood_sizes * sum_log_q  # (num_edge_samples,)
+            
+            # Aggregate losses
+            total_loss += kl_losses.sum()
+            loss_count += len(edge_indices)
         
         # Compute cross-entropy loss for PATH tasks
         if is_path.any():

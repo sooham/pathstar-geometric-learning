@@ -65,7 +65,7 @@ def get_default_config():
         'attention_map_samples': 3,  # Number of samples to visualize
         'log_activation_stats': True,  # If True, log activation mean/variance per layer to wandb
         'analyze_embedding_geometry': False,  # If True, compute and log embedding geometry metrics during eval
-        'show_edge_memorization_metrics': False, # If True, show and log % of edges memorized by model (works in both normal and edge_only modes)
+        'log_edge_memorization_metrics': False, # If True, show and log % of edges memorized by model (works in both normal and edge_only modes)
         # Debugging
         'debug_masking': False,          # If True, show target masks applied to Y
         'debug_masking_samples': 2,      # How many batch rows to show
@@ -1606,7 +1606,7 @@ def evaluate(estimate_metrics, config, meta, iter_num, lr, ctx, device, model, v
     
     # Evaluate edge memorization
     edge_memorization_pct = None
-    if config['show_edge_memorization_metrics']:
+    if config['log_edge_memorization_metrics']:
         edge_memorization_pct = evaluate_edge_memorization(
             ctx, model, meta, edges_data_np, device,
             batch_size=int(config.get('edge_eval_batch_size', 512)),
@@ -2897,7 +2897,7 @@ def train(config=None):
                     except Exception as e:
                         LiveTrainingPanel.CONSOLE.print(f"[yellow]Warning: Cosine similarity matrix plot failed: {e}[/yellow]")
                     
-                    if default_config['show_edge_memorization_metrics']:
+                    if default_config['log_edge_memorization_metrics']:
                         LiveTrainingPanel.CONSOLE.print(f"\n[cyan]Evaluating edge memorization (edge_only mode, iter {iter_num})...[/cyan]")
                         edge_memorization_pct = evaluate_edge_memorization(
                             ctx, model, meta, edges_data_np, device,
@@ -2943,7 +2943,7 @@ def train(config=None):
                     
                     # Create a minimal metrics dict for edge_only mode
                     edge_only_metrics = {}
-                    edge_memorization_pct = edge_memorization_pct if default_config['show_edge_memorization_metrics'] else None
+                    edge_memorization_pct = edge_memorization_pct if default_config['log_edge_memorization_metrics'] else None
                     live_panel.update_metrics_table(
                         edge_only_metrics,
                         graph_length,
