@@ -285,7 +285,8 @@ class GPT(nn.Module):
                 activation_stats[f'layer_{i}_mean'] = x.mean().item()
                 activation_stats[f'layer_{i}_var'] = x.var().item()
         
-        x = self.transformer.ln_f(x)
+        if self.config.use_layernorm:
+            x = self.transformer.ln_f(x)
         
         if track_activation_stats:
             activation_stats['final_mean'] = x.mean().item()
