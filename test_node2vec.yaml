@@ -9,9 +9,9 @@ metric:
 parameters:
   # Dataset parameters - small fixed values for quick iteration
   graph_d:
-    values: [100]
+    values: [10]
   graph_l:
-    values: [20, 100, 11]
+    values: [5]
   graph_vocab_size:
     value: '1max'
   graph_holdout_percentage:
@@ -22,8 +22,6 @@ parameters:
     value: true
   use_directional_tokens:
     values: [false]
-  use_task_tokens:
-    values: [true]
   balance_interleaved_datasets:
     values: [false]
   weight_tying:
@@ -47,17 +45,17 @@ parameters:
       # Deep models (n_layer=5): sweep MLP and LayerNorm (2x2 = 4 configs)
       - n_layer: [0]
         n_head: 1
-        n_embd: [4]
+        n_embd: [5, 2]
         dropout: [0]
         embed_dropout: 0
-        bias: [true]
+        bias: [false]
         base: 100
         learning_rate: 1e-3
         weight_decay: [0]
         lr_scheduler: 'None' #'ReduceLROnPlateau'
         epochs: 20_000
-        use_mlp: [true]
-        use_layernorm: [true]
+        use_mlp: [false]
+        use_layernorm: [false]
         seed: [4731]
 
   # Other training hyperparameters (not in model_config)
@@ -115,7 +113,7 @@ parameters:
   #   value: resume
   
   wandb_project:
-    value: test_node2vec
+    value: debug_acc
   # wandb_run_name:
   #   value: 20260102T023816_2e73091_DSET_G50L20P0PeUdir_L0E4H1MlpAgeluLnBiasNoPosD0WtEp10000Seed4731
 

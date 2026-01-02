@@ -7,7 +7,6 @@ graph_holdout_percentage = 0.2
 num_pause_tokens = 5
 use_undirected = True
 use_directional_tokens = True # from values [false, true], picking true
-use_task_tokens = True # picking true
 weight_tying = True # Not in get_default_config?? Wait, need to check model.py
 interleave_dataset = True
 

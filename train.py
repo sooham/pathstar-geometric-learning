@@ -461,12 +461,30 @@ def evaluate_edge_memorization(ctx, model, meta, edges_data_np, device, batch_si
     correct_predictions = 0
     total_predictions = 0
     
+    use_directional_tokens = meta.get('use_directional_tokens', False)
+    predict_dir = bool(meta.get('predict_direction_for_edge_task', False))
+    
+    # Determine if we should use neighborhood-based accuracy
+    use_neighborhood_accuracy = (not use_directional_tokens) and (not predict_dir)
+    
     # Debug: Print first batch details
     print(f"\n=== Edge Memorization Evaluation Debug ===")
     print(f"Total edges: {num_edges}")
     print(f"Batch size: {batch_size}")
     print(f"Number of batches: {num_batches}")
-    print(f"use_directional_tokens: {meta.get('use_directional_tokens', False)}")
+    print(f"use_directional_tokens: {use_directional_tokens}")
+    print(f"predict_direction_for_edge_task: {predict_dir}")
+    print(f"use_neighborhood_accuracy: {use_neighborhood_accuracy}")
+    
+    # Get adjacency list if using neighborhood-based accuracy
+    adj_list = None
+    if use_neighborhood_accuracy:
+        adj_list = meta.get('adj_list')
+        if adj_list is None:
+            print(f"WARNING: adj_list not found in meta, falling back to argmax accuracy")
+            raise ValueError("adj_list not found in meta")
+        else:
+            print(f"Using neighborhood-based accuracy with adjacency list")
     
     for batch_idx in range(num_batches):
         start_idx = batch_idx * batch_size
@@ -475,11 +493,10 @@ def evaluate_edge_memorization(ctx, model, meta, edges_data_np, device, batch_si
         # Get batch of edge sequences
         batch = torch.from_numpy(edges_data_np[start_idx:end_idx].astype(np.int64)).to(device)
         
-        predict_dir = bool(meta.get('predict_direction_for_edge_task', False))
         if predict_dir:
             pos = 1 + 2  # EDGE token + u + v
         else:
-            pos = 1 + (1 if meta.get('use_directional_tokens', False) else 0) + 1
+            pos = 2 + int(use_directional_tokens) # EDGE token + u + direction
 
         X = batch[:, :pos]
         Y_true = batch[:, pos]
@@ -491,13 +508,43 @@ def evaluate_edge_memorization(ctx, model, meta, edges_data_np, device, batch_si
                 
                 # Get predictions for the last position (final token)
                 final_logits = logits[:, -1, :]  # Shape: [batch_size, vocab_size]
-                predictions = torch.argmax(final_logits, dim=-1)  # Shape: [batch_size]
                 
-                
-                # Count correct predictions
-                correct = (predictions == Y_true).sum().item()
-                correct_predictions += correct
-                total_predictions += len(Y_true)
+                if use_neighborhood_accuracy:
+                    # Neighborhood-based accuracy: check if top-N logits match neighbors of source node
+                    # Extract source node u from position 1 (after EDGE token)
+                    source_nodes = batch[:, 1].cpu().numpy()  # Shape: [batch_size]
+                    
+                    for i in range(len(source_nodes)):
+                        u = int(source_nodes[i])
+                        
+                        # Get neighbors of u from adjacency list
+                        if u not in adj_list:
+                            raise ValueError(f"During edge evaluation, node {u} not found in adjacency list")
+                        
+                        neighbors = set(adj_list[u])
+                        num_neighbors = len(neighbors)
+                        
+                        if num_neighbors == 0:
+                            raise ValueError(f"During edge evaluation, node {u} was found to have no neighbors in the adjacency list")
+                        
+                        # Get top N logits where N = number of neighbors
+                        logits_for_sample = final_logits[i]  # Shape: [vocab_size]
+                        top_n_values, top_n_indices = torch.topk(logits_for_sample, k=num_neighbors)
+                        top_n_predictions = set(top_n_indices.cpu().numpy().tolist())
+                        
+                        # Count the cardinality of the intersection
+                        intersection = top_n_predictions & neighbors
+                        correct_predictions += len(intersection)
+                        
+                        total_predictions += num_neighbors
+                else:
+                    # Standard argmax accuracy (single prediction)
+                    predictions = torch.argmax(final_logits, dim=-1)  # Shape: [batch_size]
+                    
+                    # Count correct predictions
+                    correct = (predictions == Y_true).sum().item()
+                    correct_predictions += correct
+                    total_predictions += len(Y_true)
     
     model.train()
     
