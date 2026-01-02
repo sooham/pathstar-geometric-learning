@@ -216,7 +216,7 @@ Sweep `graph_d` and `graph_l` to understand how performance scales with graph si
 Find optimal `n_layer`, `n_head`, `n_embd` for your dataset.
 
 ### 3. Learning Rate Tuning
-Use Bayesian search to find best `learning_rate`, `warmup_frac`, `min_lr`.
+Use Bayesian search to find best `learning_rate`, `lr_warmup_frac`, `min_learning_rate`.
 
 ### 4. Regularization Study
 Sweep `dropout`, `label_smoothing`, `weight_decay` to prevent overfitting.

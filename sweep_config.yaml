@@ -42,9 +42,9 @@ parameters:
     values: [0.0, 0.05, 0.1, 0.15]
   weight_decay:
     values: [0.0, 0.001, 0.01, 0.1]
-  beta1:
+  adam_beta1:
     value: 0.9
-  beta2:
+  adam_beta2:
     values: [0.95, 0.98, 0.99]
   grad_clip:
     values: [0.5, 1.0, 2.0]
@@ -52,11 +52,9 @@ parameters:
   # Learning rate schedule
   decay_lr:
     value: true
-  warmup_frac:
+  lr_warmup_frac:
     values: [0.05, 0.10, 0.15]
-  lr_decay_frac:
-    values: [0.95, 0.99, 1.0]
-  min_lr:
+  min_learning_rate:
     distribution: log_uniform_values
     min: 1e-6
     max: 1e-4

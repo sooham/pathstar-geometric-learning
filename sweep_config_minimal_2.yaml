@@ -48,9 +48,9 @@ parameters:
     value: 0
   weight_decay:
     value: 0.01
-  beta1:
+  adam_beta1:
     value: 0.9
-  beta2:
+  adam_beta2:
     value: 0.95
   grad_clip:
     value: 0.0
@@ -58,11 +58,9 @@ parameters:
   # Learning rate schedule
   decay_lr:
     value: true
-  warmup_frac:
+  lr_warmup_frac:
     value: 0.10
-  lr_decay_frac:
-    value: 0.80
-  min_lr:
+  min_learning_rate:
     value: 1e-5
   
   # Fixed training parameters
@@ -80,9 +78,9 @@ parameters:
     value: 500  # Increased from 50 to reduce evaluation overhead
   log_interval:
     value: 150  # Increased from 10 to reduce print overhead
-  print_eval_interval:
+  eval_verbose_interval:
     value: 500
-  vis_interval:
+  live_display_update_interval:
     value: 150
   debug_masking:
     value: false

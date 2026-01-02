@@ -31,7 +31,6 @@ def get_git_commit_id():
         pass
     return 'unknown'
 
-# GOOD
 def detect_device(config):
     if config['device'] == 'auto':
         if torch.cuda.is_available():
@@ -54,20 +53,9 @@ def detect_device(config):
             print(f"  CUDA_VISIBLE_DEVICES: {os.environ['CUDA_VISIBLE_DEVICES']}")
     else:
         print(f"Using device: {device}")
-    # Determine GPU ID for checkpoint naming
-    gpu_id = config.get('gpu_id')
-    if gpu_id is None:
-        cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', None)
-        if cuda_visible is not None:
-            gpu_id = cuda_visible.split(',')[0]
-        elif torch.cuda.is_available():
-            gpu_id = torch.cuda.current_device()
-        else:
-            gpu_id = 'cpu'
-    
     
     device_type = 'cuda' if 'cuda' in device else ('mps' if 'mps' in device else 'cpu')
-    return device, device_type, gpu_id
+    return device, device_type
 
 def set_dtype(config):
     torch.backends.cudnn.allow_tf32 = True

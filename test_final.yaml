@@ -32,7 +32,7 @@ parameters:
     value: true
   predict_direction_for_edge_task:
     values: [false]
-  use_task_tokens_in_path:
+  use_directional_tokens_in_path:
     values: [false] # for now test this
   p_autoregressive_substitution:
     values: [0]
@@ -52,7 +52,7 @@ parameters:
         base: 100
         learning_rate: 1e-3
         weight_decay: [0]
-        lr_scheduler: 'None' #'ReduceLROnPlateau'
+        lr_scheduler: "Constant" #'ReduceLROnPlateau'
         epochs: 10_000
         use_mlp: [true]
         use_layernorm: [true]
@@ -66,7 +66,7 @@ parameters:
         base: 100
         learning_rate: 1e-3
         weight_decay: [0]
-        lr_scheduler: 'None' #'ReduceLROnPlateau'
+        lr_scheduler: "Constant" #'ReduceLROnPlateau'
         epochs: 10_000
         use_mlp: [true]
         use_layernorm: [true]
@@ -75,9 +75,9 @@ parameters:
   # Other training hyperparameters (not in model_config)
   label_smoothing:
     values: [0]
-  beta1:
+  adam_beta1:
     value: 0.9
-  beta2:
+  adam_beta2:
     value: 0.95
   grad_clip:
     value: 1.0
@@ -91,13 +91,11 @@ parameters:
     value: 1e-4
   plateau_cooldown:
     value: 0
-  warmup_frac:
+  lr_warmup_frac:
     value: 0
-  lr_decay_frac:
-    value: 1
-  min_lr:
+  min_learning_rate:
     value: 0
-  target_val_loss:
+  early_terimation_val_loss_threshold:
     value: 0.001
   edge_iterations_per_epoch: # 16k edges total for d=1000, l=5
     value: 10
@@ -111,19 +109,19 @@ parameters:
     value: 100  # Increased from 50 to reduce evaluation overhead
   log_interval:
     value: 5  # Increased from 10 to reduce print overhead
-  print_eval_interval:
+  eval_verbose_interval:
     value: 1
   live_display:
     value: false
-  vis_interval:
+  live_display_update_interval:
     value: 100
   debug_masking:
     value: false
-  log_attention_maps:
+  debug_attention_maps:
     value: false
-  show_edge_memorization_metrics:
+  log_edge_memorization_metrics:
     value: false
-  attention_map_interval:
+  debug_attention_map_interval:
     value: 8000
   batch_size:
     value: 4000

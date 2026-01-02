@@ -89,7 +89,7 @@ class LiveTrainingPanel:
         self.use_live_display = config.get('live_display', True)
         self.show_training_slices = config.get('show_training_slices', False)
         self.show_debug_masking = config.get('debug_masking', False)
-        self.vis_interval = config.get('vis_interval', 100)
+        self.live_display_update_interval = config.get('live_display_update_interval', 100)
         
         # Create layout if enabled
         if self.use_live_display:
@@ -148,7 +148,7 @@ class LiveTrainingPanel:
             loss: Current training loss (optional)
         """
         # Early return if live display is disabled or not time to update
-        if not self.use_live_display or iter_num % self.vis_interval != 0:
+        if not self.use_live_display or iter_num % self.live_display_update_interval != 0:
             return
         
         # Early return if layout is not available

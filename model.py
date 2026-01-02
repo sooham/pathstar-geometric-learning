@@ -171,12 +171,13 @@ class GPTConfig:
 
 class GPT(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, meta=None):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
 
         self.config = config
+        self.meta = meta
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
@@ -193,6 +194,13 @@ class GPT(nn.Module):
         else:
             self.pos_emb = None
 
+        # Precompute neighborhood information for efficient loss computation
+        self.use_neighborhood_loss = False
+        self.neighborhood_tensor = None
+        self.neighborhood_sizes_tensor = None
+        if meta is not None:
+            self._precompute_neighborhood_info()
+
         # init all weights
         self.apply(self._init_weights)
         # weight tying
@@ -201,6 +209,53 @@ class GPT(nn.Module):
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
+
+    def _precompute_neighborhood_info(self):
+        """
+        Precompute neighborhood information for efficient KL divergence loss computation.
+        
+        Creates tensors for fast lookup of neighbors and neighborhood sizes during forward pass.
+        This is only used when use_directional_tokens=False and predict_direction_for_edge_task=False.
+        """
+        if self.meta is None:
+            return
+        
+        # Check if we should use neighborhood-based loss
+        use_directional_tokens = self.meta.get('use_directional_tokens', False)
+        predict_dir = self.meta.get('predict_direction_for_edge_task', False)
+        self.use_neighborhood_loss = (not use_directional_tokens) and (not predict_dir)
+        
+        if not self.use_neighborhood_loss:
+            return
+        
+        adj_list = self.meta.get('adj_list')
+        if adj_list is None:
+            raise ValueError("adj_list not found in meta, but use_neighborhood_loss is True")
+        
+        vocab_size = self.config.vocab_size
+        max_neighbors = max(len(neighbors) for neighbors in adj_list.values()) if adj_list else 0
+        
+        # Create tensors for neighbor lookup (padded to max_neighbors)
+        # Shape: (vocab_size, max_neighbors) - padded with -1 for nodes with fewer neighbors
+        neighborhood_tensor = torch.full((vocab_size, max_neighbors), -1, dtype=torch.long)
+        neighborhood_sizes_tensor = torch.zeros(vocab_size, dtype=torch.long)
+        
+        for node, neighbors in adj_list.items():
+            node_idx = int(node)
+            if node_idx >= vocab_size:
+                raise ValueError(f"Node index {node_idx} is greater than vocab size {vocab_size}")
+            neighbor_list = sorted(list(neighbors))
+            num_neighbors = len(neighbor_list)
+            neighborhood_sizes_tensor[node_idx] = num_neighbors
+            if num_neighbors > 0:
+                neighborhood_tensor[node_idx, :num_neighbors] = torch.tensor(neighbor_list, dtype=torch.long)
+        
+        # Register as buffers so they move to the correct device with the model
+        self.register_buffer('neighborhood_tensor', neighborhood_tensor)
+        self.register_buffer('neighborhood_sizes_tensor', neighborhood_sizes_tensor)
+        
+        print(f"Precomputed neighborhood info: {len(adj_list)} nodes, max {max_neighbors} neighbors per node")
+        print(f"Using neighborhood-based KL divergence loss for EDGE tasks")
 
     def _create_sinusoidal_embeddings(self, max_len, d_model, base=100):
         """
@@ -295,8 +350,14 @@ class GPT(nn.Module):
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x) # shape (batch, sequence_length, vocab_size)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), 
-                                   ignore_index=-1, label_smoothing=label_smoothing)
+            
+            # Compute loss with optional neighborhood-based KL divergence for EDGE tasks
+            if self.use_neighborhood_loss and self.meta is not None:
+                loss = self._compute_mixed_loss(logits, targets, idx, label_smoothing)
+            else:
+                # Standard cross-entropy loss for all tasks
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), 
+                                       ignore_index=-1, label_smoothing=label_smoothing)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
@@ -305,6 +366,121 @@ class GPT(nn.Module):
         if track_activation_stats:
             return logits, loss, activation_stats
         return logits, loss
+
+    def _compute_mixed_loss(self, logits, targets, idx, label_smoothing):
+        """
+        Compute mixed loss: KL divergence for EDGE tasks, cross-entropy for PATH tasks.
+        
+        Precondition: This function is only called when use_neighborhood_loss=True,
+        which means use_directional_tokens=False and predict_direction_for_edge_task=False.
+        
+        Args:
+            logits: (batch, seq_len, vocab_size) - model predictions
+            targets: (batch, seq_len) - target tokens (with -1 for masked positions)
+            idx: (batch, seq_len) - input tokens
+            label_smoothing: label smoothing factor for cross-entropy
+            
+        Returns:
+            loss: scalar loss tensor
+        """
+        device = logits.device
+        batch_size = logits.size(0)
+        
+        # Get special tokens
+        EDGE_token = self.meta['special_tokens']['EDGE']
+        PATH_token = self.meta['special_tokens']['PATH']
+        
+        # Identify EDGE vs PATH tasks
+        is_edge = (idx[:, 0] == EDGE_token)
+        is_path = (idx[:, 0] == PATH_token)
+        
+        # Prediction position for EDGE tasks
+        # Since use_directional_tokens=False: [EDGE, u, v, ...] -> predict at position 1 (for token at position 2)
+        edge_pred_pos = 1
+        
+        total_loss = 0.0
+        loss_count = 0
+        
+        # Compute KL divergence loss for EDGE tasks
+        if is_edge.any():
+            edge_indices = torch.where(is_edge)[0]
+            
+            # Extract source nodes u (position 1 after EDGE token)
+            source_nodes = idx[edge_indices, 1]  # Shape: (num_edge_samples,)
+            
+            # Get logits for the prediction position
+            edge_logits = logits[edge_indices, edge_pred_pos, :]  # Shape: (num_edge_samples, vocab_size)
+            
+            # Get neighborhoods for each source node
+            neighborhoods = self.neighborhood_tensor[source_nodes]  # Shape: (num_edge_samples, max_neighbors)
+            neighborhood_sizes = self.neighborhood_sizes_tensor[source_nodes]  # Shape: (num_edge_samples,)
+            
+            # Compute model's distribution Q from logits
+            Q = F.softmax(edge_logits, dim=1)  # Shape: (num_edge_samples, vocab_size)
+            
+            # Compute KL divergence for each edge sample
+            # Vectorized where possible, but loop needed due to variable neighborhood sizes
+            for i in range(len(edge_indices)):
+                num_neighbors = neighborhood_sizes[i].item()
+                if num_neighbors == 0:
+                    source_node = source_nodes[i].item()
+                    raise ValueError(f"Node {source_node} appears in EDGE task but has zero neighbors in adjacency list")
+                
+                # Get valid neighbors (exclude padding -1)
+                neighbors = neighborhoods[i, :num_neighbors]  # Shape: (num_neighbors,)
+                
+                # Uniform probability for each neighbor
+                p_uniform = 1.0 / num_neighbors
+                
+                # Get model's probabilities for neighbors
+                q_neighbors = Q[i, neighbors]  # Shape: (num_neighbors,)
+                
+                # Compute KL(P || Q) = sum(P(x) * log(P(x) / Q(x)))
+                # Since P is uniform over N neighbors:
+                #   KL = sum_{x in neighbors} (1/N) * log((1/N) / Q(x))
+                #      = sum_{x in neighbors} (1/N) * (log(1/N) - log(Q(x)))
+                #      = (1/N) * N * log(1/N) - (1/N) * sum_{x in neighbors} log(Q(x))
+                #      = log(1/N) - (1/N) * sum log(Q(x))
+                # 
+                # Note: log(1/N) is negative (entropy term)
+                # The loss will be MINIMIZED during training, making Q approach P
+                # Add small epsilon to Q to avoid log(0)
+                epsilon = 1e-10
+                log_p_uniform = torch.log(torch.tensor(p_uniform, device=device))
+                kl_loss = log_p_uniform - p_uniform * torch.sum(torch.log(q_neighbors + epsilon))
+                
+                total_loss += kl_loss
+                loss_count += 1
+        
+        # Compute cross-entropy loss for PATH tasks
+        if is_path.any():
+            path_indices = torch.where(is_path)[0]
+            
+            # Extract logits and targets for PATH tasks
+            path_logits = logits[path_indices]  # Shape: (num_path_samples, seq_len, vocab_size)
+            path_targets = targets[path_indices]  # Shape: (num_path_samples, seq_len)
+            
+            # Flatten and compute cross-entropy
+            path_loss = F.cross_entropy(
+                path_logits.reshape(-1, path_logits.size(-1)),
+                path_targets.reshape(-1),
+                ignore_index=-1,
+                label_smoothing=label_smoothing,
+                reduction='sum'
+            )
+            
+            # Count non-masked tokens
+            path_loss_count = (path_targets != -1).sum().item()
+            
+            if path_loss_count > 0:
+                total_loss += path_loss
+                loss_count += path_loss_count
+        
+        # Return average loss
+        if loss_count > 0:
+            return total_loss / loss_count
+        else:
+            return torch.tensor(0.0, device=device, requires_grad=True)
 
     def get_attention_maps(self, idx):
         """

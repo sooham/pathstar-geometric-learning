@@ -9,9 +9,9 @@ metric:
 parameters:
   # Dataset parameters - small fixed values for quick iteration
   graph_d:
-    values: [1000]
+    values: [10]
   graph_l:
-    value: 5
+    value: 10
   graph_vocab_size:
     value: '1max'
   graph_holdout_percentage:
@@ -34,6 +34,8 @@ parameters:
     values: [false]
   use_directional_tokens_in_path:
     values: [false] # for now test this
+  p_autoregressive_substitution:
+    values: [0]
   
   # Model + Training config combinations (partial cross-product)
   # Lists within a dict are expanded into cross products
@@ -41,32 +43,20 @@ parameters:
   model_config:
     values:
       # Deep models (n_layer=5): sweep MLP and LayerNorm (2x2 = 4 configs)
-      - n_layer: 5
+      - n_layer: [3,4,5,6]
         n_head: 1
-        n_embd: [16,32]
+        n_embd: [12]
         dropout: 0
         embed_dropout: 0
-        bias: [false, true]
+        bias: [true]
         base: 100
         learning_rate: 1e-3
-        weight_decay: 0
-        lr_scheduler: 'ReduceLROnPlateau'
-        epochs: 120_000
+        weight_decay: 0.01
+        lr_scheduler: "Constant" #'ReduceLROnPlateau'
+        epochs: 15_000
         use_mlp: [true]
         use_layernorm: [true]
-      - n_layer: [5,6,7,8]
-        n_head: 1
-        n_embd: [32]
-        dropout: 0
-        embed_dropout: 0
-        bias: [false]
-        base: 100
-        learning_rate: 1e-3
-        weight_decay: 0
-        lr_scheduler: 'ReduceLROnPlateau'
-        epochs: 120_000
-        use_mlp: [false]
-        use_layernorm: [false]
+        seed: [2723,2842,9004]
 
   # Other training hyperparameters (not in model_config)
   label_smoothing:
@@ -119,5 +109,5 @@ parameters:
     value: 8000
   
   wandb_project:
-    value: mats_pathstar_debug_success
+    value: debug
 

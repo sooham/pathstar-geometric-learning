@@ -18,7 +18,7 @@ def get_cosine_lr(it, warmup_iters, lr_decay_iters, config):
         it: Current iteration number
         warmup_iters: Number of warmup iterations
         lr_decay_iters: Number of iterations for LR decay
-        config: Configuration dictionary with 'learning_rate' and 'min_lr'
+        config: Configuration dictionary with 'learning_rate' and 'min_learning_rate'
     
     Returns:
         Current learning rate
@@ -26,10 +26,10 @@ def get_cosine_lr(it, warmup_iters, lr_decay_iters, config):
     if it < warmup_iters:
         return config['learning_rate'] * (it + 1) / (warmup_iters + 1)
     if it > lr_decay_iters:
-        return config['min_lr']
+        return config['min_learning_rate']
     decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-    return config['min_lr'] + coeff * (config['learning_rate'] - config['min_lr'])
+    return config['min_learning_rate'] + coeff * (config['learning_rate'] - config['min_learning_rate'])
 
 
 class ReduceLROnPlateauScheduler:
@@ -47,7 +47,7 @@ class ReduceLROnPlateauScheduler:
             console: Rich console for printing (optional)
         """
         self.learning_rate = config['learning_rate']
-        self.min_lr = config['min_lr']
+        self.min_learning_rate = config['min_learning_rate']
         self.factor = config['plateau_factor']
         self.patience = config['plateau_patience']
         self.threshold = config['plateau_threshold']
@@ -117,7 +117,7 @@ class ReduceLROnPlateauScheduler:
         # Check if we should reduce LR
         if self.num_bad_evals >= self.patience:
             old_lr = self.current_lr
-            new_lr = max(self.current_lr * self.factor, self.min_lr)
+            new_lr = max(self.current_lr * self.factor, self.min_learning_rate)
             
             if new_lr < old_lr:
                 self.current_lr = new_lr
@@ -178,9 +178,13 @@ def get_lr(it, warmup_iters, lr_decay_iters, config, lr_scheduler_obj=None):
     """
     scheduler_type = config.get('lr_scheduler', None)
     
-    # None or 'None' means no scheduling - use constant learning rate
-    if scheduler_type is None or scheduler_type == 'None':
-        return config['learning_rate']
+    # None or "Constant" means no scheduling - use constant learning rate (with warmup if specified)
+    if scheduler_type is None or scheduler_type == "Constant":
+        base_lr = config['learning_rate']
+        # Apply warmup if warmup_iters is specified
+        if warmup_iters and warmup_iters > 0 and it < warmup_iters:
+            return base_lr * (it + 1) / warmup_iters
+        return base_lr
     elif scheduler_type == 'CosineLR':
         return get_cosine_lr(it, warmup_iters, lr_decay_iters, config)
     elif scheduler_type == 'ReduceLROnPlateau':
@@ -207,7 +211,7 @@ def initialize_lr_scheduler(config, warmup_iters, lr_decay_iters, console=None):
     lr_scheduler_type = config.get('lr_scheduler', None)
     lr_scheduler_obj = None
     
-    if lr_scheduler_type is None or lr_scheduler_type == 'None':
+    if lr_scheduler_type is None or lr_scheduler_type == "Constant":
         msg = f"Using constant learning rate: {config['learning_rate']:.2e}"
         if console:
             console.print(f"[cyan]{msg}[/cyan]")

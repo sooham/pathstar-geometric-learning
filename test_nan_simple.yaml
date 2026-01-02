@@ -1,0 +1,124 @@
+# Simplified test to quickly reproduce and verify NaN fix
+# Single config that should fail without gradient clipping
+program: train.py
+method: grid
+metric:
+  name: val/loss/overall
+  goal: minimize
+
+parameters:
+  # Dataset - same as failing case
+  graph_d:
+    value: 1000
+  graph_l:
+    value: 5
+  graph_vocab_size:
+    value: '1max'
+  graph_holdout_percentage:
+    value: 0.2
+  num_pause_tokens:
+    value: 1
+  use_undirected:
+    value: true
+  use_directional_tokens:
+    value: true
+  use_task_tokens:
+    value: true
+  balance_interleaved_datasets:
+    value: true
+  weight_tying:
+    value: true
+  interleave_dataset:
+    value: true
+  predict_direction_for_edge_task:
+    value: false
+  use_directional_tokens_in_path:
+    value: false
+  p_autoregressive_substitution:
+    value: 0
+  
+  # Model config - WITH FIX (gradient clipping enabled)
+  model_config:
+    values:
+      - n_layer: 3
+        n_head: 1
+        n_embd: 512
+        dropout: 0
+        embed_dropout: 0
+        bias: true
+        base: 100
+        learning_rate: 1e-3
+        weight_decay: 0
+        lr_scheduler: "Constant"
+        epochs: 500
+        use_mlp: true
+        use_layernorm: true
+        seed: 4731
+
+  # CRITICAL FIX: Enable gradient clipping
+  grad_clip:
+    value: 1.0
+  
+  # Enhanced NaN detection
+  debug_detect_anomaly:
+    value: true
+  debug_check_nan_interval:
+    value: 10
+
+  # Other params
+  label_smoothing:
+    value: 0
+  adam_beta1:
+    value: 0.9
+  adam_beta2:
+    value: 0.95
+  
+  plateau_factor:
+    value: 0.80
+  plateau_patience:
+    value: 30
+  plateau_threshold:
+    value: 1e-4
+  plateau_cooldown:
+    value: 0
+  lr_warmup_frac:
+    value: 0
+  min_learning_rate:
+    value: 0
+  early_terimation_val_loss_threshold:
+    value: 0.001
+  
+  edge_iterations_per_epoch:
+    value: 10
+  path_iterations_per_epoch:
+    value: 10
+  gradient_accumulation_steps:
+    value: 1
+  compile:
+    value: true
+  eval_interval:
+    value: 50
+  log_interval:
+    value: 10
+  eval_verbose_interval:
+    value: 1
+  live_display:
+    value: false
+  live_display_update_interval:
+    value: 100
+  debug_masking:
+    value: false
+  debug_attention_maps:
+    value: false
+  log_edge_memorization_metrics:
+    value: false
+  debug_attention_map_interval:
+    value: 8000
+  
+  wandb_project:
+    value: nan_fix_test
+
+
+
+
+

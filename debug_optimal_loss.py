@@ -6,7 +6,7 @@ import math
 
 def calculate_optimal_loss(d, l, holdout_percentage, use_undirected=True, 
                           interleave_dataset=True, balance_interleaved_datasets=True,
-                          use_task_tokens_in_path=False):
+                          use_directional_tokens_in_path=False):
     """
     Calculate theoretical minimum loss for PathStar training.
     
@@ -17,7 +17,7 @@ def calculate_optimal_loss(d, l, holdout_percentage, use_undirected=True,
         use_undirected: whether edges are undirected
         interleave_dataset: whether paths and edges are interleaved
         balance_interleaved_datasets: whether paths are upsampled to match edges
-        use_task_tokens_in_path: whether GT tokens are interleaved in path sequences
+        use_directional_tokens_in_path: whether GT tokens are interleaved in path sequences
     """
     
     # Calculate dataset sizes
@@ -48,7 +48,7 @@ def calculate_optimal_loss(d, l, holdout_percentage, use_undirected=True,
     n_edge_samples = edges_size
     
     # Calculate tokens per sample
-    path_target_len = (2 * l - 1) if use_task_tokens_in_path else l
+    path_target_len = (2 * l - 1) if use_directional_tokens_in_path else l
     edge_tokens_per_sample = 1  # Only 1 token contributes to loss per edge
     
     # Calculate total tokens
@@ -120,7 +120,7 @@ if __name__ == "__main__":
         use_undirected=True,
         interleave_dataset=True,
         balance_interleaved_datasets=True,
-        use_task_tokens_in_path=False
+        use_directional_tokens_in_path=False
     )
     
     print("\n" + "=" * 80)
@@ -133,7 +133,7 @@ if __name__ == "__main__":
         use_undirected=True,
         interleave_dataset=True,
         balance_interleaved_datasets=True,
-        use_task_tokens_in_path=False
+        use_directional_tokens_in_path=False
     )
     
     print("\n" + "=" * 80)
@@ -146,6 +146,6 @@ if __name__ == "__main__":
         use_undirected=True,
         interleave_dataset=True,
         balance_interleaved_datasets=True,
-        use_task_tokens_in_path=False
+        use_directional_tokens_in_path=False
     )
 

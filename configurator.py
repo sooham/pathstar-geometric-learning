@@ -24,5 +24,5 @@ gradient_accumulation_steps = 1
 compile = False # Faster startup
 eval_interval = 1000
 log_interval = 1
-wandb_log = False
+use_wandb = False
 device = 'cpu' # Use CPU for deterministic/easy run

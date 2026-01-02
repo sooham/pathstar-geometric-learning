@@ -818,7 +818,7 @@ def initalize_model(device, meta, config, checkpoint_filename):
             print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
         model_args['vocab_size'] = meta.get('vocab_size', 50304)
         gptconf = GPTConfig(**model_args)
-        model = GPT(gptconf)
+        model = GPT(gptconf, meta=meta)
     elif config['init_from'] == 'resume':
         print(f"Resuming training from {config['out_dir']}")
         ckpt_path = os.path.join(config['out_dir'], checkpoint_filename)
@@ -828,13 +828,13 @@ def initalize_model(device, meta, config, checkpoint_filename):
             if k in checkpoint_model_args:
                 model_args[k] = checkpoint_model_args[k]
         gptconf = GPTConfig(**model_args)
-        model = GPT(gptconf)
+        model = GPT(gptconf, meta=meta)
         state_dict = checkpoint['model']
         unwanted_prefix = '_orig_mod.'
         for k, v in list(state_dict.items()):
             if k.startswith(unwanted_prefix):
                 state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-        model.load_state_dict(state_dict)
+        model.load_state_dict(state_dict, strict=False)  # Use strict=False to allow new buffers
         iter_num = checkpoint['iter_num']
         meta['best_val_loss'] = checkpoint.get('best_val_loss', float('inf'))
         meta['best_train_loss'] = checkpoint.get('best_train_loss', float('inf'))
