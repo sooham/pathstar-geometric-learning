@@ -135,7 +135,7 @@ class LiveTrainingPanel:
         else:
             self.context = nullcontext()
     
-    def update_train(self, X, Y, iter_num, meta, last_mask_debug_str=None):
+    def update_train(self, X, Y, iter_num, meta, last_mask_debug_str=None, loss=None):
         """
         Update training slice and mask debug panels in the live display.
         
@@ -145,6 +145,7 @@ class LiveTrainingPanel:
             iter_num: Current iteration number
             meta: Metadata dictionary containing itos and other info
             last_mask_debug_str: Debug string for mask visualization (optional)
+            loss: Current training loss (optional)
         """
         # Early return if live display is disabled or not time to update
         if not self.use_live_display or iter_num % self.vis_interval != 0:
@@ -164,7 +165,14 @@ class LiveTrainingPanel:
             # but for path tasks the last token (LEAF) is not masked.
             full_batch = torch.cat([X, Y[:, -1:]], dim=1)
             training_slice_str = self.format_training_slice(full_batch, itos, meta, num_samples=10)
-            self.layout["training"].update(Panel(training_slice_str, title=f"Training Slice (Iter {iter_num})", border_style="green"))
+            
+            # Build title with loss if available
+            title = f"Training Slice (Iter {iter_num}"
+            if loss is not None:
+                title += f", Loss: {loss:.6f}"
+            title += ")"
+            
+            self.layout["training"].update(Panel(training_slice_str, title=title, border_style="green"))
         
         # Update mask debug panel if enabled
         if self.show_debug_masking and last_mask_debug_str is not None:

@@ -222,8 +222,21 @@ def visualize_all_embeddings(embeddings, labels, meta, save_dir='out', prefix='e
     """
     os.makedirs(save_dir, exist_ok=True)
     
-    vocab_size = embeddings.shape[0]
-    print(f"\nCreating UMAP visualizations for {vocab_size} tokens...")
+    vocab_size, n_embd = embeddings.shape
+    
+    # Check if we can use raw embeddings (skip UMAP when dimension matches)
+    use_raw_2d = (n_embd == 2)
+    use_raw_3d = (n_embd == 3)
+    
+    if use_raw_2d:
+        print(f"\nEmbeddings are 2D - using raw embeddings for 2D visualizations")
+        print(f"Creating visualizations for {vocab_size} tokens...")
+    elif use_raw_3d:
+        print(f"\nEmbeddings are 3D - using raw embeddings for 3D visualizations")
+        print(f"Creating visualizations for {vocab_size} tokens...")
+    else:
+        print(f"\nCreating UMAP visualizations for {vocab_size} tokens...")
+    
     print(f"  Include root: {include_root}")
     print(f"  Include special: {include_special}")
     
@@ -244,75 +257,95 @@ def visualize_all_embeddings(embeddings, labels, meta, save_dir='out', prefix='e
     filtered_embeddings = embeddings[umap_mask]
     filtered_indices = np.where(umap_mask)[0]
     
-    print(f"  UMAP will use {filtered_embeddings.shape[0]} tokens (filtered from {vocab_size})")
+    print(f"  Visualization will use {filtered_embeddings.shape[0]} tokens (filtered from {vocab_size})")
     
     if filtered_embeddings.shape[0] == 0:
         print("  Warning: No tokens to visualize after filtering!")
         return None
     
+    # Compute embeddings for visualization
     n_neighbors_val = min(15, filtered_embeddings.shape[0] - 1)
     
-    # Compute both 2D and 3D UMAP on filtered embeddings
-    print("  [1/3] Computing 2D UMAP (n_neighbors=15)...")
-    
-    reduced_2d = apply_umap(
-        filtered_embeddings,
-        n_components=2,
-        n_neighbors=n_neighbors_val,
-        min_dist=0.1,
-        random_state=42
-    )
-    
-    print("  [2/3] Computing 3D UMAP (n_neighbors=15)...")
-    
-    reduced_3d = apply_umap(
-        filtered_embeddings,
-        n_components=3,
-        n_neighbors=n_neighbors_val,
-        min_dist=0.1,
-        random_state=42
-    )
-    
-    fig = plt.figure(figsize=(14, 10))
-    ax = fig.add_subplot(111, projection='3d')
-    
-    # Determine which filtered tokens are nodes vs special
-    filtered_is_special = labels['is_special'][umap_mask]
-    filtered_is_node = ~filtered_is_special
-    
-    # Plot node tokens
-    if filtered_is_node.any():
-        ax.scatter(
-            reduced_3d[filtered_is_node, 0],
-            reduced_3d[filtered_is_node, 1],
-            reduced_3d[filtered_is_node, 2],
-            c='steelblue', alpha=0.4, s=10, label='Node tokens'
+    # 2D visualization
+    if use_raw_2d:
+        print("  [1/3] Using raw 2D embeddings...")
+        reduced_2d = filtered_embeddings  # Already 2D
+        viz_method_2d = "Raw Embeddings"
+    else:
+        print("  [1/3] Computing 2D UMAP (n_neighbors=15)...")
+        reduced_2d = apply_umap(
+            filtered_embeddings,
+            n_components=2,
+            n_neighbors=n_neighbors_val,
+            min_dist=0.1,
+            random_state=42
         )
+        viz_method_2d = "UMAP"
     
-    # Plot special tokens if included
-    if include_special and filtered_is_special.any():
-        ax.scatter(
-            reduced_3d[filtered_is_special, 0],
-            reduced_3d[filtered_is_special, 1],
-            reduced_3d[filtered_is_special, 2],
-            c='red', alpha=1.0, s=100, marker='*', label='Special tokens'
+    # 3D visualization
+    if use_raw_2d:
+        # Skip 3D for 2D embeddings
+        reduced_3d = None
+        viz_method_3d = None
+    elif use_raw_3d:
+        print("  [2/3] Using raw 3D embeddings...")
+        reduced_3d = filtered_embeddings  # Already 3D
+        viz_method_3d = "Raw Embeddings"
+    else:
+        print("  [2/3] Computing 3D UMAP (n_neighbors=15)...")
+        reduced_3d = apply_umap(
+            filtered_embeddings,
+            n_components=3,
+            n_neighbors=n_neighbors_val,
+            min_dist=0.1,
+            random_state=42
         )
+        viz_method_3d = "UMAP"
     
-    ax.set_xlabel('UMAP 1')
-    ax.set_ylabel('UMAP 2')
-    ax.set_zlabel('UMAP 3')
-    title = 'Token Embeddings (3D UMAP)'
-    if not include_root:
-        title += ' [Root Excluded]'
-    if not include_special:
-        title += ' [Special Excluded]'
-    ax.set_title(title, fontsize=14)
-    ax.legend()
-    
-    path3 = os.path.join(save_dir, f'{prefix}_3d.png')
-    fig.savefig(path3, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-    print(f"    Saved: {path3}")
+    # Only create 3D plot if we have 3D data
+    if reduced_3d is not None:
+        fig = plt.figure(figsize=(14, 10))
+        ax = fig.add_subplot(111, projection='3d')
+        
+        # Determine which filtered tokens are nodes vs special
+        filtered_is_special = labels['is_special'][umap_mask]
+        filtered_is_node = ~filtered_is_special
+        
+        # Plot node tokens
+        if filtered_is_node.any():
+            ax.scatter(
+                reduced_3d[filtered_is_node, 0],
+                reduced_3d[filtered_is_node, 1],
+                reduced_3d[filtered_is_node, 2],
+                c='steelblue', alpha=0.4, s=10, label='Node tokens'
+            )
+        
+        # Plot special tokens if included
+        if include_special and filtered_is_special.any():
+            ax.scatter(
+                reduced_3d[filtered_is_special, 0],
+                reduced_3d[filtered_is_special, 1],
+                reduced_3d[filtered_is_special, 2],
+                c='red', alpha=1.0, s=100, marker='*', label='Special tokens'
+            )
+        
+            ax.set_xlabel(f'{viz_method_3d} 1')
+            ax.set_ylabel(f'{viz_method_3d} 2')
+            ax.set_zlabel(f'{viz_method_3d} 3')
+            title = f'Token Embeddings (3D {viz_method_3d})'
+            if not include_root:
+                title += ' [Root Excluded]'
+            if not include_special:
+                title += ' [Special Excluded]'
+            ax.set_title(title, fontsize=14)
+            ax.legend()
+            
+            path3 = os.path.join(save_dir, '3d.png')
+            fig.savefig(path3, dpi=150, bbox_inches='tight')
+            plt.close(fig)
+            print(f"    Saved: {path3}")
+    else:
+        print(f"    Skipped 3D plot (embeddings are 2D)")
     
     # 3. Similarity to root visualizations (both 2D and 3D)
     print("  [3/3] Creating similarity to root visualizations...")
@@ -353,58 +386,61 @@ def visualize_all_embeddings(embeddings, labels, meta, save_dir='out', prefix='e
                 c='black', s=200, marker='X', label='Root', zorder=10
             )
         
-        ax.set_xlabel('UMAP 1', fontsize=12)
-        ax.set_ylabel('UMAP 2', fontsize=12)
-        title = 'Node Embeddings Colored by Similarity to Root (2D)'
+        ax.set_xlabel(f'{viz_method_2d} 1', fontsize=12)
+        ax.set_ylabel(f'{viz_method_2d} 2', fontsize=12)
+        title = f'Node Embeddings Colored by Similarity to Root (2D {viz_method_2d})'
         if not include_root:
             title += ' [Root Excluded]'
         ax.set_title(title, fontsize=14)
         ax.legend(fontsize=10)
         ax.grid(True, alpha=0.3)
         
-        path4_2d = os.path.join(save_dir, f'{prefix}_similarity_to_root_2d.png')
+        path4_2d = os.path.join(save_dir, 'similarity_to_root_2d.png')
         fig.savefig(path4_2d, dpi=150, bbox_inches='tight')
         plt.close(fig)
         print(f"    Saved: {path4_2d}")
         
         # === 3D Similarity to Root ===
-        fig = plt.figure(figsize=(14, 10))
-        ax = fig.add_subplot(111, projection='3d')
-        
-        if filtered_is_node_2d.any():
-            scatter = ax.scatter(
-                reduced_3d[filtered_is_node_2d, 0],
-                reduced_3d[filtered_is_node_2d, 1],
-                reduced_3d[filtered_is_node_2d, 2],
-                c=filtered_sims[filtered_is_node_2d],
-                cmap='RdYlGn',
-                alpha=0.7, s=20
-            )
-            fig.colorbar(scatter, ax=ax, label='Cosine Similarity to Root', pad=0.1)
-        
-        # Mark root if included
-        if include_root and root_vertex in filtered_indices:
-            root_pos_in_filtered = np.where(filtered_indices == root_vertex)[0][0]
-            ax.scatter(
-                reduced_3d[root_pos_in_filtered, 0],
-                reduced_3d[root_pos_in_filtered, 1],
-                reduced_3d[root_pos_in_filtered, 2],
-                c='black', s=200, marker='X', label='Root', zorder=10
-            )
-        
-        ax.set_xlabel('UMAP 1')
-        ax.set_ylabel('UMAP 2')
-        ax.set_zlabel('UMAP 3')
-        title = 'Node Embeddings Colored by Similarity to Root (3D)'
-        if not include_root:
-            title += ' [Root Excluded]'
-        ax.set_title(title, fontsize=14)
-        ax.legend()
-        
-        path4_3d = os.path.join(save_dir, f'{prefix}_similarity_to_root_3d.png')
-        fig.savefig(path4_3d, dpi=150, bbox_inches='tight')
-        plt.close(fig)
-        print(f"    Saved: {path4_3d}")
+        if reduced_3d is not None:
+            fig = plt.figure(figsize=(14, 10))
+            ax = fig.add_subplot(111, projection='3d')
+            
+            if filtered_is_node_2d.any():
+                scatter = ax.scatter(
+                    reduced_3d[filtered_is_node_2d, 0],
+                    reduced_3d[filtered_is_node_2d, 1],
+                    reduced_3d[filtered_is_node_2d, 2],
+                    c=filtered_sims[filtered_is_node_2d],
+                    cmap='RdYlGn',
+                    alpha=0.7, s=20
+                )
+                fig.colorbar(scatter, ax=ax, label='Cosine Similarity to Root', pad=0.1)
+            
+            # Mark root if included
+            if include_root and root_vertex in filtered_indices:
+                root_pos_in_filtered = np.where(filtered_indices == root_vertex)[0][0]
+                ax.scatter(
+                    reduced_3d[root_pos_in_filtered, 0],
+                    reduced_3d[root_pos_in_filtered, 1],
+                    reduced_3d[root_pos_in_filtered, 2],
+                    c='black', s=200, marker='X', label='Root', zorder=10
+                )
+            
+            ax.set_xlabel(f'{viz_method_3d} 1')
+            ax.set_ylabel(f'{viz_method_3d} 2')
+            ax.set_zlabel(f'{viz_method_3d} 3')
+            title = f'Node Embeddings Colored by Similarity to Root (3D {viz_method_3d})'
+            if not include_root:
+                title += ' [Root Excluded]'
+            ax.set_title(title, fontsize=14)
+            ax.legend()
+            
+            path4_3d = os.path.join(save_dir, 'similarity_to_root_3d.png')
+            fig.savefig(path4_3d, dpi=150, bbox_inches='tight')
+            plt.close(fig)
+            print(f"    Saved: {path4_3d}")
+        else:
+            print(f"    Skipped 3D similarity plot (embeddings are 2D)")
     else:
         print("    Skipping similarity plot (no root token found)")
         similarities = None
@@ -492,12 +528,23 @@ def visualize_all_embeddings(embeddings, labels, meta, save_dir='out', prefix='e
         paths_by_leaf = meta['paths_by_leaf']
         train_leaves = meta.get('train_leaves', set())
         
-        # Sample up to 20 training paths
+        # Sample up to 20 training paths with consistent seed
         train_path_leaves = [leaf for leaf in paths_by_leaf.keys() if leaf in train_leaves]
         num_paths_to_sample = min(20, len(train_path_leaves))
         
         if num_paths_to_sample > 0:
+            # Use consistent sampling with seed
+            np.random.seed(42)
             sampled_leaves = np.random.choice(train_path_leaves, size=num_paths_to_sample, replace=False)
+            
+            # Define consistent color palette
+            BRIGHT_COLORS = [
+                '#FF6B6B',  # Bright Red
+                '#4ECDC4',  # Bright Teal
+                '#FFD93D',  # Bright Yellow
+                '#6BCB77',  # Bright Green
+                '#C77DFF',  # Bright Purple
+            ]
             
             for path_idx, leaf_token in enumerate(sampled_leaves):
                 path_tokens = paths_by_leaf[leaf_token]
@@ -512,12 +559,13 @@ def visualize_all_embeddings(embeddings, labels, meta, save_dir='out', prefix='e
                     else:
                         path_sims.append(0)
                 
-                # Plot path
+                # Plot path with consistent color
                 x_vals = list(range(len(path_tokens)))  # distance: 0=root, l-1=leaf
                 y_vals = [path_idx] * len(path_tokens)  # path index
                 z_vals = path_sims  # cosine similarity to leaf
+                color = BRIGHT_COLORS[path_idx % len(BRIGHT_COLORS)]
                 
-                ax.plot(x_vals, y_vals, z_vals, 'o-', alpha=0.6, markersize=4)
+                ax.plot(x_vals, y_vals, z_vals, 'o-', alpha=0.6, markersize=4, color=color)
             
             ax.set_xlabel('Distance in Path\n(0=Root, L-1=Leaf)', fontsize=10)
             ax.set_ylabel('Path Index', fontsize=10)
@@ -530,7 +578,7 @@ def visualize_all_embeddings(embeddings, labels, meta, save_dir='out', prefix='e
     plt.suptitle('Token Embedding Analysis Summary', fontsize=14, fontweight='bold')
     plt.tight_layout()
     
-    path_summary = os.path.join(save_dir, f'{prefix}_summary.png')
+    path_summary = os.path.join(save_dir, 'summary.png')
     fig.savefig(path_summary, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print(f"  Saved summary: {path_summary}")
@@ -569,7 +617,63 @@ def visualize_paths_in_umap(embeddings, labels, meta, save_dir='out', prefix='em
     if root_vertex is None:
         print("Warning: 'root_vertex' not found in metadata")
     
+    vocab_size, n_embd = embeddings.shape
+    
+    # ============================================================
+    # CONSISTENT COLOR MAPPING: Sample paths once and assign colors
+    # ============================================================
+    # Define consistent color palette (5 bright distinguishable colors)
+    BRIGHT_COLORS = [
+        '#FF6B6B',  # Bright Red
+        '#4ECDC4',  # Bright Teal
+        '#FFD93D',  # Bright Yellow
+        '#6BCB77',  # Bright Green
+        '#C77DFF',  # Bright Purple
+    ]
+    
+    # Separate train and holdout paths
+    train_path_leaves = [leaf for leaf in paths_by_leaf.keys() if leaf in train_leaves]
+    holdout_path_leaves = [leaf for leaf in paths_by_leaf.keys() if leaf in holdout_leaves]
+    
+    # Sample paths consistently with a fixed seed
+    max_paths_to_show = 20
+    num_paths_for_viz = min(5, len(train_path_leaves))  # For detailed visualizations
+    num_paths_to_show = min(max_paths_to_show, len(train_path_leaves))  # For sampled paths viz
+    
+    np.random.seed(42)  # Fixed seed for reproducibility
+    
+    # Sample paths for detailed analysis (5 paths)
+    sampled_leaves_5 = []
+    if num_paths_for_viz > 0:
+        sampled_leaves_5 = np.random.choice(train_path_leaves, size=num_paths_for_viz, replace=False).tolist()
+    
+    # Sample paths for the larger visualization (up to 20 paths)
+    sampled_leaves_20 = []
+    if num_paths_to_show > 0:
+        # Reuse the same seed to ensure the first 5 are the same
+        np.random.seed(42)
+        sampled_leaves_20 = np.random.choice(train_path_leaves, size=num_paths_to_show, replace=False).tolist()
+    
+    # Create color mapping: leaf_id -> color
+    # The first 5 paths get distinct colors, rest cycle through the same colors
+    path_color_map = {}
+    for idx, leaf in enumerate(sampled_leaves_20):
+        path_color_map[leaf] = BRIGHT_COLORS[idx % len(BRIGHT_COLORS)]
+    
+    print(f"  Sampled {num_paths_for_viz} paths for detailed analysis: {sampled_leaves_5}")
+    print(f"  Sampled {num_paths_to_show} paths for distinct path visualization")
+    print(f"  Color mapping established for consistent visualization")
+    # ============================================================
+    
+    # Check if we can use raw embeddings (skip UMAP when dimension matches)
+    use_raw_2d = (n_embd == 2)
+    use_raw_3d = (n_embd == 3)
+    
     print("\n=== Path-Based Visualization ===")
+    if use_raw_2d:
+        print(f"  Using raw 2D embeddings (no UMAP needed)")
+    elif use_raw_3d:
+        print(f"  Using raw 3D embeddings (no UMAP needed)")
     print(f"  Train leaves: {len(train_leaves)}")
     print(f"  Holdout leaves: {len(holdout_leaves)}")
     print(f"  Total paths: {len(paths_by_leaf)}")
@@ -578,8 +682,6 @@ def visualize_paths_in_umap(embeddings, labels, meta, save_dir='out', prefix='em
     print(f"  Include special: {include_special}")
     
     os.makedirs(save_dir, exist_ok=True)
-    
-    vocab_size = embeddings.shape[0]
     node_mask = ~labels['is_special']
     special_mask = labels['is_special']
     
@@ -593,32 +695,50 @@ def visualize_paths_in_umap(embeddings, labels, meta, save_dir='out', prefix='em
     filtered_embeddings = embeddings[umap_mask]
     filtered_indices = np.where(umap_mask)[0]
     
-    print(f"  UMAP will use {filtered_embeddings.shape[0]} tokens (filtered from {vocab_size})")
+    print(f"  Visualization will use {filtered_embeddings.shape[0]} tokens (filtered from {vocab_size})")
     
     if filtered_embeddings.shape[0] == 0:
         print("  Warning: No tokens to visualize after filtering!")
         return
     
+    # Compute embeddings for visualization
     n_neighbors_val = min(15, filtered_embeddings.shape[0] - 1)
     
-    # Compute both 2D and 3D UMAP projections on filtered embeddings
-    print("  Computing 2D UMAP projection (n_neighbors=15)...")
-    reduced_2d = apply_umap(
-        filtered_embeddings, 
-        n_components=2, 
-        n_neighbors=n_neighbors_val, 
-        min_dist=0.1,
-        random_state=42
-    )
+    # 2D visualization
+    if use_raw_2d:
+        print("  Using raw 2D embeddings...")
+        reduced_2d = filtered_embeddings  # Already 2D
+        viz_method_2d = "Raw Embeddings"
+    else:
+        print("  Computing 2D UMAP projection (n_neighbors=15)...")
+        reduced_2d = apply_umap(
+            filtered_embeddings, 
+            n_components=2, 
+            n_neighbors=n_neighbors_val, 
+            min_dist=0.1,
+            random_state=42
+        )
+        viz_method_2d = "UMAP"
     
-    print("  Computing 3D UMAP projection (n_neighbors=15)...")
-    reduced_3d = apply_umap(
-        filtered_embeddings, 
-        n_components=3, 
-        n_neighbors=n_neighbors_val, 
-        min_dist=0.1,
-        random_state=42
-    )
+    # 3D visualization
+    if use_raw_2d:
+        # Skip 3D for 2D embeddings
+        reduced_3d = None
+        viz_method_3d = None
+    elif use_raw_3d:
+        print("  Using raw 3D embeddings...")
+        reduced_3d = filtered_embeddings  # Already 3D
+        viz_method_3d = "Raw Embeddings"
+    else:
+        print("  Computing 3D UMAP projection (n_neighbors=15)...")
+        reduced_3d = apply_umap(
+            filtered_embeddings, 
+            n_components=3, 
+            n_neighbors=n_neighbors_val, 
+            min_dist=0.1,
+            random_state=42
+        )
+        viz_method_3d = "UMAP"
     
     # Create a mapping from token ID to its position in the filtered UMAP
     token_to_umap_pos = {}
@@ -633,36 +753,17 @@ def visualize_paths_in_umap(embeddings, labels, meta, save_dir='out', prefix='em
                 token_to_paths[token] = []
             token_to_paths[token].append(leaf_token)
     
-    # Separate train and holdout paths
-    train_path_leaves = [leaf for leaf in paths_by_leaf.keys() if leaf in train_leaves]
-    holdout_path_leaves = [leaf for leaf in paths_by_leaf.keys() if leaf in holdout_leaves]
-    
     print(f"  Paths in training: {len(train_path_leaves)}")
     print(f"  Paths in holdout: {len(holdout_path_leaves)}")
     
     # ============================================================
     # Visualization 1: Sample of paths with distinct colors and arrows
     # ============================================================
-    max_paths_to_show = 20
-    
-    if len(train_path_leaves) > 0:
+    if len(sampled_leaves_20) > 0:
         print(f"\n  [1/4] Creating visualization: Sample of training paths with arrows...")
-        
-        # Sample a subset of paths to visualize
-        num_paths_to_show = min(max_paths_to_show, len(train_path_leaves))
-        sampled_leaves = np.random.choice(train_path_leaves, size=num_paths_to_show, replace=False)
         
         # === 2D Version ===
         fig, ax = plt.subplots(figsize=(14, 12))
-        
-        # Use only 5 bright distinguishable colors and cycle through them
-        bright_colors = [
-            '#FF6B6B',  # Bright Red
-            '#4ECDC4',  # Bright Teal
-            '#FFD93D',  # Bright Yellow
-            '#6BCB77',  # Bright Green
-            '#C77DFF',  # Bright Purple
-        ]
         
         # Plot background: all filtered node tokens in gray
         background_mask = umap_mask & node_mask
@@ -678,10 +779,10 @@ def visualize_paths_in_umap(embeddings, labels, meta, save_dir='out', prefix='em
                 c='lightgray', alpha=0.2, s=10, label='Other nodes', zorder=1
             )
         
-        # Plot each path with a color (cycling through 5 colors)
-        for path_idx, leaf_token in enumerate(sampled_leaves):
+        # Plot each path with a color (using consistent color mapping)
+        for path_idx, leaf_token in enumerate(sampled_leaves_20):
             path_tokens = paths_by_leaf[leaf_token]
-            color = bright_colors[path_idx % len(bright_colors)]
+            color = path_color_map[leaf_token]
             
             # Filter path tokens to only those in UMAP
             visible_path_tokens = [t for t in path_tokens if t in token_to_umap_pos]
@@ -695,7 +796,7 @@ def visualize_paths_in_umap(embeddings, labels, meta, save_dir='out', prefix='em
                     reduced_2d[path_positions, 0],
                     reduced_2d[path_positions, 1],
                     c=color, alpha=0.8, s=50, 
-                    label=f'Path {path_idx+1} (→ leaf {leaf_token})',
+                    label=f'Path {path_idx+1} (leaf token {leaf_token})',
                     edgecolors='black', linewidths=0.5,
                     zorder=3
                 )
@@ -741,108 +842,111 @@ def visualize_paths_in_umap(embeddings, labels, meta, save_dir='out', prefix='em
                     zorder=2
                 )
         
-        ax.set_xlabel('UMAP 1', fontsize=12)
-        ax.set_ylabel('UMAP 2', fontsize=12)
-        title = f'Sample of {num_paths_to_show} Training Paths with Arrows (2D)'
+        ax.set_xlabel(f'{viz_method_2d} 1', fontsize=12)
+        ax.set_ylabel(f'{viz_method_2d} 2', fontsize=12)
+        title = f'Sample of {num_paths_to_show} Training Paths with Arrows (2D {viz_method_2d})'
         if not include_root:
             title += ' [Root Excluded]'
         ax.set_title(title, fontsize=14)
         ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8, ncol=1)
         ax.grid(True, alpha=0.3)
         
-        path1_2d = os.path.join(save_dir, f'{prefix}_paths_distinct_2d.png')
+        path1_2d = os.path.join(save_dir, 'paths_distinct_2d.png')
         fig.savefig(path1_2d, dpi=150, bbox_inches='tight')
         plt.close(fig)
         print(f"    Saved: {path1_2d}")
         
         # === 3D Version ===
-        fig = plt.figure(figsize=(16, 12))
-        ax = fig.add_subplot(111, projection='3d')
-        
-        # Plot background
-        if background_tokens:
-            background_positions = [token_to_umap_pos[t] for t in background_tokens]
-            ax.scatter(
-                reduced_3d[background_positions, 0],
-                reduced_3d[background_positions, 1],
-                reduced_3d[background_positions, 2],
-                c='lightgray', alpha=0.2, s=10, label='Other nodes', zorder=1
-            )
-        
-        # Plot each path
-        for path_idx, leaf_token in enumerate(sampled_leaves):
-            path_tokens = paths_by_leaf[leaf_token]
-            color = bright_colors[path_idx % len(bright_colors)]
+        if reduced_3d is not None:
+            fig = plt.figure(figsize=(16, 12))
+            ax = fig.add_subplot(111, projection='3d')
             
-            visible_path_tokens = [t for t in path_tokens if t in token_to_umap_pos]
+            # Plot background
+            if background_tokens:
+                background_positions = [token_to_umap_pos[t] for t in background_tokens]
+                ax.scatter(
+                    reduced_3d[background_positions, 0],
+                    reduced_3d[background_positions, 1],
+                    reduced_3d[background_positions, 2],
+                    c='lightgray', alpha=0.2, s=10, label='Other nodes', zorder=1
+                )
             
-            if len(visible_path_tokens) > 0:
-                path_positions = [token_to_umap_pos[t] for t in visible_path_tokens]
+            # Plot each path
+            for path_idx, leaf_token in enumerate(sampled_leaves_20):
+                path_tokens = paths_by_leaf[leaf_token]
+                color = path_color_map[leaf_token]
                 
-                ax.scatter(
-                    reduced_3d[path_positions, 0],
-                    reduced_3d[path_positions, 1],
-                    reduced_3d[path_positions, 2],
-                    c=color, alpha=0.8, s=50, 
-                    label=f'Path {path_idx+1} (→ leaf {leaf_token})',
-                    edgecolors='black', linewidths=0.5,
-                    zorder=3
-                )
+                visible_path_tokens = [t for t in path_tokens if t in token_to_umap_pos]
                 
-                # Draw 3D arrows/lines between consecutive nodes
-                for i in range(len(visible_path_tokens) - 1):
-                    start_token = visible_path_tokens[i]
-                    end_token = visible_path_tokens[i + 1]
+                if len(visible_path_tokens) > 0:
+                    path_positions = [token_to_umap_pos[t] for t in visible_path_tokens]
                     
-                    start_pos = token_to_umap_pos[start_token]
-                    end_pos = token_to_umap_pos[end_token]
+                    ax.scatter(
+                        reduced_3d[path_positions, 0],
+                        reduced_3d[path_positions, 1],
+                        reduced_3d[path_positions, 2],
+                        c=color, alpha=0.8, s=50, 
+                        label=f'Path {path_idx+1} (leaf token {leaf_token})',
+                        edgecolors='black', linewidths=0.5,
+                        zorder=3
+                    )
                     
-                    xs = [reduced_3d[start_pos, 0], reduced_3d[end_pos, 0]]
-                    ys = [reduced_3d[start_pos, 1], reduced_3d[end_pos, 1]]
-                    zs = [reduced_3d[start_pos, 2], reduced_3d[end_pos, 2]]
-                    
-                    ax.plot(xs, ys, zs, color=color, lw=1.5, alpha=0.6, zorder=2)
-        
-        # Highlight root if included
-        if include_root and root_vertex is not None and root_vertex in token_to_umap_pos:
-            root_pos = token_to_umap_pos[root_vertex]
-            ax.scatter(
-                reduced_3d[root_pos, 0],
-                reduced_3d[root_pos, 1],
-                reduced_3d[root_pos, 2],
-                c='black', s=300, marker='X', 
-                label=f'Root ({root_vertex})',
-                edgecolors='white', linewidths=2,
-                zorder=10
-            )
-        
-        # Plot special tokens if included
-        if include_special:
-            special_in_filtered = [t for t in filtered_indices if labels['is_special'][t]]
-            if special_in_filtered:
-                special_positions = [token_to_umap_pos[t] for t in special_in_filtered]
+                    # Draw 3D arrows/lines between consecutive nodes
+                    for i in range(len(visible_path_tokens) - 1):
+                        start_token = visible_path_tokens[i]
+                        end_token = visible_path_tokens[i + 1]
+                        
+                        start_pos = token_to_umap_pos[start_token]
+                        end_pos = token_to_umap_pos[end_token]
+                        
+                        xs = [reduced_3d[start_pos, 0], reduced_3d[end_pos, 0]]
+                        ys = [reduced_3d[start_pos, 1], reduced_3d[end_pos, 1]]
+                        zs = [reduced_3d[start_pos, 2], reduced_3d[end_pos, 2]]
+                        
+                        ax.plot(xs, ys, zs, color=color, lw=1.5, alpha=0.6, zorder=2)
+            
+            # Highlight root if included
+            if include_root and root_vertex is not None and root_vertex in token_to_umap_pos:
+                root_pos = token_to_umap_pos[root_vertex]
                 ax.scatter(
-                    reduced_3d[special_positions, 0],
-                    reduced_3d[special_positions, 1],
-                    reduced_3d[special_positions, 2],
-                    c='red', alpha=0.6, s=100, marker='*',
-                    label='Special tokens',
-                    zorder=2
+                    reduced_3d[root_pos, 0],
+                    reduced_3d[root_pos, 1],
+                    reduced_3d[root_pos, 2],
+                    c='black', s=300, marker='X', 
+                    label=f'Root ({root_vertex})',
+                    edgecolors='white', linewidths=2,
+                    zorder=10
                 )
-        
-        ax.set_xlabel('UMAP 1')
-        ax.set_ylabel('UMAP 2')
-        ax.set_zlabel('UMAP 3')
-        title = f'Sample of {num_paths_to_show} Training Paths (3D)'
-        if not include_root:
-            title += ' [Root Excluded]'
-        ax.set_title(title, fontsize=14)
-        ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8, ncol=1)
-        
-        path1_3d = os.path.join(save_dir, f'{prefix}_paths_distinct_3d.png')
-        fig.savefig(path1_3d, dpi=150, bbox_inches='tight')
-        plt.close(fig)
-        print(f"    Saved: {path1_3d}")
+            
+            # Plot special tokens if included
+            if include_special:
+                special_in_filtered = [t for t in filtered_indices if labels['is_special'][t]]
+                if special_in_filtered:
+                    special_positions = [token_to_umap_pos[t] for t in special_in_filtered]
+                    ax.scatter(
+                        reduced_3d[special_positions, 0],
+                        reduced_3d[special_positions, 1],
+                        reduced_3d[special_positions, 2],
+                        c='red', alpha=0.6, s=100, marker='*',
+                        label='Special tokens',
+                        zorder=2
+                    )
+            
+            ax.set_xlabel(f'{viz_method_3d} 1')
+            ax.set_ylabel(f'{viz_method_3d} 2')
+            ax.set_zlabel(f'{viz_method_3d} 3')
+            title = f'Sample of {num_paths_to_show} Training Paths (3D {viz_method_3d})'
+            if not include_root:
+                title += ' [Root Excluded]'
+            ax.set_title(title, fontsize=14)
+            ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8, ncol=1)
+            
+            path1_3d = os.path.join(save_dir, 'paths_distinct_3d.png')
+            fig.savefig(path1_3d, dpi=150, bbox_inches='tight')
+            plt.close(fig)
+            print(f"    Saved: {path1_3d}")
+        else:
+            print(f"    Skipped 3D paths plot (embeddings are 2D)")
     
     # ============================================================
     # Visualization 2: Train vs Holdout paths
@@ -950,114 +1054,145 @@ def visualize_paths_in_umap(embeddings, labels, meta, save_dir='out', prefix='em
                 zorder=2
             )
     
-    ax.set_xlabel('UMAP 1', fontsize=12)
-    ax.set_ylabel('UMAP 2', fontsize=12)
-    title = 'Token Embeddings: Train vs Holdout Paths (2D)'
+    ax.set_xlabel(f'{viz_method_2d} 1', fontsize=12)
+    ax.set_ylabel(f'{viz_method_2d} 2', fontsize=12)
+    title = f'Token Embeddings: Train vs Holdout Paths (2D {viz_method_2d})'
     if not include_root:
         title += ' [Root Excluded]'
     ax.set_title(title, fontsize=14)
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)
     
-    path2_2d = os.path.join(save_dir, f'{prefix}_train_vs_holdout_2d.png')
+    path2_2d = os.path.join(save_dir, 'train_vs_holdout_2d.png')
     fig.savefig(path2_2d, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print(f"    Saved: {path2_2d}")
     
     # === 3D Version ===
-    fig = plt.figure(figsize=(14, 10))
-    ax = fig.add_subplot(111, projection='3d')
-    
-    if other_tokens:
-        positions = [token_to_umap_pos[t] for t in other_tokens]
-        ax.scatter(
-            reduced_3d[positions, 0],
-            reduced_3d[positions, 1],
-            reduced_3d[positions, 2],
-            c='lightgray', alpha=0.2, s=10,
-            label=f'Other nodes ({len(other_tokens)})',
-            zorder=1
-        )
-    
-    if train_only_tokens:
-        positions = [token_to_umap_pos[t] for t in train_only_tokens]
-        ax.scatter(
-            reduced_3d[positions, 0],
-            reduced_3d[positions, 1],
-            reduced_3d[positions, 2],
-            c='steelblue', alpha=0.6, s=40,
-            label=f'Train-only paths ({len(train_only_tokens)})',
-            zorder=3
-        )
-    
-    if holdout_only_tokens:
-        positions = [token_to_umap_pos[t] for t in holdout_only_tokens]
-        ax.scatter(
-            reduced_3d[positions, 0],
-            reduced_3d[positions, 1],
-            reduced_3d[positions, 2],
-            c='orange', alpha=0.6, s=40,
-            label=f'Holdout-only paths ({len(holdout_only_tokens)})',
-            zorder=3
-        )
-    
-    if shared_tokens:
-        positions = [token_to_umap_pos[t] for t in shared_tokens]
-        ax.scatter(
-            reduced_3d[positions, 0],
-            reduced_3d[positions, 1],
-            reduced_3d[positions, 2],
-            c='green', alpha=0.8, s=60,
-            label=f'Shared nodes ({len(shared_tokens)})',
-            edgecolors='black', linewidths=0.5,
-            zorder=5
-        )
-    
-    # Highlight root if included
-    if include_root and root_vertex is not None and root_vertex in token_to_umap_pos:
-        root_pos = token_to_umap_pos[root_vertex]
-        ax.scatter(
-            reduced_3d[root_pos, 0],
-            reduced_3d[root_pos, 1],
-            reduced_3d[root_pos, 2],
-            c='black', s=300, marker='X',
-            label=f'Root',
-            edgecolors='white', linewidths=2,
-            zorder=10
-        )
-    
-    # Plot special tokens if included
-    if include_special:
-        special_in_filtered = [t for t in filtered_indices if labels['is_special'][t]]
-        if special_in_filtered:
-            positions = [token_to_umap_pos[t] for t in special_in_filtered]
+    if reduced_3d is not None:
+        fig = plt.figure(figsize=(14, 10))
+        ax = fig.add_subplot(111, projection='3d')
+        
+        if other_tokens:
+            positions = [token_to_umap_pos[t] for t in other_tokens]
             ax.scatter(
                 reduced_3d[positions, 0],
                 reduced_3d[positions, 1],
                 reduced_3d[positions, 2],
-                c='red', alpha=0.6, s=100, marker='*',
-                label='Special tokens',
-                zorder=2
+                c='lightgray', alpha=0.2, s=10,
+                label=f'Other nodes ({len(other_tokens)})',
+                zorder=1
             )
-    
-    ax.set_xlabel('UMAP 1')
-    ax.set_ylabel('UMAP 2')
-    ax.set_zlabel('UMAP 3')
-    title = 'Token Embeddings: Train vs Holdout Paths (3D)'
-    if not include_root:
-        title += ' [Root Excluded]'
-    ax.set_title(title, fontsize=14)
-    ax.legend(fontsize=10)
-    
-    path2_3d = os.path.join(save_dir, f'{prefix}_train_vs_holdout_3d.png')
-    fig.savefig(path2_3d, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-    print(f"    Saved: {path2_3d}")
+        
+        if train_only_tokens:
+            positions = [token_to_umap_pos[t] for t in train_only_tokens]
+            ax.scatter(
+                reduced_3d[positions, 0],
+                reduced_3d[positions, 1],
+                reduced_3d[positions, 2],
+                c='steelblue', alpha=0.6, s=40,
+                label=f'Train-only paths ({len(train_only_tokens)})',
+                zorder=3
+            )
+        
+        if holdout_only_tokens:
+            positions = [token_to_umap_pos[t] for t in holdout_only_tokens]
+            ax.scatter(
+                reduced_3d[positions, 0],
+                reduced_3d[positions, 1],
+                reduced_3d[positions, 2],
+                c='orange', alpha=0.6, s=40,
+                label=f'Holdout-only paths ({len(holdout_only_tokens)})',
+                zorder=3
+            )
+        
+        if shared_tokens:
+            positions = [token_to_umap_pos[t] for t in shared_tokens]
+            ax.scatter(
+                reduced_3d[positions, 0],
+                reduced_3d[positions, 1],
+                reduced_3d[positions, 2],
+                c='green', alpha=0.8, s=60,
+                label=f'Shared nodes ({len(shared_tokens)})',
+                edgecolors='black', linewidths=0.5,
+                zorder=5
+            )
+        
+        # Highlight root if included
+        if include_root and root_vertex is not None and root_vertex in token_to_umap_pos:
+            root_pos = token_to_umap_pos[root_vertex]
+            ax.scatter(
+                reduced_3d[root_pos, 0],
+                reduced_3d[root_pos, 1],
+                reduced_3d[root_pos, 2],
+                c='black', s=300, marker='X',
+                label=f'Root',
+                edgecolors='white', linewidths=2,
+                zorder=10
+            )
+        
+        # Plot special tokens if included
+        if include_special:
+            special_in_filtered = [t for t in filtered_indices if labels['is_special'][t]]
+            if special_in_filtered:
+                positions = [token_to_umap_pos[t] for t in special_in_filtered]
+                ax.scatter(
+                    reduced_3d[positions, 0],
+                    reduced_3d[positions, 1],
+                    reduced_3d[positions, 2],
+                    c='red', alpha=0.6, s=100, marker='*',
+                    label='Special tokens',
+                    zorder=2
+                )
+        
+        ax.set_xlabel(f'{viz_method_3d} 1')
+        ax.set_ylabel(f'{viz_method_3d} 2')
+        ax.set_zlabel(f'{viz_method_3d} 3')
+        title = f'Token Embeddings: Train vs Holdout Paths (3D {viz_method_3d})'
+        if not include_root:
+            title += ' [Root Excluded]'
+        ax.set_title(title, fontsize=14)
+        ax.legend(fontsize=10)
+        
+        path2_3d = os.path.join(save_dir, 'train_vs_holdout_3d.png')
+        fig.savefig(path2_3d, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        print(f"    Saved: {path2_3d}")
+    else:
+        print(f"    Skipped 3D train vs holdout plot (embeddings are 2D)")
     
     # ============================================================
     # Visualization 3: Depth in path structure
     # ============================================================
     print(f"  [3/4] Creating visualization: Depth in path structure...")
+    
+    # Define discrete colors for depth levels (up to 10 distinct colors)
+    DEPTH_COLORS = [
+        '#E63946',  # Red (depth 0 - root)
+        '#F77F00',  # Orange
+        '#FCBF49',  # Yellow
+        '#06D6A0',  # Teal
+        '#118AB2',  # Blue
+        '#073B4C',  # Dark Blue
+        '#9D4EDD',  # Purple
+        '#FF006E',  # Hot Pink
+        '#8338EC',  # Violet
+        '#3A86FF',  # Light Blue
+    ]
+    
+    # Define distinct marker shapes for depth levels (up to 10 distinct shapes)
+    DEPTH_MARKERS = [
+        'o',   # Circle (depth 0 - root)
+        's',   # Square 4 sides
+        '^',   # Triangle up 3 sides
+        'D',   # Diamond  4 sides
+        'p',   # Pentagon 5 sides
+        'h',   # Hexagon 6 sides
+        '*',   # Star
+        'v',   # Triangle down
+        'P',   # Plus (filled)
+        'X',   # X (filled)
+    ]
     
     # Calculate depth for each token (distance from root along path)
     token_depths = np.full(vocab_size, -1, dtype=int)
@@ -1104,15 +1239,39 @@ def visualize_paths_in_umap(embeddings, labels, meta, save_dir='out', prefix='em
     if has_depth_tokens:
         positions = [token_to_umap_pos[t] for t in has_depth_tokens]
         depths = [token_depths[t] for t in has_depth_tokens]
-        scatter = ax.scatter(
-            reduced_2d[positions, 0],
-            reduced_2d[positions, 1],
-            c=depths,
-            cmap='viridis',
-            alpha=0.7, s=40,
-            vmin=0, vmax=max(depths)
-        )
-        plt.colorbar(scatter, ax=ax, label='Depth (Distance from Root)')
+        max_depth = max(depths)
+        
+        # Check if depth exceeds our discrete color/marker palette
+        if max_depth >= len(DEPTH_COLORS):
+            # Fallback to continuous colormap with circles for depths > 10
+            print(f"    Note: Max depth ({max_depth}) >= {len(DEPTH_COLORS)}, using continuous colormap with circles")
+            scatter = ax.scatter(
+                reduced_2d[positions, 0],
+                reduced_2d[positions, 1],
+                c=depths,
+                cmap='viridis',
+                marker='o',
+                alpha=0.7, s=40,
+                vmin=0, vmax=max_depth
+            )
+            plt.colorbar(scatter, ax=ax, label='Depth (Distance from Root)')
+        else:
+            # Use discrete colors and shapes for depths 0-9
+            # Plot each depth level with its own distinct color and shape
+            for depth_level in range(max_depth + 1):
+                depth_mask = np.array([d == depth_level for d in depths])
+                if depth_mask.any():
+                    color = DEPTH_COLORS[depth_level]
+                    marker = DEPTH_MARKERS[depth_level]
+                    ax.scatter(
+                        reduced_2d[np.array(positions)[depth_mask], 0],
+                        reduced_2d[np.array(positions)[depth_mask], 1],
+                        c=color,
+                        marker=marker,
+                        alpha=0.7, s=60,
+                        label=f'Depth {depth_level}' + (' (root)' if depth_level == 0 else ''),
+                        edgecolors='black', linewidths=0.3
+                    )
     
     # Highlight root if included
     if include_root and root_vertex is not None and root_vertex in token_to_umap_pos:
@@ -1139,89 +1298,121 @@ def visualize_paths_in_umap(embeddings, labels, meta, save_dir='out', prefix='em
                 zorder=5
             )
     
-    ax.set_xlabel('UMAP 1', fontsize=12)
-    ax.set_ylabel('UMAP 2', fontsize=12)
-    title = 'Token Embeddings: Depth in Path Structure (2D)'
+    ax.set_xlabel(f'{viz_method_2d} 1', fontsize=12)
+    ax.set_ylabel(f'{viz_method_2d} 2', fontsize=12)
+    title = f'Token Embeddings: Depth in Path Structure (2D {viz_method_2d})'
     if not include_root:
         title += ' [Root Excluded]'
     ax.set_title(title, fontsize=14)
-    ax.legend(fontsize=10)
+    # Only show legend if using discrete colors/shapes (max_depth < 10)
+    if has_depth_tokens and max(token_depths[t] for t in has_depth_tokens) < len(DEPTH_COLORS):
+        ax.legend(fontsize=9, loc='best', ncol=2)
     ax.grid(True, alpha=0.3)
     
-    path3_2d = os.path.join(save_dir, f'{prefix}_depth_2d.png')
+    path3_2d = os.path.join(save_dir, 'depth_2d.png')
     fig.savefig(path3_2d, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print(f"    Saved: {path3_2d}")
     
     # === 3D Version ===
-    fig = plt.figure(figsize=(14, 10))
-    ax = fig.add_subplot(111, projection='3d')
-    
-    if no_depth_tokens:
-        positions = [token_to_umap_pos[t] for t in no_depth_tokens]
-        ax.scatter(
-            reduced_3d[positions, 0],
-            reduced_3d[positions, 1],
-            reduced_3d[positions, 2],
-            c='lightgray', alpha=0.2, s=10,
-            label='Unknown depth',
-            zorder=1
-        )
-    
-    if has_depth_tokens:
-        positions = [token_to_umap_pos[t] for t in has_depth_tokens]
-        depths = [token_depths[t] for t in has_depth_tokens]
-        scatter = ax.scatter(
-            reduced_3d[positions, 0],
-            reduced_3d[positions, 1],
-            reduced_3d[positions, 2],
-            c=depths,
-            cmap='viridis',
-            alpha=0.7, s=40,
-            vmin=0, vmax=max(depths)
-        )
-        fig.colorbar(scatter, ax=ax, label='Depth (Distance from Root)', pad=0.1)
-    
-    # Highlight root if included
-    if include_root and root_vertex is not None and root_vertex in token_to_umap_pos:
-        root_pos = token_to_umap_pos[root_vertex]
-        ax.scatter(
-            reduced_3d[root_pos, 0],
-            reduced_3d[root_pos, 1],
-            reduced_3d[root_pos, 2],
-            c='black', s=300, marker='X',
-            label='Root (depth=0)',
-            edgecolors='white', linewidths=2,
-            zorder=10
-        )
-    
-    # Plot special tokens if included
-    if include_special:
-        special_in_filtered = [t for t in filtered_indices if labels['is_special'][t]]
-        if special_in_filtered:
-            positions = [token_to_umap_pos[t] for t in special_in_filtered]
+    if reduced_3d is not None:
+        fig = plt.figure(figsize=(14, 10))
+        ax = fig.add_subplot(111, projection='3d')
+        
+        if no_depth_tokens:
+            positions = [token_to_umap_pos[t] for t in no_depth_tokens]
             ax.scatter(
                 reduced_3d[positions, 0],
                 reduced_3d[positions, 1],
                 reduced_3d[positions, 2],
-                c='red', alpha=0.6, s=100, marker='*',
-                label='Special tokens',
-                zorder=5
+                c='lightgray', alpha=0.2, s=10,
+                label='Unknown depth',
+                zorder=1
             )
-    
-    ax.set_xlabel('UMAP 1')
-    ax.set_ylabel('UMAP 2')
-    ax.set_zlabel('UMAP 3')
-    title = 'Token Embeddings: Depth in Path Structure (3D)'
-    if not include_root:
-        title += ' [Root Excluded]'
-    ax.set_title(title, fontsize=14)
-    ax.legend(fontsize=10)
-    
-    path3_3d = os.path.join(save_dir, f'{prefix}_depth_3d.png')
-    fig.savefig(path3_3d, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-    print(f"    Saved: {path3_3d}")
+        
+        if has_depth_tokens:
+            positions = [token_to_umap_pos[t] for t in has_depth_tokens]
+            depths = [token_depths[t] for t in has_depth_tokens]
+            max_depth = max(depths)
+            
+            # Check if depth exceeds our discrete color/marker palette
+            if max_depth >= len(DEPTH_COLORS):
+                # Fallback to continuous colormap with circles for depths > 10
+                print(f"    Note: Max depth ({max_depth}) >= {len(DEPTH_COLORS)}, using continuous colormap with circles")
+                scatter = ax.scatter(
+                    reduced_3d[positions, 0],
+                    reduced_3d[positions, 1],
+                    reduced_3d[positions, 2],
+                    c=depths,
+                    cmap='viridis',
+                    marker='o',
+                    alpha=0.7, s=40,
+                    vmin=0, vmax=max_depth
+                )
+                fig.colorbar(scatter, ax=ax, label='Depth (Distance from Root)', pad=0.1)
+            else:
+                # Use discrete colors and shapes for depths 0-9
+                # Plot each depth level with its own distinct color and shape
+                for depth_level in range(max_depth + 1):
+                    depth_mask = np.array([d == depth_level for d in depths])
+                    if depth_mask.any():
+                        color = DEPTH_COLORS[depth_level]
+                        marker = DEPTH_MARKERS[depth_level]
+                        ax.scatter(
+                            reduced_3d[np.array(positions)[depth_mask], 0],
+                            reduced_3d[np.array(positions)[depth_mask], 1],
+                            reduced_3d[np.array(positions)[depth_mask], 2],
+                            c=color,
+                            marker=marker,
+                            alpha=0.7, s=60,
+                            label=f'Depth {depth_level}' + (' (root)' if depth_level == 0 else ''),
+                            edgecolors='black', linewidths=0.3
+                        )
+        
+        # Highlight root if included
+        if include_root and root_vertex is not None and root_vertex in token_to_umap_pos:
+            root_pos = token_to_umap_pos[root_vertex]
+            ax.scatter(
+                reduced_3d[root_pos, 0],
+                reduced_3d[root_pos, 1],
+                reduced_3d[root_pos, 2],
+                c='black', s=300, marker='X',
+                label='Root (depth=0)',
+                edgecolors='white', linewidths=2,
+                zorder=10
+            )
+        
+        # Plot special tokens if included
+        if include_special:
+            special_in_filtered = [t for t in filtered_indices if labels['is_special'][t]]
+            if special_in_filtered:
+                positions = [token_to_umap_pos[t] for t in special_in_filtered]
+                ax.scatter(
+                    reduced_3d[positions, 0],
+                    reduced_3d[positions, 1],
+                    reduced_3d[positions, 2],
+                    c='red', alpha=0.6, s=100, marker='*',
+                    label='Special tokens',
+                    zorder=5
+                )
+        
+        ax.set_xlabel(f'{viz_method_3d} 1')
+        ax.set_ylabel(f'{viz_method_3d} 2')
+        ax.set_zlabel(f'{viz_method_3d} 3')
+        title = f'Token Embeddings: Depth in Path Structure (3D {viz_method_3d})'
+        if not include_root:
+            title += ' [Root Excluded]'
+        ax.set_title(title, fontsize=14)
+        # Only show legend if using discrete colors/shapes (max_depth < 10)
+        if has_depth_tokens and max(token_depths[t] for t in has_depth_tokens) < len(DEPTH_COLORS):
+            ax.legend(fontsize=9, loc='best', ncol=2)
+        
+        path3_3d = os.path.join(save_dir, 'depth_3d.png')
+        fig.savefig(path3_3d, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        print(f"    Saved: {path3_3d}")
+    else:
+        print(f"    Skipped 3D depth plot (embeddings are 2D)")
     
     # ============================================================
     # Visualization 4: Leaf similarity within path vs across paths
@@ -1233,28 +1424,15 @@ def visualize_paths_in_umap(embeddings, labels, meta, save_dir='out', prefix='em
     norms[norms == 0] = 1
     normalized = embeddings / norms
     
-    # Randomly select 5 training paths
-    num_paths_to_select = min(5, len(train_path_leaves))
-    
-    if num_paths_to_select > 0:
-        np.random.seed(42)  # For reproducibility
-        selected_leaves = np.random.choice(train_path_leaves, size=num_paths_to_select, replace=False)
-        
-        # Use 5 bright colors for the selected paths
-        path_colors = [
-            '#FF6B6B',  # Bright Red
-            '#4ECDC4',  # Bright Teal
-            '#FFD93D',  # Bright Yellow
-            '#6BCB77',  # Bright Green
-            '#C77DFF',  # Bright Purple
-        ]
+    # Use the consistently sampled 5 training paths
+    if len(sampled_leaves_5) > 0:
         
         # Store data for all selected paths
         all_selected_data = []
         all_cross_path_data = []
         
         # Get other paths (excluding all 5 selected)
-        other_paths = [leaf for leaf in train_path_leaves if leaf not in selected_leaves]
+        other_paths = [leaf for leaf in train_path_leaves if leaf not in sampled_leaves_5]
         
         # Group nodes by distance from root across all other paths
         distance_to_nodes = {}
@@ -1265,7 +1443,7 @@ def visualize_paths_in_umap(embeddings, labels, meta, save_dir='out', prefix='em
                     distance_to_nodes[dist] = []
                 distance_to_nodes[dist].append(token)
         
-        for idx, selected_leaf in enumerate(selected_leaves):
+        for idx, selected_leaf in enumerate(sampled_leaves_5):
             selected_path = paths_by_leaf[selected_leaf]
             
             # Calculate distances for selected path
@@ -1285,7 +1463,7 @@ def visualize_paths_in_umap(embeddings, labels, meta, save_dir='out', prefix='em
                 'leaf': selected_leaf,
                 'distances': selected_distances,
                 'similarities': selected_sims,
-                'color': path_colors[idx % len(path_colors)]
+                'color': path_color_map[selected_leaf]
             })
             
             # CROSS-PATH: Calculate average similarity of THIS leaf to nodes from OTHER paths
@@ -1310,7 +1488,7 @@ def visualize_paths_in_umap(embeddings, labels, meta, save_dir='out', prefix='em
                 'leaf': selected_leaf,
                 'distances': cross_distances,
                 'similarities': cross_sims,
-                'color': path_colors[idx % len(path_colors)]
+                'color': path_color_map[selected_leaf]
             })
         
         # Create side-by-side plots
@@ -1321,7 +1499,7 @@ def visualize_paths_in_umap(embeddings, labels, meta, save_dir='out', prefix='em
             ax1.plot(path_data['distances'], path_data['similarities'], 'o-', 
                     linewidth=2, markersize=6, alpha=0.7,
                     color=path_data['color'], 
-                    label=f"Path {path_data['leaf']}")
+                    label=f"Leaf {path_data['leaf']}")
         
         ax1.axhline(y=1.0, color='green', linestyle='--', alpha=0.5, linewidth=1.5, 
                    label='Perfect similarity')
@@ -1380,11 +1558,11 @@ def visualize_paths_in_umap(embeddings, labels, meta, save_dir='out', prefix='em
                         fontsize=9, color='darkred', fontweight='bold',
                         transform=ax2.get_xaxis_transform())
         
-        plt.suptitle(f'Leaf-to-Node Similarity: Within-Path vs Cross-Path ({num_paths_to_select} selected paths)', 
+        plt.suptitle(f'Leaf-to-Node Similarity: Within-Path vs Cross-Path ({len(sampled_leaves_5)} selected paths)', 
                     fontsize=14, fontweight='bold')
         plt.tight_layout()
         
-        path4 = os.path.join(save_dir, f'{prefix}_leaf_similarity_comparison.png')
+        path4 = os.path.join(save_dir, 'leaf_similarity_comparison.png')
         fig.savefig(path4, dpi=150, bbox_inches='tight')
         plt.close(fig)
         print(f"    Saved: {path4}")
@@ -1394,8 +1572,8 @@ def visualize_paths_in_umap(embeddings, labels, meta, save_dir='out', prefix='em
         # ============================================================
         print(f"    [4b/4] Creating visualization: Position-based distance similarity...")
         
-        # Select the first path from the 5 selected paths for this analysis
-        selected_leaf_A = selected_leaves[0]
+        # Select the first path from the 5 sampled paths for this analysis
+        selected_leaf_A = sampled_leaves_5[0]
         selected_path_A = paths_by_leaf[selected_leaf_A]
         path_length = len(selected_path_A)
         
@@ -1444,7 +1622,7 @@ def visualize_paths_in_umap(embeddings, labels, meta, save_dir='out', prefix='em
         ax3.axhline(y=0.0, color='gray', linestyle='-', alpha=0.2, linewidth=1)
         ax3.set_xlabel('Distance from Node', fontsize=12)
         ax3.set_ylabel('Avg Cosine Similarity', fontsize=12)
-        ax3.set_title(f'Within-Path Similarity by Distance\n(Path {selected_leaf_A}, from each position)', fontsize=13)
+        ax3.set_title(f'Within-Path Similarity by Distance\n(Path to leaf {selected_leaf_A}, from each position)', fontsize=13)
         ax3.legend(fontsize=8, loc='best', ncol=2)
         ax3.grid(True, alpha=0.3)
         
@@ -1493,15 +1671,15 @@ def visualize_paths_in_umap(embeddings, labels, meta, save_dir='out', prefix='em
         ax4.axhline(y=0.0, color='gray', linestyle='-', alpha=0.2, linewidth=1)
         ax4.set_xlabel('Distance from Node Position', fontsize=12)
         ax4.set_ylabel('Avg Cosine Similarity', fontsize=12)
-        ax4.set_title(f'Cross-Path Similarity by Distance\n(Path {selected_leaf_A} nodes → other paths)', fontsize=13)
+        ax4.set_title(f'Cross-Path Similarity by Distance\n(Path to leaf {selected_leaf_A} nodes → other paths)', fontsize=13)
         ax4.legend(fontsize=8, loc='best', ncol=2)
         ax4.grid(True, alpha=0.3)
         
-        plt.suptitle(f'Position-Distance Similarity Analysis (Path {selected_leaf_A})', 
+        plt.suptitle(f'Position-Distance Similarity Analysis (Path to leaf token {selected_leaf_A})', 
                     fontsize=14, fontweight='bold')
         plt.tight_layout()
         
-        path4b = os.path.join(save_dir, f'{prefix}_position_distance_similarity.png')
+        path4b = os.path.join(save_dir, 'position_distance_similarity.png')
         fig.savefig(path4b, dpi=150, bbox_inches='tight')
         plt.close(fig)
         print(f"    Saved: {path4b}")
