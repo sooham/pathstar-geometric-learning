@@ -166,6 +166,7 @@ class GPTConfig:
     activation: str = 'GELU'
     use_layernorm: bool = True
     use_mlp: bool = True
+    use_pos_embeddings: bool = True  # True: use positional embeddings. False: no positional information
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
 
 class GPT(nn.Module):
@@ -185,9 +186,12 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-        # Create sinusoidal position embeddings
-        base = config.base if config.base else 10_000
-        self.register_buffer("pos_emb", self._create_sinusoidal_embeddings(config.block_size, config.n_embd, base=base))
+        # Create sinusoidal position embeddings (if enabled)
+        if config.use_pos_embeddings:
+            base = config.base if config.base else 10_000
+            self.register_buffer("pos_emb", self._create_sinusoidal_embeddings(config.block_size, config.n_embd, base=base))
+        else:
+            self.pos_emb = None
 
         # init all weights
         self.apply(self._init_weights)
@@ -261,11 +265,15 @@ class GPT(nn.Module):
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.pos_emb[pos] # sinusoidal position embeddings of shape (t, n_embd)
-        # Apply dropout to the combined embeddings for regularization during training.
-        # This randomly zeros out some elements with probability config.dropout,
-        # helping prevent overfitting by making the model more robust.
-        x = self.transformer.drop(tok_emb + pos_emb)
+        if self.config.use_pos_embeddings:
+            pos_emb = self.pos_emb[pos] # sinusoidal position embeddings of shape (t, n_embd)
+            # Apply dropout to the combined embeddings for regularization during training.
+            # This randomly zeros out some elements with probability config.dropout,
+            # helping prevent overfitting by making the model more robust.
+            x = self.transformer.drop(tok_emb + pos_emb)
+        else:
+            # No positional embeddings - only token embeddings with dropout
+            x = self.transformer.drop(tok_emb)
         
         if track_activation_stats:
             activation_stats['embedding_mean'] = x.mean().item()
@@ -315,8 +323,11 @@ class GPT(nn.Module):
 
         # forward through embeddings
         tok_emb = self.transformer.wte(idx)
-        pos_emb = self.pos_emb[pos]
-        x = tok_emb + pos_emb  # No dropout during attention extraction
+        if self.config.use_pos_embeddings:
+            pos_emb = self.pos_emb[pos]
+            x = tok_emb + pos_emb  # No dropout during attention extraction
+        else:
+            x = tok_emb  # No positional embeddings
         
         attention_maps = []
         for block in self.transformer.h:
@@ -331,8 +342,9 @@ class GPT(nn.Module):
         # but want to use a smaller block size for some smaller, simpler model
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
-        # Crop sinusoidal position embeddings
-        self.pos_emb = self.pos_emb[:block_size]
+        # Crop sinusoidal position embeddings (if they exist)
+        if self.pos_emb is not None:
+            self.pos_emb = self.pos_emb[:block_size]
         for block in self.transformer.h:
             if hasattr(block.attn, 'bias'):
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
