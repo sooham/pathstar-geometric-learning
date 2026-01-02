@@ -276,7 +276,7 @@ class InWeightsPathStar:
         idx = np.argsort(eigenvalues)
         return eigenvalues[idx], eigenvectors[:, idx]
     
-    def compute_fiedler_value(self) -> float:
+    def compute_fiedler_value(self, use_undirected=True) -> float:
         """
         Compute the Fiedler value (algebraic connectivity) of the PathStar graph.
         
@@ -295,6 +295,9 @@ class InWeightsPathStar:
         for u, neighbors in self.adj_list.items():
             for v in neighbors:
                 G.add_edge(u, v)
+                if use_undirected:
+                    G.add_edge(v, u)
+
         
         # Get sparse Laplacian matrix
         L = nx.laplacian_matrix(G).astype(float)
@@ -304,7 +307,7 @@ class InWeightsPathStar:
         eigenvalues, _ = eigsh(L, k=2, which='SM')
         return float(np.sort(eigenvalues)[1])
     
-    def compute_fiedler_vector(self) -> np.ndarray:
+    def compute_fiedler_vector(self, use_undirected=True) -> np.ndarray:
         """
         Compute the Fiedler vector of the PathStar graph.
         
@@ -323,6 +326,8 @@ class InWeightsPathStar:
         for u, neighbors in self.adj_list.items():
             for v in neighbors:
                 G.add_edge(u, v)
+                if use_undirected:
+                    G.add_edge(v, u)
         
         # Get sparse Laplacian matrix
         L = nx.laplacian_matrix(G).astype(float)
@@ -333,28 +338,6 @@ class InWeightsPathStar:
         # Sort and return the eigenvector for the second-smallest eigenvalue
         idx = np.argsort(eigenvalues)
         return eigenvectors[:, idx[1]]
-    
-    def _generate_adjacency_list(self):
-        """
-        Generate an adjacency list as a shuffled list of edge pairs
-        """
-        # total nodes N = D * (P -1 ) + 1
-        # total edges  total edges (P-1)*D
-
-        adjacency_pairs_list = []
-        for u in self.adj_list:
-            for v in self.adj_list[u]:
-                adjacency_pairs_list.append((u, v))
-        
-        random.shuffle(adjacency_pairs_list)
-
-        return adjacency_pairs_list
-    
-    def _generate_paths_by_leaf(self):
-        """
-        Generate paths by leaf (returns a copy of the internal paths_by_leaf)
-        """
-        return dict(self.paths_by_leaf)
     
     def _generate_edge_memorization_training_set(self, size, undirected=True, use_directional_tokens=True, predict_direction_for_edge_task=True):
         """
@@ -709,6 +692,22 @@ class InWeightsPathStar:
         # Note: path_seq_len is the stored sequence length (WITHOUT pause tokens).
         # At runtime, the actual sequence length = path_seq_len + num_pause_tokens
         
+        # Create bidirectional adjacency list if use_undirected is True
+        adj_list_bidirectional = self.adj_list
+        if use_undirected:
+            adj_list_bidirectional = {}
+            # First copy the original directed edges
+            for u, neighbors in self.adj_list.items():
+                adj_list_bidirectional[u] = list(neighbors)  # Make a copy
+            
+            # Add reverse edges to make it bidirectional
+            for u, neighbors in self.adj_list.items():
+                for v in neighbors:
+                    if v not in adj_list_bidirectional:
+                        adj_list_bidirectional[v] = []
+                    if u not in adj_list_bidirectional[v]:
+                        adj_list_bidirectional[v].append(u)
+        
         # Save metadata
         meta = {
             'vocab_size': vocab_size,
@@ -729,6 +728,7 @@ class InWeightsPathStar:
             'leaf_vertices': self.v_leaf,
 
             'vertices': self.vertices,
+            'adj_list': adj_list_bidirectional,  # Full adjacency list (bidirectional if use_undirected=True)
             'holdout_percentage': self.holdout_percentage,
             'train_leaves': self.train_leaves,
             'holdout_leaves': self.holdout_leaves,
