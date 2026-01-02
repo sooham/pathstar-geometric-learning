@@ -83,7 +83,7 @@ def get_default_config():
         'use_directional_tokens': False,
         # If True, PATH task sequences interleave GT tokens between edges:
         #   [PATH] leaf (PAUSE)xN root GT n2 GT n3 ... GT leaf
-        'use_task_tokens_in_path': False,
+        'use_directional_tokens_in_path': False,
         
         # Scheduled sampling / autoregressive substitution for PATH tasks:
         # During training, with probability p_autoregressive_substitution, substitute
@@ -747,7 +747,7 @@ def set_wandb_name(config):
             commit_id = get_git_commit_id()
             dir_label = "Udir" if config["use_undirected"] else "Dir"
             dt_label = 'Dt' if config['use_directional_tokens'] else ''
-            ptgt_label = 'Pgt' if config.get('use_task_tokens_in_path', False) else ''
+            ptgt_label = 'Pgt' if config.get('use_directional_tokens_in_path', False) else ''
             ped_or_pet_label = 'Pd' if config['predict_direction_for_edge_task'] else 'Pe'
             wt_label = 'Wt' if config['weight_tying'] else ''
             wd_label = f"Wd{config['weight_decay']}" if config['weight_decay'] > 0 else ""
@@ -1883,7 +1883,7 @@ def train(config=None):
         use_undirected=default_config['use_undirected'],
         use_directional_tokens=default_config['use_directional_tokens'],
         predict_direction_for_edge_task=default_config['predict_direction_for_edge_task'],
-        use_task_tokens_in_path=default_config.get('use_task_tokens_in_path', False),
+        use_directional_tokens_in_path=default_config.get('use_directional_tokens_in_path', False),
     )
     
     meta, paths_data, edges_data, val_data = gen.load_dataset()
@@ -1956,7 +1956,7 @@ def train(config=None):
         print(f"=========================================================\n")
 
     # Auto-detect device
-    device, device_type, gpu_id = detect_device(default_config)
+    device, device_type = detect_device(default_config)
     
     # Enable PyTorch anomaly detection if requested (slow but thorough NaN debugging)
     if default_config.get('detect_anomaly', False):
