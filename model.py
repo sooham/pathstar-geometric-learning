@@ -767,7 +767,8 @@ class GPT(nn.Module):
 
     @torch.no_grad()
     def plot_embeddings_umap(self, save_path=None, epoch=None, iteration=None,
-                            include_root=False, include_special=False, num_paths=5):
+                            include_root=False, include_special=False, num_paths=5,
+                            figsize=(10, 8)):
         """
         Plot token embeddings in 2D with path structure highlighted.
         
@@ -781,6 +782,7 @@ class GPT(nn.Module):
             include_root: Whether to include root vertex in UMAP (default: False)
             include_special: Whether to include special tokens in UMAP (default: False)
             num_paths: Number of paths to highlight (default: 5)
+            figsize: Figure size as (width, height) in inches (default: (10, 8))
             
         Returns:
             fig: matplotlib figure object
@@ -805,7 +807,8 @@ class GPT(nn.Module):
             iteration=iteration,
             include_root=include_root,
             include_special=include_special,
-            num_paths=num_paths
+            num_paths=num_paths,
+            figsize=figsize
         )
         
         return fig

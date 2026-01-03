@@ -47,7 +47,8 @@ import matplotlib.pyplot as plt
 
 
 def plot_embeddings_2d_with_paths(embeddings, meta, save_path=None, epoch=None, iteration=None,
-                                   include_root=True, include_special=False, num_paths=5):
+                                   include_root=True, include_special=False, num_paths=5,
+                                   figsize=(12, 10)):
     """
     Create a simple 2D visualization of embeddings with sampled paths highlighted.
     
@@ -62,6 +63,7 @@ def plot_embeddings_2d_with_paths(embeddings, meta, save_path=None, epoch=None, 
         include_root: Whether to include root vertex in UMAP (default: False)
         include_special: Whether to include special tokens in UMAP (default: False)
         num_paths: Number of paths to highlight (default: 5)
+        figsize: Figure size as (width, height) in inches (default: (12, 10))
         
     Returns:
         fig: matplotlib figure object
@@ -128,7 +130,7 @@ def plot_embeddings_2d_with_paths(embeddings, meta, save_path=None, epoch=None, 
     path_color_map = {leaf: BRIGHT_COLORS[i % len(BRIGHT_COLORS)] for i, leaf in enumerate(sampled_leaves)}
     
     # Create figure
-    fig, ax = plt.subplots(figsize=(12, 10))
+    fig, ax = plt.subplots(figsize=figsize)
     
     # Plot background nodes
     background_tokens = [t for t in filtered_indices if not is_special[t]]

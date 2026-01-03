@@ -484,23 +484,20 @@ def evaluate_edge_memorization(ctx, model, meta, edges_data_np, device, batch_si
     use_neighborhood_accuracy = (not use_directional_tokens) and (not predict_dir)
     
     # Debug: Print first batch details
-    print(f"\n=== Edge Memorization Evaluation Debug ===")
-    print(f"Total edges: {num_edges}")
-    print(f"Batch size: {batch_size}")
-    print(f"Number of batches: {num_batches}")
-    print(f"use_directional_tokens: {use_directional_tokens}")
-    print(f"predict_direction_for_edge_task: {predict_dir}")
-    print(f"use_neighborhood_accuracy: {use_neighborhood_accuracy}")
+    # print(f"\n=== Edge Memorization Evaluation Debug ===")
+    # print(f"Total edges: {num_edges}")
+    # print(f"Batch size: {batch_size}")
+    # print(f"Number of batches: {num_batches}")
+    # print(f"use_directional_tokens: {use_directional_tokens}")
+    # print(f"predict_direction_for_edge_task: {predict_dir}")
+    # print(f"use_neighborhood_accuracy: {use_neighborhood_accuracy}")
     
     # Get adjacency list if using neighborhood-based accuracy
     adj_list = None
     if use_neighborhood_accuracy:
         adj_list = meta.get('adj_list')
         if adj_list is None:
-            print(f"WARNING: adj_list not found in meta, falling back to argmax accuracy")
             raise ValueError("adj_list not found in meta")
-        else:
-            print(f"Using neighborhood-based accuracy with adjacency list")
     
     for batch_idx in range(num_batches):
         start_idx = batch_idx * batch_size
@@ -3558,7 +3555,6 @@ def train(config=None):
                         'train/loss/overall': lossf,
                         'train/batch_composition/num_edges': num_edges_in_batch,
                         'train/batch_composition/num_paths': num_paths_in_batch,
-                        'train/embedding_geometry/mean_cosine_distance': train_mean_cosine_distance,
                         'iter': iter_num,
                         "epoch": round(current_epoch, 4),
                         'tokens_per_sec': tokens_per_sec,
