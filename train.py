@@ -2370,8 +2370,8 @@ def train(config=None):
     
     # Log individual sparsity and importance values for each path to wandb
     if user_config['wandb_log'] and wandb.run is not None:
-        sparsity_arr = np.array(meta.get('sparsity', [0.0] * meta['d']))
-        importance_arr = np.array(meta.get('importance', [1.0] * meta['d']))
+        sparsity_arr = np.array(user_config.get('sparsity', [0.0] * meta['d']))
+        importance_arr = np.array(user_config.get('importance', [1.0] * meta['d']))
         
         # Create dict with S_0, S_1, ..., S_{d-1} and I_0, I_1, ..., I_{d-1}
         sparsity_importance_config = {}
@@ -2704,8 +2704,8 @@ def train(config=None):
     # Check if sparsity sampling is enabled
     has_sparsity = user_config.get('sparsity', False) and paths_membership is not None
     if has_sparsity:
-        sparsity_arr = np.array(meta.get('sparsity', [0.0] * meta['d']))
-        importance_arr = np.array(meta.get('importance', [1.0] * meta['d']))
+        sparsity_arr = np.array(user_config.get('sparsity', [0.0] * meta['d']))
+        importance_arr = np.array(user_config.get('importance', [1.0] * meta['d']))
         
         # Normalize importance so mean = 1.0 (keeps loss scale similar)
         importance_mean = importance_arr.mean()
