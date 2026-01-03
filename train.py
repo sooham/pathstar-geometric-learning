@@ -1768,6 +1768,47 @@ def evaluate(estimate_metrics, config, meta, iter_num, lr, ctx, device, model, v
     # Return validation loss for LR schedulers like ReduceLROnPlateau
     return losses['val']
 
+def validate_config(config):
+    """
+    Validate training configuration parameters.
+    
+    Raises:
+        ValueError: If validation fails with a descriptive error message.
+    """
+    errors = []
+    
+    # 1. Check interval hierarchy: print_eval_interval > eval_interval > log_interval
+    log_interval = config.get('log_interval', 1)
+    eval_interval = config.get('eval_interval', 10)
+    print_eval_interval = config.get('print_eval_interval', 100)
+    
+    if not (print_eval_interval > eval_interval):
+        errors.append(
+            f"print_eval_interval ({print_eval_interval}) must be > eval_interval ({eval_interval})"
+        )
+    
+    if not (eval_interval > log_interval):
+        errors.append(
+            f"eval_interval ({eval_interval}) must be > log_interval ({log_interval})"
+        )
+    
+    # 2. Check learning rate bounds: learning_rate >= min_lr
+    learning_rate = config.get('learning_rate', 1e-3)
+    min_lr = config.get('min_lr', 6e-5)
+    
+    if not (learning_rate >= min_lr):
+        errors.append(
+            f"learning_rate ({learning_rate}) must be >= min_lr ({min_lr})"
+        )
+    
+    # If any validation errors, raise with all messages
+    if errors:
+        error_msg = "Configuration validation failed:\n  - " + "\n  - ".join(errors)
+        raise ValueError(error_msg)
+    
+    LiveTrainingPanel.CONSOLE.print("[green]✓ Configuration validation passed[/green]")
+
+
 def determine_dataset_in_device_size(device, device_type, paths_data, edges_data, val_data, limit=0.1):
     # Calculate dataset memory requirements BEFORE batch size calculation
     # This ensures batch size accounts for dataset memory if it will be loaded to GPU
@@ -1842,6 +1883,9 @@ def train(config=None):
         for k in config_keys:
             default_config[k] = globals()[k]
 
+    # Validate config
+    validate_config(default_config)
+    
     # Set random seed and backend configurations
     random.seed(config['seed'])
     torch.manual_seed(config['seed'])
@@ -2192,43 +2236,6 @@ def train(config=None):
         
         print(f"DEBUG: Found {num_gt_edges_from_root} GT edges from root in edge dataset (expected: {meta['d']})")
         
-        # Calculate total entropy (Loss Mass)
-        # Paths: Assumed perfect memorization -> 0 entropy.
-        # Edges: 
-        #   If predict_dir=True ([EDGE] u v -> GT/LT): Deterministic -> 0 entropy.
-        #   If predict_dir=False ([EDGE] u GT/LT -> v): 
-        #     - From Root (GT): d branches. Target is 1/d. Entropy = log(d). There are d such edges.
-        #     - From Root (LT): Not possible (Root has no parent).
-        #     - From Node (GT): 1 branch (linear path). Entropy = 0.
-        #     - From Node (LT): 1 branch (parent). Entropy = 0.
-        #     Total Entropy Mass = num_gt_edges_from_root * log(num_gt_edges_from_root)
-        
-        if predict_dir:
-            optimal_loss = 0.0
-        else:
-            # Use actual count instead of meta['d']
-            d_val = num_gt_edges_from_root if num_gt_edges_from_root > 0 else meta['d']
-            entropy_mass = d_val * math.log(d_val) if d_val > 0 else 0.0
-            optimal_loss = entropy_mass / total_tokens
-            
-        print(f"=== Theoretical Minimum Loss Calculation ===")
-        print(f"  d (graph spokes): {meta['d']}")
-        print(f"  l (path length): {meta['l']}")
-        print(f"  GT edges from root: {num_gt_edges_from_root}")
-        print(f"  Path samples (after upsampling): {n_path_samples}")
-        print(f"  Edge samples: {n_edge_samples}")
-        print(f"  Path tokens per sample: {path_target_len}")
-        print(f"  Total path tokens: {n_path_samples * path_target_len}")
-        print(f"  Total edge tokens: {n_edge_samples}")
-        print(f"  Total tokens: {total_tokens}")
-        print(f"  Entropy mass: {entropy_mass:.6f} ({d_val} * log({d_val}))")
-        print(f"  Theoretical Minimum Loss: {optimal_loss:.8f}")
-        print(f"=============================================")
-        
-        # Store for reference during training
-        meta['theoretical_min_loss'] = optimal_loss
-        meta['entropy_mass'] = entropy_mass
-        meta['total_contributing_tokens'] = total_tokens
     
     meta_vocab_size = meta['randomize_vocab_size']
     print(f"found randomize_vocab_size= {meta_vocab_size}")
@@ -3134,11 +3141,8 @@ def train(config=None):
                     
                     wandb.log({
                         'train/loss/overall': lossf,
-                        'train/loss/overall_remove_optimal': lossf - meta['theoretical_min_loss'],
-                        'train/loss/running_avg_epoch': running_avg_loss - meta['theoretical_min_loss'],
                         'train/batch_composition/num_edges': num_edges_in_batch,
                         'train/batch_composition/num_paths': num_paths_in_batch,
-                        'train/optimal_loss': meta['theoretical_min_loss'],
                         'train/embedding_geometry/mean_cosine_distance': train_mean_cosine_distance,
                         'iter': iter_num,
                         "epoch": round(current_epoch, 4),
