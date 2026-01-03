@@ -2445,8 +2445,11 @@ def train(config=None):
         LiveTrainingPanel.CONSOLE.print(f"[yellow]{'='*60}[/yellow]")
     
     # Register handlers
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
+    try:
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+    except ValueError as e:
+        LiveTrainingPanel.CONSOLE.print(f"[yellow]Note: Signal handlers not available (running in worker thread)[/yellow]")
 
     # Calculate and log theoretical minimum loss
     if default_config['wandb_log'] and wandb.run is not None:
