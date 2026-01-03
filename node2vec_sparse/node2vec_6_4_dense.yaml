@@ -62,7 +62,7 @@ parameters:
       # Deep models (n_layer=5): sweep MLP and LayerNorm (2x2 = 4 configs)
       - n_layer: [0]
         n_head: 1
-        n_embd: [2]
+        n_embd: [10]
         dropout: [0]
         embed_dropout: 0
         bias: [false]
@@ -107,9 +107,9 @@ parameters:
   eval_interval:
     value: 10  # Increased from 50 to reduce evaluation overhead
   log_interval:
-    value: 1  # Increased from 10 to reduce print overhead
+    value: 10  # Increased from 10 to reduce print overhead
   eval_verbose_interval:
-    value: 10
+    value: 30
   live_display:
     value: true
   live_display_update_interval:

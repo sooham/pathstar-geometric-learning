@@ -107,9 +107,9 @@ parameters:
   eval_interval:
     value: 10  # Increased from 50 to reduce evaluation overhead
   log_interval:
-    value: 1  # Increased from 10 to reduce print overhead
+    value: 10  # Increased from 10 to reduce print overhead
   eval_verbose_interval:
-    value: 10
+    value: 30
   live_display:
     value: true
   live_display_update_interval:
