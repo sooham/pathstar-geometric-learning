@@ -74,6 +74,7 @@ def get_default_config():
         'embedding_plot_interval': 100,  # How often to save embedding plots for GIF (iterations). Should be multiple of eval_interval
         'embedding_gif_duration': 500,  # Duration per frame in GIF (milliseconds)
         'embedding_gif_num_paths': 5,  # Number of paths to highlight in embedding plots
+        'embedding_gif_figsize': (8, 6),  # Figure size for embedding plots (width, height in inches)
         # Debugging
         'debug_masking': False,          # If True, show target masks applied to Y
         'debug_masking_samples': 2,      # How many batch rows to show
@@ -3176,7 +3177,8 @@ def train(config=None):
                             iteration=iter_num,
                             include_root=True,
                             include_special=False,
-                            num_paths=default_config.get('embedding_gif_num_paths', 5)
+                            num_paths=default_config.get('embedding_gif_num_paths', 5),
+                            figsize=default_config.get('embedding_gif_figsize', (8, 6))
                         )
                         plt.close(fig)
                         embedding_plot_paths.append(plot_path)
