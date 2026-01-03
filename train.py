@@ -1785,17 +1785,21 @@ def evaluate(estimate_metrics, config, meta, iter_num, lr, ctx, device, model, v
     # During sweeps, only save best checkpoint to reduce I/O overhead
     # In standalone mode, save based on always_save_checkpoint config
     save_checkpoint = False
-    if losses['val'] < meta['best_val_loss']:
-        meta['best_val_loss'] = losses['val']
-        save_checkpoint = True
-    elif not is_sweep_mode and config['always_save_checkpoint']:
-        save_checkpoint = True
     
-    if save_checkpoint and iter_num > 0:
-        checkpoint_model(model, meta, config, iter_num, losses['val'], loss_type='val', lr_scheduler_obj=lr_scheduler_obj)
+    # Handle NaN validation loss (when holdout_percentage=0)
+    if not math.isnan(losses['val']):
+        if losses['val'] < meta['best_val_loss']:
+            meta['best_val_loss'] = losses['val']
+            save_checkpoint = True
+        elif not is_sweep_mode and config['always_save_checkpoint']:
+            save_checkpoint = True
+        
+        if save_checkpoint and iter_num > 0:
+            checkpoint_model(model, meta, config, iter_num, losses['val'], loss_type='val', lr_scheduler_obj=lr_scheduler_obj)
     
     # Return validation loss for LR schedulers like ReduceLROnPlateau
-    return losses['val']
+    # If validation loss is NaN (no validation set), return None to signal that validation is unavailable
+    return losses['val'] if not math.isnan(losses['val']) else None
 
 def validate_config(config):
     """
@@ -3079,6 +3083,15 @@ def train(config=None):
         out = {}
         model.eval()
         
+        # Handle empty validation set (when holdout_percentage=0)
+        if split == 'val' and VAL_DATASET_SIZE == 0:
+            # Return dummy metrics for empty validation set
+            out['val'] = float('nan')
+            out['val_per_token_accuracy'] = {}
+            out['val_full_path_accuracy'] = 0.0
+            model.train()
+            return out
+        
         # Determine data and size
         # NOTE: data_source_raw is stored data WITHOUT pause tokens
         # We add pause tokens on-the-fly when needed
@@ -3257,7 +3270,8 @@ def train(config=None):
                     )
                     
                     # Update ReduceLROnPlateau scheduler if being used
-                    if lr_scheduler_obj is not None:
+                    # Skip if val_loss is None (no validation set)
+                    if lr_scheduler_obj is not None and val_loss is not None:
                         lr_scheduler_obj.step(val_loss, iter_num)
                         
                         # Early termination if LR has dropped below threshold (LR exhausted)
