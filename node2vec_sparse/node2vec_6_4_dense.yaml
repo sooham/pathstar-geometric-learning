@@ -62,7 +62,7 @@ parameters:
       # Deep models (n_layer=5): sweep MLP and LayerNorm (2x2 = 4 configs)
       - n_layer: [0]
         n_head: 1
-        n_embd: [10]
+        n_embd: [2]
         dropout: [0]
         embed_dropout: 0
         bias: [false]
@@ -111,7 +111,7 @@ parameters:
   eval_verbose_interval:
     value: 30
   live_display:
-    value: true
+    value: false
   live_display_update_interval:
     value: 10
   debug_masking:

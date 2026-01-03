@@ -111,7 +111,7 @@ parameters:
   eval_verbose_interval:
     value: 30
   live_display:
-    value: true
+    value: false
   live_display_update_interval:
     value: 10
   debug_masking:
