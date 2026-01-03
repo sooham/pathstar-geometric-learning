@@ -2068,7 +2068,7 @@ def train(config=None):
         user_config['wandb_run_name'] = custom_name
 
     # Validate vocab_size
-    assert user_config['randomize_vocab_size'] == 'auto' or (user_config['randomize_vocab_size'] == user_configraph_d'] * (user_config['graph_l'] - 1) + 1), \
+    assert user_config['randomize_vocab_size'] == 'auto' or (user_config['randomize_vocab_size'] == user_config['graph_d'] * (user_config['graph_l'] - 1) + 1), \
         f"randomize_vocab_size must be >= graph_d * (graph_l - 1) + 1"
     
     # Generate/load dataset
@@ -2315,7 +2315,7 @@ def train(config=None):
     
     # Initialize LR scheduler
     lr_scheduler_obj = initialize_lr_scheduler(
-        default_config, 
+        user_config, 
         warmup_iters, 
         lr_decay_iters, 
         console=user_config.get('console')
@@ -3135,7 +3135,7 @@ def train(config=None):
     
     
     # Setup live display
-    live_panel = LiveTrainingPanel(default_config)
+    live_panel = LiveTrainingPanel(user_config)
 
     
     # Initialize with first batch from combined dataset
@@ -3147,7 +3147,7 @@ def train(config=None):
         t0 = time.time()
         while True:
             # Set learning rate based on scheduler
-            lr = get_lr(iter_num, warmup_iters, lr_decay_iters, default_config, lr_scheduler_obj=lr_scheduler_obj)
+            lr = get_lr(iter_num, warmup_iters, lr_decay_iters, user_config, lr_scheduler_obj=lr_scheduler_obj)
             for param_group in optimizer.param_groups:
                 param_group['lr'] = lr
             
@@ -3193,7 +3193,7 @@ def train(config=None):
                     train_total_dataset_size = combined_size
                     val_loss = evaluate(
                         estimate_metrics,
-                        default_config,
+                        user_config,
                         meta,
                         iter_num,
                         lr,
@@ -3274,7 +3274,7 @@ def train(config=None):
                         original_checkpoint_filename = meta['checkpoint_filename']
                         meta['checkpoint_filename'] = lowest_energy_filename
                         
-                        checkpoint_model(model, meta, default_config, iter_num, mean_cosine_distance, 
+                        checkpoint_model(model, meta, user_config, iter_num, mean_cosine_distance, 
                                        loss_type='mean_cosine_distance', lr_scheduler_obj=lr_scheduler_obj)
                         
                         # Restore original checkpoint filename
@@ -3285,7 +3285,7 @@ def train(config=None):
                     if user_config.get('plot_cosine_similarity_matrix', False):
                         try:
                             cosine_similarity_plot_path = plot_pairwise_cosine_similarity_matrix(
-                                model, meta, iter_num, default_config,
+                                model, meta, iter_num, user_config,
                                 out_dir=user_config.get('out_dir', 'out')
                             )
                         except Exception as e:
@@ -3560,7 +3560,7 @@ def train(config=None):
                         save_checkpoint = True
                     
                     if save_checkpoint:
-                        checkpoint_model(model, meta, default_config, iter_num, lossf, loss_type='train', lr_scheduler_obj=lr_scheduler_obj)
+                        checkpoint_model(model, meta, user_config, iter_num, lossf, loss_type='train', lr_scheduler_obj=lr_scheduler_obj)
                 
                 # Log attention maps to wandb (expensive, so use separate interval)
                 if user_config['wandb_log'] and user_config.get('log_attention_maps', False):
