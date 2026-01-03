@@ -2341,8 +2341,14 @@ def train(config=None):
     meta['max_iters'] = max_iters
     meta['batches_per_epoch'] = batches_per_epoch
     
-    val_batch_size = min(num_holdout, train_batch_size)
-    eval_iters = int(np.ceil(VAL_DATASET_SIZE / val_batch_size))
+    # Handle validation batch size and iterations (when holdout_percentage=0)
+    if VAL_DATASET_SIZE > 0 and num_holdout > 0:
+        val_batch_size = min(num_holdout, train_batch_size)
+        eval_iters = int(np.ceil(VAL_DATASET_SIZE / val_batch_size))
+    else:
+        # No validation set (holdout_percentage=0)
+        val_batch_size = train_batch_size  # Dummy value (won't be used)
+        eval_iters = 0
     # Calculate learning rate schedule parameters
     warmup_iters = int(max_iters * user_config['warmup_frac'])
     lr_decay_iters = int(max_iters * user_config['lr_decay_frac'])
