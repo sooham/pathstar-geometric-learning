@@ -15,7 +15,7 @@ parameters:
   graph_vocab_size:
     value: '1max'
   graph_holdout_percentage:
-    value: 0
+    value: 0.1
   num_pause_tokens:
     values: [0] 
   use_undirected:
