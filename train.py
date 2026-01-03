@@ -93,6 +93,12 @@ def get_default_config():
         # Only applies to PATH tasks, not EDGE tasks.
         'p_autoregressive_substitution': 0.0,
         
+        # Sparsity & Importance Sampling
+        'sparsity': 0.0,  # Scalar or list: probability of path exclusion (0.0 = disabled)
+        'importance': 1.0,  # Scalar or list: sampling weight per path (1.0 = uniform)
+        'independent_sampling_of_edges': False,  # If True, each edge sampled independently
+        'independent_sampling_of_forward_reverse': False,  # Only matters when independent_sampling_of_edges=True
+        
         # Training parameters
         'gradient_accumulation_steps': 1,
         # If set, this caps the memory-based auto batch size.
@@ -223,7 +229,7 @@ def compute_per_token_loss_with_teacher_forcing(meta, logits, input, targets, to
     return per_token_losses
 
 
-def forward_with_scheduled_sampling(model, X, Y, meta, p_sub, label_smoothing=0.0, ctx=None):
+def forward_with_scheduled_sampling(model, X, Y, meta, p_sub, label_smoothing=0.0, ctx=None, importance_weights=None):
     """
     Forward pass with scheduled sampling (autoregressive substitution) for PATH tasks.
     
@@ -250,6 +256,7 @@ def forward_with_scheduled_sampling(model, X, Y, meta, p_sub, label_smoothing=0.
         p_sub: probability of using model's prediction instead of ground truth (0.0 to 1.0)
         label_smoothing: label smoothing for cross entropy loss
         ctx: autocast context manager (e.g., torch.amp.autocast)
+        importance_weights: optional tensor of shape (batch_size,) with importance weights
     
     Returns:
         logits: (batch, seq_len, vocab_size)
@@ -267,7 +274,7 @@ def forward_with_scheduled_sampling(model, X, Y, meta, p_sub, label_smoothing=0.
     # If no scheduled sampling, use standard teacher forcing
     if p_sub <= 0:
         with ctx:
-            return model(X, Y, label_smoothing=label_smoothing)
+            return model(X, Y, label_smoothing=label_smoothing, importance_weights=importance_weights)
     
     batch_size, seq_len = X.shape
     device = X.device
@@ -279,7 +286,7 @@ def forward_with_scheduled_sampling(model, X, Y, meta, p_sub, label_smoothing=0.
     # If no PATH sequences in batch, use standard teacher forcing
     if not is_path.any():
         with ctx:
-            return model(X, Y, label_smoothing=label_smoothing)
+            return model(X, Y, label_smoothing=label_smoothing, importance_weights=importance_weights)
     
     # Get context length for PATH tasks
     # Context = <PATH> + leaf + <PAUSE> tokens = 1 + 1 + num_pause_tokens
@@ -332,7 +339,7 @@ def forward_with_scheduled_sampling(model, X, Y, meta, p_sub, label_smoothing=0.
     
     # Final forward pass with modified input and masked targets to compute loss
     with ctx:
-        logits, loss = model(X_modified, Y_modified, label_smoothing=label_smoothing)
+        logits, loss = model(X_modified, Y_modified, label_smoothing=label_smoothing, importance_weights=importance_weights)
     
     return logits, loss
 
@@ -751,6 +758,15 @@ def set_wandb_name(config):
             ped_or_pet_label = 'Pd' if config['predict_direction_for_edge_task'] else 'Pe'
             wt_label = 'Wt' if config['weight_tying'] else ''
             wd_label = f"Wd{config['weight_decay']}" if config['weight_decay'] > 0 else ""
+            
+            # Add sparsity suffix if any path has non-zero sparsity
+            sparsity_val = config.get('sparsity', 0.0)
+            has_sparsity = False
+            if isinstance(sparsity_val, (list, np.ndarray)):
+                has_sparsity = any(s > 0 for s in sparsity_val)
+            elif isinstance(sparsity_val, (int, float)):
+                has_sparsity = sparsity_val > 0
+            sparsity_label = "_s" if has_sparsity else ""
 
             model_bias_label = "Bias" if config["bias"] else ""
             model_ln_label = "Ln" if config["use_layernorm"] else ""
@@ -774,6 +790,7 @@ def set_wandb_name(config):
                 f"{dir_label}"
                 f"{dt_label}"
                 f"{ptgt_label}"
+                f"{sparsity_label}"
                 "_"
                 f"L{config['n_layer']}"
                 f"E{config['n_embd']}"
@@ -1853,6 +1870,139 @@ def determine_dataset_in_device_size(device, device_type, paths_data, edges_data
     return 0
 
 
+def sample_active_sequences_for_epoch(paths_data, edges_data, paths_membership, edges_membership,
+                                      sparsity, independent_edges, independent_fwd_rev,
+                                      use_undirected, meta):
+    """
+    Sample which sequences to include in this epoch based on sparsity only.
+    
+    Implements hierarchical sampling logic:
+    - CASE 2 (independent_edges=False): One coin flip per path (independent_fwd_rev ignored)
+    - CASE 1B (independent_edges=True, independent_fwd_rev=False): Edges independent, forward/reverse coupled
+    - CASE 1A (independent_edges=True, independent_fwd_rev=True): Fully independent sampling
+    
+    Args:
+        paths_data: numpy array of path sequences
+        edges_data: numpy array of edge sequences
+        paths_membership: array of path indices for each path sequence
+        edges_membership: array of path indices for each edge sequence
+        sparsity: array of sparsity values per path (probability of exclusion)
+        independent_edges: if True, each edge sampled independently
+        independent_fwd_rev: if True and independent_edges=True, forward/reverse sampled independently
+        use_undirected: whether graph uses undirected edges
+        meta: metadata dict containing special tokens and config
+    
+    Returns:
+        active_indices: array of indices into combined dataset to use this epoch
+    """
+    d = len(sparsity)
+    
+    # Direct independent sampling: P_p = 1 - S_p
+    # No normalization needed - each path independently included with probability (1 - S_p)
+    probs = 1.0 - sparsity  # Shape: (d,) with values in [0, 1]
+    
+    # Check if all paths are excluded
+    if np.all(sparsity >= 1.0):
+        print("WARNING: All paths have sparsity >= 1.0 - no sequences will be sampled this epoch!")
+        return np.array([], dtype=np.int32)
+    
+    # Sample which paths are active this epoch
+    if independent_edges:
+        # CASE 1: Each edge/path sequence sampled independently
+        # For paths
+        active_paths_mask = np.random.rand(len(paths_data)) < probs[paths_membership]
+        
+        # For edges: independent_fwd_rev flag now matters
+        if independent_fwd_rev and use_undirected:
+            # CASE 1A: Each edge (including forward/reverse) sampled independently
+            active_edges_mask = np.random.rand(len(edges_data)) < probs[edges_membership]
+        else:
+            # CASE 1B: Edges sampled independently, but forward/reverse coupled
+            # Need to group edges by (u,v) pair and sample pairs together
+            active_edges_mask = _sample_coupled_fwd_rev_edges(edges_data, edges_membership, probs, meta)
+    else:
+        # CASE 2: All sequences from a path sampled together (coupled)
+        # One coin flip per path determines ALL edges from that path
+        # independent_fwd_rev is IGNORED here (irrelevant with one coin flip)
+        path_active = np.random.rand(d) < probs
+        
+        # Apply to paths
+        active_paths_mask = path_active[paths_membership]
+        
+        # Apply to edges (all edges from path p active if path_active[p] is True)
+        active_edges_mask = path_active[edges_membership]
+    
+    # Combine active paths and edges
+    active_path_indices = np.where(active_paths_mask)[0]
+    active_edge_indices = np.where(active_edges_mask)[0] + len(paths_data)  # Offset for combined array
+    
+    active_indices = np.concatenate([active_path_indices, active_edge_indices])
+    
+    return active_indices
+
+
+def _sample_coupled_fwd_rev_edges(edges_data, edges_membership, probs, meta):
+    """
+    Sample edges with forward/reverse coupling (CASE 1B).
+    When independent_edges=True but independent_fwd_rev=False,
+    each edge pair (u,v) and (v,u) is sampled together.
+    
+    Strategy:
+    1. Identify forward/reverse edge pairs in edges_data
+    2. Sample each pair with one coin flip
+    3. If pair is active, include both forward and reverse edges
+    
+    Args:
+        edges_data: numpy array of edge sequences
+        edges_membership: array of path indices for each edge
+        probs: sampling probabilities per path
+        meta: metadata dict containing special tokens
+    
+    Returns:
+        active_edges_mask: boolean array indicating which edges are active
+    """
+    num_edges = len(edges_data)
+    active_edges_mask = np.zeros(num_edges, dtype=bool)
+    
+    # Identify edge pairs by parsing edge sequences
+    # Edge format: [EDGE, u, direction, v] or [EDGE, u, v, direction]
+    # Group edges into pairs based on (u,v) sorted tuple
+    edge_pairs = {}  # Maps (min(u,v), max(u,v)) -> [idx1, idx2, ...]
+    
+    EDGE_token = meta['special_tokens']['EDGE']
+    
+    for idx in range(num_edges):
+        seq = edges_data[idx]
+        if seq[0] != EDGE_token:
+            continue
+        
+        # Extract u and v from sequence (depends on predict_direction_for_edge_task)
+        if meta.get('predict_direction_for_edge_task', False):
+            u, v = int(seq[1]), int(seq[2])
+        else:
+            # Format: [EDGE, u, direction, v]
+            u, v = int(seq[1]), int(seq[3])
+        
+        # Create canonical pair key
+        pair_key = (min(u, v), max(u, v))
+        if pair_key not in edge_pairs:
+            edge_pairs[pair_key] = []
+        edge_pairs[pair_key].append(idx)
+    
+    # Sample each pair
+    for pair_key, indices in edge_pairs.items():
+        path_idx = edges_membership[indices[0]]  # All edges in pair have same path membership
+        prob = probs[path_idx]
+        
+        # One coin flip for this pair
+        if np.random.rand() < prob:
+            # Activate all edges in this pair (both forward and reverse)
+            for idx in indices:
+                active_edges_mask[idx] = True
+    
+    return active_edges_mask
+
+
 def train(config=None):
     """
     Main training function that can be called standalone or by wandb sweep.
@@ -1920,6 +2070,8 @@ def train(config=None):
         l=default_config['graph_l'],
         randomize_vocab_size=default_config['randomize_vocab_size'],
         holdout_percentage=default_config['graph_holdout_percentage'],
+        sparsity=default_config.get('sparsity', 0.0),
+        importance=default_config.get('importance', 1.0),
     )
 
     # NOTE: num_pause_tokens is NOT passed here - pause tokens are added at runtime
@@ -1931,6 +2083,29 @@ def train(config=None):
     )
     
     meta, paths_data, edges_data, val_data = gen.load_dataset()
+    
+    # Load path membership arrays if they exist
+    data_dir = os.path.join('data', gen.dir_name)
+    paths_membership_path = os.path.join(data_dir, 'paths_membership.npy')
+    edges_membership_path = os.path.join(data_dir, 'edges_membership.npy')
+    
+    if os.path.exists(paths_membership_path):
+        paths_membership = np.load(paths_membership_path)
+        edges_membership = np.load(edges_membership_path)
+        val_membership = np.load(os.path.join(data_dir, 'val_membership.npy'))
+        meta['paths_membership'] = paths_membership
+        meta['edges_membership'] = edges_membership
+        meta['val_membership'] = val_membership
+        print(f"Loaded path membership arrays from {data_dir}")
+        print(f"  paths_membership: {paths_membership.shape}")
+        print(f"  edges_membership: {edges_membership.shape}")
+        print(f"  val_membership: {val_membership.shape}")
+    else:
+        # Backward compatibility: no sparsity sampling
+        paths_membership = None
+        edges_membership = None
+        val_membership = None
+        print("No path membership arrays found - sparsity sampling disabled (legacy dataset)")
     
     # num_pause_tokens is a RUNTIME config parameter (not stored in dataset)
     # Add it to meta for use throughout training
@@ -2177,6 +2352,26 @@ def train(config=None):
             name=default_config['wandb_run_name'],
             config={k: v for k, v in default_config.items() if k != 'console'}
         )
+    
+    # Log individual sparsity and importance values for each path to wandb
+    if default_config['wandb_log'] and wandb.run is not None:
+        sparsity_arr = np.array(meta.get('sparsity', [0.0] * meta['d']))
+        importance_arr = np.array(meta.get('importance', [1.0] * meta['d']))
+        
+        # Create dict with S_0, S_1, ..., S_{d-1} and I_0, I_1, ..., I_{d-1}
+        sparsity_importance_config = {}
+        for i in range(len(sparsity_arr)):
+            sparsity_importance_config[f'S_{i}'] = float(sparsity_arr[i])
+            sparsity_importance_config[f'I_{i}'] = float(importance_arr[i])
+        
+        # Update wandb config
+        wandb.config.update(sparsity_importance_config, allow_val_change=True)
+        
+        # Also log as summary for easier filtering
+        for key, val in sparsity_importance_config.items():
+            wandb.run.summary[key] = val
+        
+        print(f"Logged {len(sparsity_arr)} sparsity and importance values to wandb")
     
     # Init tracking variables
     if default_config['init_from'] == 'resume':
@@ -2428,9 +2623,54 @@ def train(config=None):
     edges_data_np = edges_data
     val_data_np = val_data
     
+    # Check if sparsity sampling is enabled
+    has_sparsity = meta.get('has_sparsity_sampling', False) and paths_membership is not None
+    if has_sparsity:
+        sparsity_arr = np.array(meta.get('sparsity', [0.0] * meta['d']))
+        importance_arr = np.array(meta.get('importance', [1.0] * meta['d']))
+        
+        # Normalize importance so mean = 1.0 (keeps loss scale similar)
+        importance_mean = importance_arr.mean()
+        if importance_mean > 0:
+            importance_arr_normalized = importance_arr / importance_mean
+        else:
+            importance_arr_normalized = np.ones_like(importance_arr)
+        
+        # Store normalized importance in metadata
+        meta['importance_normalized'] = importance_arr_normalized
+        
+        print(f"\n=== Sparsity Sampling Enabled ===")
+        print(f"  Sparsity range: [{sparsity_arr.min():.3f}, {sparsity_arr.max():.3f}]")
+        print(f"  Importance range: [{importance_arr.min():.3f}, {importance_arr.max():.3f}]")
+        print(f"  Importance normalized: mean={importance_arr_normalized.mean():.3f}, "
+              f"range=[{importance_arr_normalized.min():.3f}, {importance_arr_normalized.max():.3f}]")
+        print(f"  Independent edges: {default_config['independent_sampling_of_edges']}")
+        print(f"  Independent forward/reverse: {default_config['independent_sampling_of_forward_reverse']}")
+        print(f"=================================\n")
+    else:
+        # No sparsity - set uniform importance (still needed for loss computation)
+        importance_arr_normalized = np.ones(meta['d'])
+        meta['importance_normalized'] = importance_arr_normalized
+    
     # Initialize epoch indices for sampling without replacement
-    combined_epoch_indices = np.arange(combined_size)
-    # Perform initial shuffle once
+    if has_sparsity:
+        # Sample active sequences for first epoch
+        active_indices = sample_active_sequences_for_epoch(
+            paths_data, edges_data, paths_membership, edges_membership,
+            sparsity_arr,
+            default_config['independent_sampling_of_edges'],
+            default_config['independent_sampling_of_forward_reverse'],
+            default_config['use_undirected'],
+            meta
+        )
+        combined_epoch_indices = active_indices
+        combined_size_effective = len(active_indices)
+        print(f"Epoch 0: Sampled {combined_size_effective}/{combined_size} sequences ({100*combined_size_effective/combined_size:.1f}%)")
+    else:
+        combined_epoch_indices = np.arange(combined_size)
+        combined_size_effective = combined_size
+    
+    # Perform initial shuffle
     np.random.shuffle(combined_epoch_indices)
     
     combined_batch_idx = 0
@@ -2568,12 +2808,12 @@ def train(config=None):
         """Sample a batch from the combined or validation dataset"""
         nonlocal val_batch_idx, val_epoch_indices, combined_batch_idx, combined_epoch_indices
         nonlocal combined_epoch_completed, val_epoch_completed
-        nonlocal last_mask_debug_str
+        nonlocal last_mask_debug_str, combined_size_effective
 
         if dataset == 'combined':
             batch_idx = combined_batch_idx
             epoch_indices = combined_epoch_indices
-            dataset_size = combined_size
+            dataset_size = combined_size_effective if has_sparsity else combined_size
             X_source = combined_X
             Y_source = combined_Y
             epoch_completed = combined_epoch_completed
@@ -2598,6 +2838,20 @@ def train(config=None):
         # - This prevents constant reshuffling when batch_size >= dataset_size
         # - For dataset_size >> batch_size, this shuffles once per epoch (proper behavior)
         if batch_idx == 0 and epoch_completed:
+            if dataset == 'combined' and has_sparsity:
+                # Resample active sequences for new epoch
+                active_indices = sample_active_sequences_for_epoch(
+                    paths_data, edges_data, paths_membership, edges_membership,
+                    sparsity_arr,
+                    default_config['independent_sampling_of_edges'],
+                    default_config['independent_sampling_of_forward_reverse'],
+                    default_config['use_undirected'],
+                    meta
+                )
+                epoch_indices = active_indices
+                combined_size_effective = len(active_indices)
+                current_epoch = iter_num / meta['batches_per_epoch']
+                print(f"Epoch {int(current_epoch)}: Sampled {combined_size_effective}/{combined_size} sequences ({100*combined_size_effective/combined_size:.1f}%)")
             np.random.shuffle(epoch_indices)
         
         # Get batch indices
@@ -2616,6 +2870,7 @@ def train(config=None):
         if dataset == 'combined':
             combined_batch_idx = batch_idx
             combined_epoch_completed = epoch_completed
+            combined_epoch_indices = epoch_indices  # Update with potentially resampled indices
         elif dataset == 'val':
             val_batch_idx = batch_idx
             val_epoch_completed = epoch_completed
@@ -2647,7 +2902,14 @@ def train(config=None):
                 y = y_after
             else:
                 y = apply_task_specific_target_mask(x, y, 'paths')
-            return x, y
+            
+            # Get path membership for this batch (if available)
+            if val_membership is not None:
+                batch_path_membership = val_membership[batch_seq_indices]
+            else:
+                batch_path_membership = None
+            
+            return x, y, batch_path_membership
         
         # Standard training batch retrieval
         # Extract sequences (from GPU if available, otherwise from CPU and transfer)
@@ -2678,7 +2940,25 @@ def train(config=None):
         else:
             y = apply_task_specific_target_mask(x, y, mask_dataset_type)
         
-        return x, y
+        # Get path membership for this batch (if available)
+        if paths_membership is not None and edges_membership is not None:
+            # Determine path membership for each sample
+            # batch_seq_indices indexes into epoch_indices (which are indices into combined data)
+            # For combined: indices < len(paths_data) are paths, >= are edges
+            batch_path_membership = []
+            for idx in batch_seq_indices:
+                if idx < len(paths_data):
+                    # This is a path sequence
+                    batch_path_membership.append(paths_membership[idx])
+                else:
+                    # This is an edge sequence
+                    edge_idx = idx - len(paths_data)
+                    batch_path_membership.append(edges_membership[edge_idx])
+            batch_path_membership = np.array(batch_path_membership, dtype=np.int32)
+        else:
+            batch_path_membership = None
+        
+        return x, y, batch_path_membership
     
     @torch.no_grad()
     def estimate_metrics(split, print_samples=False):
@@ -2709,7 +2989,7 @@ def train(config=None):
         
         for k in range(num_iters):
             if split == 'val':
-                X, Y = get_batch('val')
+                X, Y, batch_path_membership = get_batch('val')
             else:
                 # Manual sampling for training paths to ensure we only evaluate on paths
                 # (not edges) even though training uses combined dataset
@@ -2725,9 +3005,25 @@ def train(config=None):
                 if pause_token_id is not None: Y[Y == pause_token_id] = -1
                 # Training metrics here are for paths; apply path-specific masking.
                 Y = apply_task_specific_target_mask(X, Y, 'paths')
+                
+                # Get path membership for manual samples (if available)
+                if paths_membership is not None:
+                    batch_path_membership = paths_membership[idx]
+                else:
+                    batch_path_membership = None
+            
+            # Compute importance weights (if importance weighting enabled)
+            if batch_path_membership is not None and (has_sparsity or not np.allclose(meta['importance_normalized'], 1.0)):
+                importance_weights = torch.tensor(
+                    meta['importance_normalized'][batch_path_membership],
+                    dtype=torch.float32,
+                    device=device
+                )
+            else:
+                importance_weights = None
 
             with ctx:
-                logits, loss = model(X, Y, label_smoothing=default_config['label_smoothing'])
+                logits, loss = model(X, Y, label_smoothing=default_config['label_smoothing'], importance_weights=importance_weights)
             batch_losses[k] = loss.item()
             
             per_token_losses_in_batch = compute_per_token_loss_with_teacher_forcing(meta, logits, X, Y, range(1, graph_length + 1), task_type='path')
@@ -2777,7 +3073,7 @@ def train(config=None):
     running_loss_count = 0
 
     # Initialize with first batch from combined dataset
-    X, Y = get_batch('combined')
+    X, Y, batch_path_membership = get_batch('combined')
     
 
     with live_panel.context:
@@ -2977,6 +3273,16 @@ def train(config=None):
             last_activation_stats = None
             last_logits = None  # For NaN debugging
             
+            # Compute importance weights for this batch (if importance weighting enabled)
+            if batch_path_membership is not None and (has_sparsity or not np.allclose(meta['importance_normalized'], 1.0)):
+                importance_weights = torch.tensor(
+                    meta['importance_normalized'][batch_path_membership],
+                    dtype=torch.float32,
+                    device=device
+                )
+            else:
+                importance_weights = None
+            
             for micro_step in range(steps):
                 # Use scheduled sampling for PATH tasks if p_autoregressive_substitution > 0
                 p_sub = default_config.get('p_autoregressive_substitution', 0.0)
@@ -2986,7 +3292,8 @@ def train(config=None):
                     logits_step, loss = forward_with_scheduled_sampling(
                         model, X, Y, meta, p_sub,
                         label_smoothing=default_config['label_smoothing'],
-                        ctx=ctx
+                        ctx=ctx,
+                        importance_weights=importance_weights
                     )
                     if micro_step == steps - 1:
                         last_logits = logits_step
@@ -2996,7 +3303,8 @@ def train(config=None):
                     should_track = track_stats and (micro_step == steps - 1)
                     with ctx:
                         result = model(X, Y, label_smoothing=default_config['label_smoothing'], 
-                                       track_activation_stats=should_track)
+                                       track_activation_stats=should_track,
+                                       importance_weights=importance_weights)
                         if should_track:
                             logits_step, loss, last_activation_stats = result
                         else:
@@ -3042,7 +3350,7 @@ def train(config=None):
                     X, Y = X_next, Y_next
             
             # Get batch for next iteration
-            X, Y = get_batch('combined')
+            X, Y, batch_path_membership = get_batch('combined')
             
             # Clip gradients
             if default_config['grad_clip'] != 0.0:

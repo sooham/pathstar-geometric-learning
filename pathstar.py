@@ -77,7 +77,8 @@ from filelock import FileLock
 
 
 class InWeightsPathStar:
-    def __init__(self, d=5, l=5, randomize_vocab_size=None, holdout_percentage=0.0):
+    def __init__(self, d=5, l=5, randomize_vocab_size=None, holdout_percentage=0.0, 
+                 sparsity=None, importance=None):
         """
         Generator instance for a pathstar graph with d spokes
         of length l.
@@ -87,11 +88,42 @@ class InWeightsPathStar:
             l: Length of each path (number of nodes from root to leaf)
             randomize_vocab_size: Optional vocabulary mapping size we want to randomize vertices with 
             holdout_percentage: Percentage of paths to hold out (0.0 to 1.0)
+            sparsity: Scalar or array of sparsity values (probability of exclusion) per path. 
+                      None or 0.0 = disabled. Range: [0, 1]
+            importance: Scalar or array of importance values (sampling weight) per path.
+                        None or 1.0 = uniform. Range: [0, ∞)
         """
 
         self.d = d
         self.l = l
         self.randomize_vocab_size = randomize_vocab_size
+        
+        # Setup sparsity (scalar or per-path array)
+        if sparsity is None or sparsity == 0.0:
+            self.sparsity = np.zeros(d)  # Disabled
+        elif isinstance(sparsity, (int, float)):
+            self.sparsity = np.full(d, float(sparsity))
+        else:
+            self.sparsity = np.array(sparsity, dtype=np.float32)
+            assert len(self.sparsity) == d, f"Sparsity array length {len(self.sparsity)} != d={d}"
+        
+        # Setup importance (scalar or per-path array)
+        if importance is None or importance == 1.0:
+            self.importance = np.ones(d)  # Uniform
+        elif isinstance(importance, (int, float)):
+            self.importance = np.full(d, float(importance))
+        else:
+            self.importance = np.array(importance, dtype=np.float32)
+            assert len(self.importance) == d, f"Importance array length {len(self.importance)} != d={d}"
+        
+        # Validate ranges
+        assert np.all((self.sparsity >= 0) & (self.sparsity <= 1)), "Sparsity must be in [0, 1]"
+        assert np.all(self.importance >= 0), "Importance must be non-negative"
+        
+        # Warn if all weights are zero
+        weights = self.importance * (1.0 - self.sparsity)
+        if np.sum(weights) == 0:
+            print("WARNING: All paths have zero sampling weight (sparsity=1 or importance=0). No sequences will be sampled!")
 
         self.adj_list = {}
         self.num_vertices = d * (l-1) + 1
@@ -219,6 +251,35 @@ class InWeightsPathStar:
         # Convert to lists for easier sampling
         self.holdout_leaves = list(self.holdout_leaves)
         self.train_leaves = list(self.train_leaves)
+    
+    def _get_path_index_for_edge(self, u, v):
+        """
+        Determine which path (spoke index) an edge belongs to.
+        
+        Args:
+            u: source node
+            v: destination node
+        
+        Returns:
+            path index in [0, d-1]
+        """
+        # Root is connected to all paths
+        if u == self.v_root or v == self.v_root:
+            # Determine which spoke based on the non-root vertex
+            node = v if u == self.v_root else u
+            # Find which path this node belongs to
+            for path_idx in range(self.d):
+                if node in self.paths_by_leaf[self.v_leaf[path_idx]]:
+                    return path_idx
+            raise ValueError(f"Node {node} not found in any path")
+        
+        # Non-root edge: find which path it belongs to
+        for path_idx, leaf in enumerate(self.v_leaf):
+            path = self.paths_by_leaf[leaf]
+            if u in path and v in path:
+                return path_idx
+        
+        raise ValueError(f"Edge ({u}, {v}) not found in any path")
     
     def __str__(self):
         """
@@ -352,9 +413,13 @@ class InWeightsPathStar:
                 - If False (predict endpoint), the format is [EDGE] u direction v
         Returns:
             edges: shape (size, 3+A) where A == 1 if use_directional_tokens is true
+            edge_path_membership: array of path indices for each edge
         """
+        # Track which path each edge belongs to
+        edge_path_membership = []
+        
         # Collect all edges from the adjacency list
-        def add_edge(u, v):
+        def add_edge(u, v, path_idx):
             # assumption u is before v from root
             # first edge (u, v)
             if use_directional_tokens:
@@ -364,6 +429,7 @@ class InWeightsPathStar:
                     edges.append([u, self.SPECIAL_TOKENS['GT'], v]) # GT means  away from root
             else:
                 edges.append([u, v])
+            edge_path_membership.append(path_idx)
 
             if undirected: # add the reverse edge (v, u)
                 if use_directional_tokens:
@@ -373,11 +439,14 @@ class InWeightsPathStar:
                         edges.append([v, self.SPECIAL_TOKENS['LT'], u]) # LT means  toward root
                 else:
                     edges.append([v, u])
+                edge_path_membership.append(path_idx)
 
         edges = []
         for u in self.adj_list:
             for v in self.adj_list[u]:
-                add_edge(u, v)
+                # Determine which path this edge belongs to
+                path_idx = self._get_path_index_for_edge(u, v)
+                add_edge(u, v, path_idx)
         
         # Validate size
         max_edges = len(edges)
@@ -388,9 +457,11 @@ class InWeightsPathStar:
                 + (f" or {2 * self.total_edges} undirected edges." if undirected else ".")
             )
         
-        # Shuffle edges and take the first k
-        random.shuffle(edges)
-        sampled_edges = edges[:size]
+        # Shuffle edges and membership together to maintain correspondence
+        combined = list(zip(edges, edge_path_membership))
+        random.shuffle(combined)
+        sampled_combined = combined[:size]
+        sampled_edges, sampled_membership = zip(*sampled_combined)
         
         # Return as torch tensor
         edges = torch.tensor(sampled_edges, dtype=torch.long)
@@ -400,7 +471,10 @@ class InWeightsPathStar:
         edge_task_tokens = torch.full((size, 1), self.SPECIAL_TOKENS['EDGE'], dtype=torch.long)
         edge_sequences = torch.cat([edge_task_tokens, edges], dim=1)
         
-        return edge_sequences
+        # Convert membership to numpy array
+        sampled_membership = np.array(sampled_membership, dtype=np.int32)
+        
+        return edge_sequences, sampled_membership
 
     def _generate_path_prediction_training_set(self, size, split, use_directional_tokens_in_path=False):
         """
@@ -427,6 +501,7 @@ class InWeightsPathStar:
                         1 + 1(leaf) + l(path vertices)
                       If use_directional_tokens_in_path=True, sequence length is:
                         1 + 1(leaf) + (2*l - 1)  (root plus GT+vertex for each edge)
+            path_membership: numpy array of path indices for each sequence
         """
         # Determine which leaf nodes to sample from
         if split == 'val':
@@ -455,6 +530,7 @@ class InWeightsPathStar:
         sampled_leaves = random.sample(leaf_nodes, size)
         
         sequences = []
+        path_membership = []
         for leaf in sampled_leaves:
             # Get the path from root to leaf
             path = self.paths_by_leaf[leaf]
@@ -473,11 +549,16 @@ class InWeightsPathStar:
             # Format: [<PATH>, leaf, root, n_2, ..., n_ℓ]
             sequence = [self.SPECIAL_TOKENS['PATH'], leaf] + path_tokens
             sequences.append(sequence)
+            
+            # Track which path this sequence belongs to
+            path_idx = self.v_leaf.index(leaf)
+            path_membership.append(path_idx)
         
         # Convert to tensor
         sequences = torch.tensor(sequences, dtype=torch.long)
+        path_membership = np.array(path_membership, dtype=np.int32)
         
-        return sequences
+        return sequences, path_membership
     
     def prepare(self, output_dir='./data',
                 use_undirected=True, use_directional_tokens=True,
@@ -569,14 +650,14 @@ class InWeightsPathStar:
         
         # Generate path sequences for training (uses self.train_leaves)
         # NOTE: No pause tokens - they are added at runtime
-        train_path_sequences = self._generate_path_prediction_training_set(
+        train_path_sequences, train_path_membership = self._generate_path_prediction_training_set(
             size=num_train_path_samples,
             split='train',
             use_directional_tokens_in_path=use_directional_tokens_in_path,
         )
         
         # Generate edge sequences
-        edge_sequences = self._generate_edge_memorization_training_set(
+        edge_sequences, edge_path_membership = self._generate_edge_memorization_training_set(
             size=num_edge_samples,
             undirected=use_undirected,
             use_directional_tokens=use_directional_tokens,
@@ -599,7 +680,7 @@ class InWeightsPathStar:
         # Generate validation set: only holdout paths (no edges)
         # NOTE: No pause tokens - they are added at runtime
         print("Generating validation set (holdout paths only, no edges)...")
-        val_sequences = self._generate_path_prediction_training_set(
+        val_sequences, val_path_membership = self._generate_path_prediction_training_set(
             size=num_val_path_samples,
             split='val',
             use_directional_tokens_in_path=use_directional_tokens_in_path,
@@ -633,6 +714,15 @@ class InWeightsPathStar:
         val_data = val_sequences.numpy().astype(np.uint16)
         val_data.tofile(val_path)
         print(f"  Saved {val_data.shape[0]} sequences of length {val_data.shape[1]}")
+        
+        # Save path membership arrays
+        print(f"\nSaving path membership arrays...")
+        np.save(os.path.join(full_output_dir, 'paths_membership.npy'), train_path_membership)
+        print(f"  Saved paths_membership.npy: {train_path_membership.shape}")
+        np.save(os.path.join(full_output_dir, 'edges_membership.npy'), edge_path_membership)
+        print(f"  Saved edges_membership.npy: {edge_path_membership.shape}")
+        np.save(os.path.join(full_output_dir, 'val_membership.npy'), val_path_membership)
+        print(f"  Saved val_membership.npy: {val_path_membership.shape}")
         
         # Create vocabulary mappings
         # Vocab includes all vertices plus the pause token, pad token, and task tokens
@@ -722,6 +812,11 @@ class InWeightsPathStar:
             'pause_token': self.SPECIAL_TOKENS["PAUSE"],
             'pad_token': self.SPECIAL_TOKENS["PAD"],
             'special_tokens': self.SPECIAL_TOKENS,
+            
+            # Sparsity and importance for weighted sampling
+            'sparsity': self.sparsity.tolist(),
+            'importance': self.importance.tolist(),
+            'has_sparsity_sampling': not np.allclose(self.sparsity, 0.0),
 
             # NOTE: num_pause_tokens is NOT stored - it's a runtime config parameter
             'root_vertex': self.v_root,

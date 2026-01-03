@@ -306,13 +306,14 @@ class GPT(nn.Module):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt((2 if self.config.use_mlp else 1) * self.config.n_layer))
 
 
-    def forward(self, idx, targets=None, label_smoothing=0.0, track_activation_stats=False):
+    def forward(self, idx, targets=None, label_smoothing=0.0, track_activation_stats=False, importance_weights=None):
         """
         Assumption: targets are already shifted to account for the correct prediction of 
         of target[i] based on idx[0:i]
 
         idx: tokenized vector of shape (batch, sequence_length)
         track_activation_stats: if True, also return dict with mean/variance of activations per layer
+        importance_weights: optional tensor of shape (batch_size,) with importance weights for each sample
         
         Returns:
             logits, loss  (if track_activation_stats=False)
@@ -361,11 +362,31 @@ class GPT(nn.Module):
             
             # Compute loss with optional neighborhood-based KL divergence for EDGE tasks
             if self.use_neighborhood_loss and self.meta is not None:
-                loss = self._compute_mixed_loss(logits, targets, idx, label_smoothing)
+                loss = self._compute_mixed_loss(logits, targets, idx, label_smoothing, importance_weights)
             else:
                 # Standard cross-entropy loss for all tasks
-                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), 
-                                       ignore_index=-1, label_smoothing=label_smoothing)
+                if importance_weights is not None:
+                    # Compute per-sample loss, weight by importance, then average
+                    loss = F.cross_entropy(
+                        logits.view(-1, logits.size(-1)), 
+                        targets.view(-1),
+                        ignore_index=-1,
+                        label_smoothing=label_smoothing,
+                        reduction='none'
+                    )
+                    # Reshape to (batch_size, seq_len) and sum over sequence
+                    loss_per_sample = loss.view(targets.size(0), targets.size(1)).sum(dim=1)  # (batch_size,)
+                    # Apply importance weighting and average
+                    loss = (loss_per_sample * importance_weights).mean()
+                else:
+                    # Standard scalar loss computation
+                    loss = F.cross_entropy(
+                        logits.view(-1, logits.size(-1)), 
+                        targets.view(-1),
+                        ignore_index=-1,
+                        label_smoothing=label_smoothing,
+                        reduction='mean'
+                    )
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
@@ -375,7 +396,7 @@ class GPT(nn.Module):
             return logits, loss, activation_stats
         return logits, loss
 
-    def _compute_mixed_loss(self, logits, targets, idx, label_smoothing):
+    def _compute_mixed_loss(self, logits, targets, idx, label_smoothing, importance_weights=None):
         """
         Compute mixed loss: KL divergence for EDGE tasks, cross-entropy for PATH tasks.
         
@@ -387,6 +408,7 @@ class GPT(nn.Module):
             targets: (batch, seq_len) - target tokens (with -1 for masked positions)
             idx: (batch, seq_len) - input tokens
             label_smoothing: label smoothing factor for cross-entropy
+            importance_weights: optional tensor of shape (batch_size,) with importance weights
             
         Returns:
             loss: scalar loss tensor
@@ -461,6 +483,11 @@ class GPT(nn.Module):
             log_p_uniform = torch.log(inv_neighborhood_sizes)  # (num_edge_samples,)
             kl_losses = log_p_uniform - inv_neighborhood_sizes * sum_log_q  # (num_edge_samples,)
             
+            # Apply importance weighting if provided
+            if importance_weights is not None:
+                edge_importance = importance_weights[edge_indices]  # (num_edge_samples,)
+                kl_losses = kl_losses * edge_importance
+            
             # Aggregate losses
             total_loss += kl_losses.sum()
             loss_count += len(edge_indices)
@@ -473,21 +500,47 @@ class GPT(nn.Module):
             path_logits = logits[path_indices]  # Shape: (num_path_samples, seq_len, vocab_size)
             path_targets = targets[path_indices]  # Shape: (num_path_samples, seq_len)
             
-            # Flatten and compute cross-entropy
-            path_loss = F.cross_entropy(
-                path_logits.reshape(-1, path_logits.size(-1)),
-                path_targets.reshape(-1),
-                ignore_index=-1,
-                label_smoothing=label_smoothing,
-                reduction='sum'
-            )
-            
-            # Count non-masked tokens
-            path_loss_count = (path_targets != -1).sum().item()
-            
-            if path_loss_count > 0:
-                total_loss += path_loss
-                loss_count += path_loss_count
+            if importance_weights is not None:
+                # Compute per-sample loss with importance weighting
+                path_loss_per_token = F.cross_entropy(
+                    path_logits.reshape(-1, path_logits.size(-1)),
+                    path_targets.reshape(-1),
+                    ignore_index=-1,
+                    label_smoothing=label_smoothing,
+                    reduction='none'
+                )
+                # Reshape to (num_path_samples, seq_len)
+                path_loss_per_token = path_loss_per_token.view(path_targets.size(0), path_targets.size(1))
+                
+                # Sum over sequence for each sample
+                path_loss_per_sample = path_loss_per_token.sum(dim=1)  # (num_path_samples,)
+                
+                # Apply importance weighting
+                path_importance = importance_weights[path_indices]  # (num_path_samples,)
+                path_loss_weighted = path_loss_per_sample * path_importance
+                
+                # Count non-masked tokens
+                path_loss_count = (path_targets != -1).sum().item()
+                
+                if path_loss_count > 0:
+                    total_loss += path_loss_weighted.sum()
+                    loss_count += path_loss_count
+            else:
+                # Standard unweighted loss
+                path_loss = F.cross_entropy(
+                    path_logits.reshape(-1, path_logits.size(-1)),
+                    path_targets.reshape(-1),
+                    ignore_index=-1,
+                    label_smoothing=label_smoothing,
+                    reduction='sum'
+                )
+                
+                # Count non-masked tokens
+                path_loss_count = (path_targets != -1).sum().item()
+                
+                if path_loss_count > 0:
+                    total_loss += path_loss
+                    loss_count += path_loss_count
         
         # Return average loss
         if loss_count > 0:
