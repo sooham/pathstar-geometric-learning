@@ -2018,38 +2018,38 @@ def train(config=None):
         config: Optional dict of configuration overrides. If None, uses defaults and command-line args.
     """
 
-    default_config = get_default_config()
+    user_config = get_default_config()
 
     # Clear GPU memory at the start of training run
     clear_gpu_memory()
     
     # If config is provided (e.g., from wandb sweep), merge it with defaults
     if config is not None:
-        default_config.update(config)
+        user_config.update(config)
     
     # Store config in globals for configurator.py compatibility
-    for k, v in default_config.items():
+    for k, v in user_config.items():
         globals()[k] = v
     
     # Execute configurator.py if running standalone (not in sweep mode)
     if config is None and os.path.exists('configurator.py'):
         # Only execute configurator if not in wandb sweep mode
-        config_keys = list(default_config.keys())
+        config_keys = list(user_config.keys())
         exec(open('configurator.py').read(), globals())
-        # Update default_config with any overrides from configurator
+        # Update user_config with any overrides from configurator
         for k in config_keys:
-            default_config[k] = globals()[k]
+            user_config[k] = globals()[k]
 
     # Validate config
-    validate_config(default_config)
+    validate_config(user_config)
     
     # Set random seed and backend configurations
     random.seed(config['seed'])
     torch.manual_seed(config['seed'])
     np.random.seed(config['seed'])
     if torch.cuda.is_available():
-        torch.cuda.manual_seed(default_config['seed'])
-        torch.cuda.manual_seed_all(default_config['seed'])  # for multi-GPU
+        torch.cuda.manual_seed(user_config['seed'])
+        torch.cuda.manual_seed_all(user_config['seed'])  # for multi-GPU
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
         torch.backends.cuda.enable_flash_sdp(False)
@@ -2057,36 +2057,34 @@ def train(config=None):
 
     
     
-    if default_config['init_from'] == 'resume':
-        custom_name = default_config['wandb_run_name']
+    if user_config['init_from'] == 'resume':
+        custom_name = user_config['wandb_run_name']
         wandb.run.name = custom_name
         print(f"Resuming wandb run: {custom_name}")
     else:
-        custom_name = set_wandb_name(default_config)
+        custom_name = set_wandb_name(user_config)
 
-    if default_config['wandb_run_name'] is None:
-        default_config['wandb_run_name'] = custom_name
+    if user_config['wandb_run_name'] is None:
+        user_config['wandb_run_name'] = custom_name
 
     # Validate vocab_size
-    assert default_config['randomize_vocab_size'] == 'auto' or (default_config['randomize_vocab_size'] == default_config['graph_d'] * (default_config['graph_l'] - 1) + 1), \
+    assert user_config['randomize_vocab_size'] == 'auto' or (user_config['randomize_vocab_size'] == user_configraph_d'] * (user_config['graph_l'] - 1) + 1), \
         f"randomize_vocab_size must be >= graph_d * (graph_l - 1) + 1"
     
     # Generate/load dataset
     gen = InWeightsPathStar(
-        d=default_config['graph_d'],
-        l=default_config['graph_l'],
-        randomize_vocab_size=default_config['randomize_vocab_size'],
-        holdout_percentage=default_config['graph_holdout_percentage'],
-        sparsity=default_config.get('sparsity', 0.0),
-        importance=default_config.get('importance', 1.0),
+        d=user_config['graph_d'],
+        l=user_config['graph_l'],
+        randomize_vocab_size=user_config['randomize_vocab_size'],
+        holdout_percentage=user_config['graph_holdout_percentage']
     )
 
     # NOTE: num_pause_tokens is NOT passed here - pause tokens are added at runtime
     gen.generate_dataset_if_needed(
-        use_undirected=default_config['use_undirected'],
-        use_directional_tokens=default_config['use_directional_tokens'],
-        predict_direction_for_edge_task=default_config['predict_direction_for_edge_task'],
-        use_directional_tokens_in_path=default_config.get('use_directional_tokens_in_path', False),
+        use_undirected=user_config['use_undirected'],
+        use_directional_tokens=user_config['use_directional_tokens'],
+        predict_direction_for_edge_task=user_config['predict_direction_for_edge_task'],
+        use_directional_tokens_in_path=user_config.get('use_directional_tokens_in_path', False),
     )
     
     meta, paths_data, edges_data, val_data = gen.load_dataset()
@@ -2116,7 +2114,7 @@ def train(config=None):
     
     # num_pause_tokens is a RUNTIME config parameter (not stored in dataset)
     # Add it to meta for use throughout training
-    num_pause_tokens = default_config['num_pause_tokens']
+    num_pause_tokens = user_config['num_pause_tokens']
     meta['num_pause_tokens'] = num_pause_tokens
     
     # Update block_size and path_context_length to include pause tokens
@@ -2131,7 +2129,7 @@ def train(config=None):
     print(f"  path_context_length (with pause): {meta['path_context_length']}")
     
     # Only compute token colors if live display is enabled (saves compute)
-    if default_config['live_display']:
+    if user_config['live_display']:
         print("Precomputing token colors...")
         token_colors, RESET = compute_token_colors(paths_data, val_data, meta)
         meta['token_colors'] = token_colors
@@ -2154,7 +2152,7 @@ def train(config=None):
     edges_size = meta['EDGES_DATASET_SIZE']
     VAL_DATASET_SIZE = meta['VAL_DATASET_SIZE']
     
-    if default_config['edge_only']:
+    if user_config['edge_only']:
         print(f"Training dataset composition (EDGE ONLY):")
         print(f"  Edges: {edges_size}")
         print(f"  Paths: SKIPPED (edge_only=True)")
@@ -2164,14 +2162,14 @@ def train(config=None):
         print(f"Training dataset composition (INTERLEAVED):")
         print(f"  Paths (original): {paths_size}")
         print(f"  Edges: {edges_size}")
-        if default_config['balance_interleaved_datasets'] and paths_size < edges_size:
+        if user_config['balance_interleaved_datasets'] and paths_size < edges_size:
             print(f"  Paths (after balancing): {edges_size}")
             print(f"  Total Combined: {edges_size * 2} samples (50% paths, 50% edges)")
         else:
             print(f"  Total Combined: {paths_size + edges_size} samples ({paths_size} paths, {edges_size} edges)")
     
     # Log scheduled sampling configuration
-    p_sub = default_config.get('p_autoregressive_substitution', 0.0)
+    p_sub = user_config.get('p_autoregressive_substitution', 0.0)
     if p_sub > 0:
         print(f"\n=== Scheduled Sampling (Autoregressive Substitution) ===")
         print(f"  p_autoregressive_substitution: {p_sub}")
@@ -2182,24 +2180,24 @@ def train(config=None):
         print(f"=========================================================\n")
 
     # Auto-detect device
-    device, device_type = detect_device(default_config)
+    device, device_type = detect_device(user_config)
     
     # Enable PyTorch anomaly detection if requested (slow but thorough NaN debugging)
-    if default_config.get('detect_anomaly', False):
+    if user_config.get('detect_anomaly', False):
         torch.autograd.set_detect_anomaly(True)
         LiveTrainingPanel.CONSOLE.print("[yellow]⚠️  Anomaly detection ENABLED - training will be slower but NaN sources will be caught[/yellow]")
     
 
-    ptdtype, dtype = set_dtype(default_config)
+    ptdtype, dtype = set_dtype(user_config)
 
     ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
     
-    os.makedirs(default_config['out_dir'], exist_ok=True)
+    os.makedirs(user_config['out_dir'], exist_ok=True)
     checkpoint_filename = f'ckpt_{custom_name}.pt' if custom_name else "ckpt.pt"
     meta["checkpoint_filename"] = checkpoint_filename
     print(f"Checkpoint will be saved as: {checkpoint_filename}")
 
-    model, model_args, checkpoint, iter_num = initalize_model(device, meta, default_config, checkpoint_filename)
+    model, model_args, checkpoint, iter_num = initalize_model(device, meta, user_config, checkpoint_filename)
     meta['model_args'] = model_args
     meta['model'] = model
 
@@ -2216,7 +2214,7 @@ def train(config=None):
     val_data = val_data.reshape(VAL_DATASET_SIZE, val_seq_length)
 
     # Combine datasets for training
-    if default_config['edge_only']:
+    if user_config['edge_only']:
         # Edge-only mode: use only edges, no paths
         # Make a copy to avoid read-only array issues during shuffling
         combined_data = edges_data.copy()
@@ -2227,7 +2225,7 @@ def train(config=None):
         # Optionally balance datasets by upsampling paths to match edges
         # Note: edges_size >= paths_size always holds for PathStar graphs
         # Uses deterministic duplication (tiling) rather than random sampling to avoid noise
-        if default_config['balance_interleaved_datasets'] and paths_size < edges_size:
+        if user_config['balance_interleaved_datasets'] and paths_size < edges_size:
             # Tile the paths dataset: repeat full copies then take remainder from start
             num_full_copies = edges_size // paths_size
             remainder = edges_size % paths_size
@@ -2238,7 +2236,7 @@ def train(config=None):
             ])
             paths_data_balanced = paths_data[indices]
         else:
-            if not default_config['balance_interleaved_datasets']:
+            if not user_config['balance_interleaved_datasets']:
                 print(f"Skipping dataset balancing (paths: {paths_size}, edges: {edges_size})")
             paths_data_balanced = paths_data
 
@@ -2251,7 +2249,7 @@ def train(config=None):
     
     # Calculate memory for combined dataset
     # In edge_only mode, we don't load validation data to GPU
-    if default_config['edge_only']:
+    if user_config['edge_only']:
         dataset_reserved_memory = determine_dataset_in_device_size(device, device_type, combined_data, np.array([]), np.array([]))
     else:
         dataset_reserved_memory = determine_dataset_in_device_size(device, device_type, combined_data, np.array([]), val_data)
@@ -2261,7 +2259,7 @@ def train(config=None):
 
     train_batch_size = calculate_optimal_batch_size_for_training(
         model, meta['block_size'], meta['randomize_vocab_size'], device, dtype,
-        default_config['gradient_accumulation_steps'],
+        user_config['gradient_accumulation_steps'],
         reserved_memory=dataset_reserved_memory,
         target_batch_size=target_bs_ref
     )
@@ -2269,7 +2267,7 @@ def train(config=None):
     # Optional user cap on training microbatch size (safer than overriding upward).
     # If you want a smaller batch to fit memory or to change optimization dynamics,
     # set `batch_size` in configurator.py or a wandb sweep config.
-    user_batch_size = default_config.get('batch_size', None)
+    user_batch_size = user_config.get('batch_size', None)
     if user_batch_size is not None:
         try:
             user_batch_size = int(user_batch_size)
@@ -2288,15 +2286,15 @@ def train(config=None):
                     train_batch_size = user_batch_size
                 print(
                     f"Training microbatch size: {train_batch_size} "
-                    f"(effective: {train_batch_size * default_config['gradient_accumulation_steps']})"
+                    f"(effective: {train_batch_size * user_config['gradient_accumulation_steps']})"
                 )
     
     # Calculate training iteration parameters
     VAL_DATASET_SIZE = meta['VAL_DATASET_SIZE']
     
     # In interleaved mode, epoch is 1 pass over combined dataset
-    batches_per_epoch = int(np.ceil(combined_size / (train_batch_size * default_config['gradient_accumulation_steps'])))
-    max_iters = default_config['epochs'] * batches_per_epoch
+    batches_per_epoch = int(np.ceil(combined_size / (train_batch_size * user_config['gradient_accumulation_steps'])))
+    max_iters = user_config['epochs'] * batches_per_epoch
     
     print(f"\n=== Training Schedule (Interleaved) ===")
     print(f"Total samples: {combined_size}")
@@ -2310,8 +2308,8 @@ def train(config=None):
     val_batch_size = min(num_holdout, train_batch_size)
     eval_iters = int(np.ceil(VAL_DATASET_SIZE / val_batch_size))
     # Calculate learning rate schedule parameters
-    warmup_iters = int(max_iters * default_config['warmup_frac'])
-    lr_decay_iters = int(max_iters * default_config['lr_decay_frac'])
+    warmup_iters = int(max_iters * user_config['warmup_frac'])
+    lr_decay_iters = int(max_iters * user_config['lr_decay_frac'])
     meta['warmup_iters'] = warmup_iters
     meta['lr_decay_iters'] = lr_decay_iters
     
@@ -2320,7 +2318,7 @@ def train(config=None):
         default_config, 
         warmup_iters, 
         lr_decay_iters, 
-        console=default_config.get('console')
+        console=user_config.get('console')
     )
     
     
@@ -2329,12 +2327,12 @@ def train(config=None):
     
     # Optimizer
     optimizer = model.configure_optimizers(
-        default_config['weight_decay'],
-        default_config['learning_rate'],
-        (default_config['beta1'], default_config['beta2']),
+        user_config['weight_decay'],
+        user_config['learning_rate'],
+        (user_config['beta1'], user_config['beta2']),
         device_type
     )
-    if default_config['init_from'] == 'resume':
+    if user_config['init_from'] == 'resume':
         optimizer.load_state_dict(checkpoint['optimizer'])
         # Load LR scheduler state if available and using ReduceLROnPlateau
         if lr_scheduler_obj is not None and 'lr_scheduler' in checkpoint:
@@ -2344,24 +2342,24 @@ def train(config=None):
     meta['optimizer'] = optimizer
     
     # Compile model
-    if default_config['compile']:
+    if user_config['compile']:
         if device_type == 'mps':
             print("WARNING: Disabling torch.compile on MPS due to known instability (Inductor backend issues).")
-            default_config['compile'] = False
+            user_config['compile'] = False
         else:
             print("compiling the model... (takes a ~minute)")
             model = torch.compile(model)
     
     # Initialize wandb (skip if already initialized by sweep agent)
-    if default_config['wandb_log'] and wandb.run is None:
+    if user_config['wandb_log'] and wandb.run is None:
         wandb.init(
-            project=default_config['wandb_project'],
-            name=default_config['wandb_run_name'],
-            config={k: v for k, v in default_config.items() if k != 'console'}
+            project=user_config['wandb_project'],
+            name=user_config['wandb_run_name'],
+            config={k: v for k, v in user_config.items() if k != 'console'}
         )
     
     # Log individual sparsity and importance values for each path to wandb
-    if default_config['wandb_log'] and wandb.run is not None:
+    if user_config['wandb_log'] and wandb.run is not None:
         sparsity_arr = np.array(meta.get('sparsity', [0.0] * meta['d']))
         importance_arr = np.array(meta.get('importance', [1.0] * meta['d']))
         
@@ -2381,7 +2379,7 @@ def train(config=None):
         print(f"Logged {len(sparsity_arr)} sparsity and importance values to wandb")
     
     # Init tracking variables
-    if default_config['init_from'] == 'resume':
+    if user_config['init_from'] == 'resume':
         iter_num = checkpoint['iter_num']
     else:
         iter_num = 0
@@ -2389,17 +2387,17 @@ def train(config=None):
     # Initialize embedding plot tracking for GIF generation
     embedding_plot_paths = []
     embedding_plots_dir = None
-    if default_config.get('output_embedding_gif', False):
-        embedding_plots_dir = os.path.join(default_config['out_dir'], 'embedding_plots', custom_name)
+    if user_config.get('output_embedding_gif', False):
+        embedding_plots_dir = os.path.join(user_config['out_dir'], 'embedding_plots', custom_name)
         os.makedirs(embedding_plots_dir, exist_ok=True)
         LiveTrainingPanel.CONSOLE.print(f"[cyan]Embedding GIF enabled - plots will be saved to: {embedding_plots_dir}[/cyan]")
-        LiveTrainingPanel.CONSOLE.print(f"[cyan]  Plot interval: every {default_config['embedding_plot_interval']} iterations[/cyan]")
-        LiveTrainingPanel.CONSOLE.print(f"[cyan]  GIF frame duration: {default_config['embedding_gif_duration']}ms[/cyan]")
+        LiveTrainingPanel.CONSOLE.print(f"[cyan]  Plot interval: every {user_config['embedding_plot_interval']} iterations[/cyan]")
+        LiveTrainingPanel.CONSOLE.print(f"[cyan]  GIF frame duration: {user_config['embedding_gif_duration']}ms[/cyan]")
     
     # Define cleanup function for GIF generation (called at end or on interrupt)
     def cleanup_and_create_gif():
         """Create embedding GIF from saved plots on normal exit or interruption"""
-        if default_config.get('output_embedding_gif', False) and len(embedding_plot_paths) > 0:
+        if user_config.get('output_embedding_gif', False) and len(embedding_plot_paths) > 0:
             gif_path = os.path.join("embedding_gifs", f'embedding_evolution_{custom_name}.gif')
             
             LiveTrainingPanel.CONSOLE.print(f"[cyan]Creating embedding evolution GIF from {len(embedding_plot_paths)} saved plots...[/cyan]")
@@ -2408,16 +2406,16 @@ def train(config=None):
                 create_embedding_gif_from_saved_plots(
                     embedding_plot_paths,
                     gif_path,
-                    duration=default_config.get('embedding_gif_duration', 500),
+                    duration=user_config.get('embedding_gif_duration', 500),
                     cleanup_images=True  # Keep source images by default
                 )
                 
                 LiveTrainingPanel.CONSOLE.print(f"[green]✓ Created embedding GIF: {gif_path}[/green]")
                 
                 # Log to wandb if enabled
-                if default_config.get('wandb_log', False) and wandb.run is not None:
+                if user_config.get('wandb_log', False) and wandb.run is not None:
                     try:
-                        wandb.log({'embedding_evolution_gif': wandb.Video(gif_path, fps=1000/default_config.get('embedding_gif_duration', 500), format='gif')})
+                        wandb.log({'embedding_evolution_gif': wandb.Video(gif_path, fps=1000/user_config.get('embedding_gif_duration', 500), format='gif')})
                     except Exception as e:
                         LiveTrainingPanel.CONSOLE.print(f"[yellow]Warning: Failed to log GIF to wandb: {e}[/yellow]")
                 
@@ -2450,16 +2448,16 @@ def train(config=None):
         LiveTrainingPanel.CONSOLE.print(f"[yellow]Note: Signal handlers not available (running in worker thread)[/yellow]")
 
     # Calculate and log theoretical minimum loss
-    if default_config['wandb_log'] and wandb.run is not None:
+    if user_config['wandb_log'] and wandb.run is not None:
         # Only relevant when predicting edge endpoint (1 out of d options)
         # If predicting direction, the task is deterministic/binary so min loss is 0.
-        predict_dir = default_config.get('predict_direction_for_edge_task', True)
+        predict_dir = user_config.get('predict_direction_for_edge_task', True)
         
         # Calculate N_paths and N_edges effective samples based on sampling strategy
-        if default_config['edge_only']:
+        if user_config['edge_only']:
             n_path_samples = 0  # No paths in edge_only mode
             n_edge_samples = edges_size
-        elif default_config.get('balance_interleaved_datasets', True) and paths_size < edges_size:
+        elif user_config.get('balance_interleaved_datasets', True) and paths_size < edges_size:
             n_path_samples = edges_size # Effective samples due to upsampling
             n_edge_samples = edges_size # Edges are never upsampled
         else:
@@ -2634,7 +2632,7 @@ def train(config=None):
     # Create tensors and load to GPU if pre-calculated decision indicates they fit
     # NOTE: preprocess_dataset adds pause tokens at runtime based on config
     print(f"Pre-processing combined dataset (adding {num_pause_tokens} pause tokens)...")
-    if default_config['edge_only']:
+    if user_config['edge_only']:
         # In edge_only mode, combined_data contains only edges
         combined_X, combined_Y = preprocess_dataset(combined_data, dataset_type='edges')
     else:
@@ -2644,7 +2642,7 @@ def train(config=None):
     
     # Store validation data with optimized dtype (skip in edge_only mode)
     # NOTE: Validation data also needs pause tokens added
-    if default_config['edge_only']:
+    if user_config['edge_only']:
         val_data_tensor = None
         print("Skipping validation data preprocessing (edge_only=True)")
     else:
@@ -2694,7 +2692,7 @@ def train(config=None):
     val_data_np = val_data
     
     # Check if sparsity sampling is enabled
-    has_sparsity = default_config.get('sparsity', False) and paths_membership is not None
+    has_sparsity = user_config.get('sparsity', False) and paths_membership is not None
     if has_sparsity:
         sparsity_arr = np.array(meta.get('sparsity', [0.0] * meta['d']))
         importance_arr = np.array(meta.get('importance', [1.0] * meta['d']))
@@ -2714,8 +2712,8 @@ def train(config=None):
         print(f"  Importance range: [{importance_arr.min():.3f}, {importance_arr.max():.3f}]")
         print(f"  Importance normalized: mean={importance_arr_normalized.mean():.3f}, "
               f"range=[{importance_arr_normalized.min():.3f}, {importance_arr_normalized.max():.3f}]")
-        print(f"  Independent edges: {default_config['independent_sampling_of_edges']}")
-        print(f"  Independent forward/reverse: {default_config['independent_sampling_of_forward_reverse']}")
+        print(f"  Independent edges: {user_config['independent_sampling_of_edges']}")
+        print(f"  Independent forward/reverse: {user_config['independent_sampling_of_forward_reverse']}")
         print(f"=================================\n")
     else:
         # No sparsity - set uniform importance (still needed for loss computation)
@@ -2740,9 +2738,9 @@ def train(config=None):
         active_indices = sample_active_sequences_for_epoch(
             paths_data, edges_data, paths_membership, edges_membership,
             sparsity_arr,
-            default_config['independent_sampling_of_edges'],
-            default_config['independent_sampling_of_forward_reverse'],
-            default_config['use_undirected'],
+            user_config['independent_sampling_of_edges'],
+            user_config['independent_sampling_of_forward_reverse'],
+            user_config['use_undirected'],
             meta
         )
         combined_epoch_indices = active_indices
@@ -2759,7 +2757,7 @@ def train(config=None):
     combined_epoch_completed = False
     
     # Initialize validation indices (skip in edge_only mode)
-    if not default_config['edge_only']:
+    if not user_config['edge_only']:
         val_epoch_indices = np.arange(VAL_DATASET_SIZE)
         # Perform initial shuffle for validation
         np.random.shuffle(val_epoch_indices)
@@ -2778,8 +2776,8 @@ def train(config=None):
     def _format_mask_debug(x, y_before, y_after, dataset_label):
         """Return a compact debug string showing which Y positions are kept."""
         try:
-            max_samples = int(default_config.get('debug_masking_samples', 2))
-            max_len = int(default_config.get('debug_masking_max_len', 32))
+            max_samples = int(user_config.get('debug_masking_samples', 2))
+            max_len = int(user_config.get('debug_masking_max_len', 32))
         except Exception:
             max_samples, max_len = 2, 32
 
@@ -2900,7 +2898,7 @@ def train(config=None):
             Y_source = combined_Y
             epoch_completed = combined_epoch_completed
         elif dataset == 'val':
-            if default_config['edge_only']:
+            if user_config['edge_only']:
                 raise ValueError("Validation dataset not available in edge_only mode")
             # Validation logic remains largely same but we need to handle X/Y/Masking dynamically or pre-process it too.
             # For simplicity, we'll keep dynamic slicing for val since it's infrequent
@@ -2925,9 +2923,9 @@ def train(config=None):
                 active_indices = sample_active_sequences_for_epoch(
                     paths_data, edges_data, paths_membership, edges_membership,
                     sparsity_arr,
-                    default_config['independent_sampling_of_edges'],
-                    default_config['independent_sampling_of_forward_reverse'],
-                    default_config['use_undirected'],
+                    user_config['independent_sampling_of_edges'],
+                    user_config['independent_sampling_of_forward_reverse'],
+                    user_config['use_undirected'],
                     meta
                 )
                 epoch_indices = active_indices
@@ -2977,7 +2975,7 @@ def train(config=None):
             if pad_token_id is not None: y[y == pad_token_id] = -1
             if pause_token_id is not None: y[y == pause_token_id] = -1
             # Validation set contains only path sequences; apply path-specific masking.
-            if default_config.get('debug_masking') and (iter_num % default_config.get('log_interval', 100) == 0):
+            if user_config.get('debug_masking') and (iter_num % user_config.get('log_interval', 100) == 0):
                 y_before = y.clone()
                 y_after = apply_task_specific_target_mask(x, y, 'paths')
                 last_mask_debug_str = _format_mask_debug(x, y_before, y_after, "val(paths)")
@@ -3012,9 +3010,9 @@ def train(config=None):
 
         # Apply task-specific masking
         # In edge_only mode, all combined data is edges
-        mask_dataset_type = 'edges' if (dataset == 'combined' and default_config['edge_only']) else dataset
+        mask_dataset_type = 'edges' if (dataset == 'combined' and user_config['edge_only']) else dataset
         
-        if default_config.get('debug_masking') and (iter_num % default_config.get('log_interval', 100) == 0):
+        if user_config.get('debug_masking') and (iter_num % user_config.get('log_interval', 100) == 0):
             y_before = y.clone()
             y_after = apply_task_specific_target_mask(x, y, mask_dataset_type)
             last_mask_debug_str = _format_mask_debug(x, y_before, y_after, mask_dataset_type)
@@ -3095,7 +3093,7 @@ def train(config=None):
                 importance_weights = None
 
             with ctx:
-                logits, loss = model(X, Y, label_smoothing=default_config['label_smoothing'], importance_weights=importance_weights)
+                logits, loss = model(X, Y, label_smoothing=user_config['label_smoothing'], importance_weights=importance_weights)
             batch_losses[k] = loss.item()
             
             per_token_losses_in_batch = compute_per_token_loss_with_teacher_forcing(meta, logits, X, Y, range(1, graph_length + 1), task_type='path')
@@ -3154,9 +3152,9 @@ def train(config=None):
                 param_group['lr'] = lr
             
             # Save embedding plot for GIF (if enabled and at interval)
-            if (default_config.get('output_embedding_gif', False) and 
+            if (user_config.get('output_embedding_gif', False) and 
                 iter_num > 0 and 
-                iter_num % default_config.get('embedding_plot_interval', 100) == 0):
+                iter_num % user_config.get('embedding_plot_interval', 100) == 0):
                 try:
                     if meta and 'paths_by_leaf' in meta:
                         current_epoch = iter_num / meta['batches_per_epoch']
@@ -3169,8 +3167,8 @@ def train(config=None):
                             iteration=iter_num,
                             include_root=True,
                             include_special=False,
-                            num_paths=default_config.get('embedding_gif_num_paths', 5),
-                            figsize=default_config.get('embedding_gif_figsize', (8, 6))
+                            num_paths=user_config.get('embedding_gif_num_paths', 5),
+                            figsize=user_config.get('embedding_gif_figsize', (8, 6))
                         )
                         plt.close(fig)
                         embedding_plot_paths.append(plot_path)
@@ -3179,10 +3177,10 @@ def train(config=None):
                     LiveTrainingPanel.CONSOLE.print(f"[yellow]Warning: Failed to save embedding plot at iter {iter_num}: {e}[/yellow]")
             
             # Evaluate
-            if iter_num % default_config['eval_interval'] == 0:
-                if not default_config['edge_only']:
+            if iter_num % user_config['eval_interval'] == 0:
+                if not user_config['edge_only']:
                     # Full evaluation mode (paths + edges)
-                    print_samples = iter_num % default_config['print_eval_interval'] == 0
+                    print_samples = iter_num % user_config['print_eval_interval'] == 0
                     # Calculate tokens_per_sec for display if available
                     current_tokens_per_sec = None
                     if 'dt' in locals() and dt > 0:
@@ -3224,7 +3222,7 @@ def train(config=None):
                             LiveTrainingPanel.CONSOLE.print(f"[yellow]Terminating training early at iter {iter_num}[/yellow]")
                             
                             # Log early termination event to wandb
-                            if default_config['wandb_log'] and wandb.run is not None:
+                            if user_config['wandb_log'] and wandb.run is not None:
                                 wandb.log({
                                     'early_termination/triggered': True,
                                     'early_termination/reason': 'lr_exhausted',
@@ -3236,18 +3234,18 @@ def train(config=None):
                             break
                     
                     # Early termination if validation loss falls below target threshold
-                    if default_config['target_val_loss'] is not None and val_loss < default_config['target_val_loss']:
-                        LiveTrainingPanel.CONSOLE.print(f"[green]Target validation loss achieved! val_loss={val_loss:.6f} < target={default_config['target_val_loss']:.6f}[/green]")
+                    if user_config['target_val_loss'] is not None and val_loss < user_config['target_val_loss']:
+                        LiveTrainingPanel.CONSOLE.print(f"[green]Target validation loss achieved! val_loss={val_loss:.6f} < target={user_config['target_val_loss']:.6f}[/green]")
                         LiveTrainingPanel.CONSOLE.print(f"[green]Terminating training early at iter {iter_num}[/green]")
                         
                         # Log early termination event to wandb
-                        if default_config['wandb_log'] and wandb.run is not None:
+                        if user_config['wandb_log'] and wandb.run is not None:
                             wandb.log({
                                 'early_termination/triggered': True,
                                 'early_termination/reason': 'target_val_loss_achieved',
                                 'early_termination/iter': iter_num,
                                 'early_termination/val_loss': val_loss,
-                                'early_termination/target_val_loss': default_config['target_val_loss'],
+                                'early_termination/target_val_loss': user_config['target_val_loss'],
                                 'early_termination/epoch': iter_num / meta['batches_per_epoch'],
                             }, step=iter_num)
                         
@@ -3284,26 +3282,26 @@ def train(config=None):
                     
                     # Plot pairwise cosine similarity matrix (at every eval_interval)
                     cosine_similarity_plot_path = None
-                    if default_config.get('plot_cosine_similarity_matrix', False):
+                    if user_config.get('plot_cosine_similarity_matrix', False):
                         try:
                             cosine_similarity_plot_path = plot_pairwise_cosine_similarity_matrix(
                                 model, meta, iter_num, default_config,
-                                out_dir=default_config.get('out_dir', 'out')
+                                out_dir=user_config.get('out_dir', 'out')
                             )
                         except Exception as e:
                             LiveTrainingPanel.CONSOLE.print(f"[yellow]Warning: Cosine similarity matrix plot failed: {e}[/yellow]")
                     
-                    if default_config['log_edge_memorization_metrics']:
+                    if user_config['log_edge_memorization_metrics']:
                         LiveTrainingPanel.CONSOLE.print(f"\n[cyan]Evaluating edge memorization (edge_only mode, iter {iter_num})...[/cyan]")
                         edge_memorization_pct = evaluate_edge_memorization(
                             ctx, model, meta, edges_data_np, device,
-                            batch_size=int(default_config.get('edge_eval_batch_size', 512)),
+                            batch_size=int(user_config.get('edge_eval_batch_size', 512)),
                         )
                         
                         LiveTrainingPanel.CONSOLE.print(f"[cyan]Edge memorization: {edge_memorization_pct:.2f}%[/cyan]")
                         
                         # Log to wandb
-                        if default_config['wandb_log']:
+                        if user_config['wandb_log']:
                             current_epoch = iter_num / meta['batches_per_epoch']
                             log_dict_edge = {
                                 'edge_memorization_pct': edge_memorization_pct,
@@ -3318,7 +3316,7 @@ def train(config=None):
                             wandb.log(log_dict_edge, step=iter_num)
                     else:
                         # Still log mean cosine distance even if not showing edge memorization
-                        if default_config['wandb_log']:
+                        if user_config['wandb_log']:
                             current_epoch = iter_num / meta['batches_per_epoch']
                             log_dict_edge = {
                                 'embedding_geometry/mean_cosine_distance': mean_cosine_distance,
@@ -3339,7 +3337,7 @@ def train(config=None):
                     
                     # Create a minimal metrics dict for edge_only mode
                     edge_only_metrics = {}
-                    edge_memorization_pct = edge_memorization_pct if default_config['log_edge_memorization_metrics'] else None
+                    edge_memorization_pct = edge_memorization_pct if user_config['log_edge_memorization_metrics'] else None
                     live_panel.update_metrics_table(
                         edge_only_metrics,
                         graph_length,
@@ -3355,7 +3353,7 @@ def train(config=None):
                         mean_cosine_distance=mean_cosine_distance,
                     )
             
-            if iter_num == 0 and default_config['eval_only']:
+            if iter_num == 0 and user_config['eval_only']:
                 break
             
             # Check for graceful interruption
@@ -3364,10 +3362,10 @@ def train(config=None):
                 break
             
             # Forward backward update with batch prefetching for better GPU utilization
-            steps = default_config['gradient_accumulation_steps']
+            steps = user_config['gradient_accumulation_steps']
 
             # Track activation stats on the last micro_step only (to avoid overhead)
-            track_stats = default_config.get('log_activation_stats', False)
+            track_stats = user_config.get('log_activation_stats', False)
             last_activation_stats = None
             last_logits = None  # For NaN debugging
             
@@ -3384,13 +3382,13 @@ def train(config=None):
             
             for micro_step in range(steps):
                 # Use scheduled sampling for PATH tasks if p_autoregressive_substitution > 0
-                p_sub = default_config.get('p_autoregressive_substitution', 0.0)
+                p_sub = user_config.get('p_autoregressive_substitution', 0.0)
                 if p_sub > 0:
                     # Scheduled sampling: substitute teacher-forced tokens with model predictions
                     # for PATH sequences (EDGE sequences still use pure teacher forcing)
                     logits_step, loss = forward_with_scheduled_sampling(
                         model, X, Y, meta, p_sub,
-                        label_smoothing=default_config['label_smoothing'],
+                        label_smoothing=user_config['label_smoothing'],
                         ctx=ctx,
                         importance_weights=importance_weights
                     )
@@ -3401,7 +3399,7 @@ def train(config=None):
                     # Track activation stats on last micro_step only
                     should_track = track_stats and (micro_step == steps - 1)
                     with ctx:
-                        result = model(X, Y, label_smoothing=default_config['label_smoothing'], 
+                        result = model(X, Y, label_smoothing=user_config['label_smoothing'], 
                                        track_activation_stats=should_track,
                                        importance_weights=importance_weights)
                         if should_track:
@@ -3421,7 +3419,7 @@ def train(config=None):
                     # Run full diagnostic
                     nan_report = check_for_nans(model, optimizer, loss * steps, logits_step, X, Y, iter_num, 
                                                phase='combined')
-                    if nan_report and default_config['wandb_log']:
+                    if nan_report and user_config['wandb_log']:
                         wandb.log({f'nan_detection/{k}': v for k, v in nan_report.items() if not isinstance(v, list)})
                     raise ValueError(f"NaN/Inf detected in loss at iteration {iter_num}. Training stopped to prevent gradient corruption.")
                 
@@ -3434,7 +3432,7 @@ def train(config=None):
                     # Run full diagnostic
                     nan_report = check_for_nans(model, optimizer, loss * steps, logits_step, X, Y, iter_num, 
                                                phase='combined')
-                    if nan_report and default_config['wandb_log']:
+                    if nan_report and user_config['wandb_log']:
                         wandb.log({f'nan_detection/{k}': v for k, v in nan_report.items() if not isinstance(v, list)})
                     raise ValueError(f"NaN/Inf detected in logits at iteration {iter_num}. Training stopped to prevent gradient corruption.")
                 
@@ -3452,12 +3450,12 @@ def train(config=None):
             X, Y, batch_path_membership = get_batch('combined')
             
             # Clip gradients
-            if default_config['grad_clip'] != 0.0:
+            if user_config['grad_clip'] != 0.0:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), default_config['grad_clip'])
+                torch.nn.utils.clip_grad_norm_(model.parameters(), user_config['grad_clip'])
             
             # Check for NaNs BEFORE optimizer step (while gradients still exist)
-            check_nan_interval = default_config.get('check_nan_interval', 0)
+            check_nan_interval = user_config.get('check_nan_interval', 0)
             cached_nan_report = None
             if check_nan_interval > 0 and iter_num % check_nan_interval == 0:
                 cached_nan_report = check_for_nans(model, optimizer, loss * steps, last_logits, X, Y, iter_num, phase='combined')
@@ -3465,7 +3463,7 @@ def train(config=None):
             # Compute gradient statistics BEFORE optimizer step (for logging)
             # Cache these values since gradients will be cleared after optimizer step
             cached_grad_stats = {}
-            if check_nan_interval > 0 and default_config['wandb_log']:
+            if check_nan_interval > 0 and user_config['wandb_log']:
                 max_grad = 0.0
                 grad_norm = 0.0
                 for name, param in model.named_parameters():
@@ -3499,7 +3497,7 @@ def train(config=None):
                     LiveTrainingPanel.CONSOLE.print(f"[yellow]  Max gradient: {cached_nan_report['max_grad']:.6f}[/yellow]")
                 
                 # Log to wandb
-                if default_config['wandb_log']:
+                if user_config['wandb_log']:
                     wandb_nan_log = {f'nan_debug/{k}': v for k, v in cached_nan_report.items() if isinstance(v, (int, float, bool))}
                     wandb.log(wandb_nan_log, step=iter_num)
                 
@@ -3514,7 +3512,7 @@ def train(config=None):
             # Track running average for comparison with theoretical minimum
             lossf = loss.item() * steps
             
-            if iter_num % default_config['log_interval'] == 0:
+            if iter_num % user_config['log_interval'] == 0:
                 tokens_per_sec = (X.numel() * steps) / dt
                 
                 # DEBUG: Count how many edge vs path samples in this batch
@@ -3523,7 +3521,7 @@ def train(config=None):
                 num_edges_in_batch = (X[:, 0] == EDGE_token).sum().item()
                 num_paths_in_batch = (X[:, 0] == PATH_token).sum().item()
 
-                if default_config['wandb_log']:
+                if user_config['wandb_log']:
                     # Use cached gradient statistics (computed before zero_grad)
                     grad_stats = cached_grad_stats.copy()
                     
@@ -3549,7 +3547,7 @@ def train(config=None):
                 
                 # Checkpointing for edge_only mode (based on training loss)
                 # In edge_only mode, there's no validation set, so checkpoint based on best training loss
-                if default_config['edge_only'] and iter_num > 0:
+                if user_config['edge_only'] and iter_num > 0:
                     is_sweep_mode = wandb.run is not None and hasattr(wandb.run, 'sweep_id') and wandb.run.sweep_id is not None
                     save_checkpoint = False
                     
@@ -3557,7 +3555,7 @@ def train(config=None):
                     if lossf < meta['best_train_loss']:
                         meta['best_train_loss'] = lossf
                         save_checkpoint = True
-                    elif not is_sweep_mode and default_config['always_save_checkpoint']:
+                    elif not is_sweep_mode and user_config['always_save_checkpoint']:
                         # In standalone mode, save every checkpoint if always_save_checkpoint is True
                         save_checkpoint = True
                     
@@ -3565,19 +3563,19 @@ def train(config=None):
                         checkpoint_model(model, meta, default_config, iter_num, lossf, loss_type='train', lr_scheduler_obj=lr_scheduler_obj)
                 
                 # Log attention maps to wandb (expensive, so use separate interval)
-                if default_config['wandb_log'] and default_config.get('log_attention_maps', False):
-                    if iter_num % default_config.get('attention_map_interval', 500) == 0:
+                if user_config['wandb_log'] and user_config.get('log_attention_maps', False):
+                    if iter_num % user_config.get('attention_map_interval', 500) == 0:
                         try:
                             attn_images = create_attention_map_figures(
                                 model, X, itos, meta,
-                                num_samples=default_config.get('attention_map_samples', 3)
+                                num_samples=user_config.get('attention_map_samples', 3)
                             )
                             wandb.log(attn_images, step=iter_num)
                         except Exception as e:
                             LiveTrainingPanel.CONSOLE.print(f"[yellow]Warning: Failed to log attention maps: {e}[/yellow]")
                 
                 # Log activation mean/variance per layer (collected during forward pass)
-                if default_config['wandb_log'] and last_activation_stats is not None:
+                if user_config['wandb_log'] and last_activation_stats is not None:
                     try:
                         activation_log = {f'activation/{k}': v for k, v in last_activation_stats.items()}
                         wandb.log(activation_log, step=iter_num)
@@ -3608,7 +3606,7 @@ def train(config=None):
     
     # Only call wandb.finish() if we initialized wandb ourselves (not in sweep mode)
     # In sweep mode, the agent handles finishing the run
-    if default_config['wandb_log'] and wandb.run is not None:
+    if user_config['wandb_log'] and wandb.run is not None:
         # Check if we're in sweep mode
         if not hasattr(wandb.run, 'sweep_id') or wandb.run.sweep_id is None:
             # Standalone mode - we initialized it, so we finish it
