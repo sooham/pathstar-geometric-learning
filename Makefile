@@ -172,3 +172,14 @@ copy-zip:
 	@echo "  Destination: ./$(NAME).zip"
 	scp root@vastai:/workspace/pathstar-geometric-learning/$(NAME).zip ./$(NAME).zip
 	@echo "Copy complete!"
+
+# Stash local changes, pull from remote, and reapply stashed changes
+stash_and_pull:
+	@echo "Stashing local changes..."
+	git stash
+	@echo "Pulling from remote..."
+	git pull
+	@echo "Reapplying stashed changes..."
+	git stash pop
+	@echo "Done!"
+

@@ -1808,14 +1808,14 @@ def validate_config(config):
     eval_interval = config.get('eval_interval', 10)
     print_eval_interval = config.get('print_eval_interval', 100)
     
-    if not (print_eval_interval > eval_interval):
+    if not (print_eval_interval >= eval_interval):
         errors.append(
-            f"print_eval_interval ({print_eval_interval}) must be > eval_interval ({eval_interval})"
+            f"print_eval_interval ({print_eval_interval}) must be >= eval_interval ({eval_interval})"
         )
     
-    if not (eval_interval > log_interval):
+    if not (eval_interval >= log_interval):
         errors.append(
-            f"eval_interval ({eval_interval}) must be > log_interval ({log_interval})"
+            f"eval_interval ({eval_interval}) must be >= log_interval ({log_interval})"
         )
     
     # 2. Check learning rate bounds: learning_rate >= min_lr
