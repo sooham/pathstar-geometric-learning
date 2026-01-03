@@ -70,7 +70,7 @@ parameters:
         learning_rate: 1e-3
         weight_decay: [0]
         lr_scheduler: "Constant" #'ReduceLROnPlateau'
-        epochs: 1_000
+        epochs: 10_000
         use_mlp: [false]
         use_layernorm: [false]
         seed: [4731]
