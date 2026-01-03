@@ -1879,7 +1879,7 @@ def determine_dataset_in_device_size(device, device_type, paths_data, edges_data
 
 def sample_active_sequences_for_epoch(paths_data, edges_data, paths_membership, edges_membership,
                                       sparsity, independent_edges, independent_fwd_rev,
-                                      use_undirected, meta):
+                                      use_undirected, meta, edge_only=False):
     """
     Sample which sequences to include in this epoch based on sparsity only.
     
@@ -1898,6 +1898,7 @@ def sample_active_sequences_for_epoch(paths_data, edges_data, paths_membership, 
         independent_fwd_rev: if True and independent_edges=True, forward/reverse sampled independently
         use_undirected: whether graph uses undirected edges
         meta: metadata dict containing special tokens and config
+        edge_only: if True, combined dataset contains only edges (no paths)
     
     Returns:
         active_indices: array of indices into combined dataset to use this epoch
@@ -1917,7 +1918,10 @@ def sample_active_sequences_for_epoch(paths_data, edges_data, paths_membership, 
     if independent_edges:
         # CASE 1: Each edge/path sequence sampled independently
         # For paths
-        active_paths_mask = np.random.rand(len(paths_data)) < probs[paths_membership]
+        if not edge_only:
+            active_paths_mask = np.random.rand(len(paths_data)) < probs[paths_membership]
+        else:
+            active_paths_mask = np.array([], dtype=bool)
         
         # For edges: independent_fwd_rev flag now matters
         if independent_fwd_rev and use_undirected:
@@ -1934,16 +1938,22 @@ def sample_active_sequences_for_epoch(paths_data, edges_data, paths_membership, 
         path_active = np.random.rand(d) < probs
         
         # Apply to paths
-        active_paths_mask = path_active[paths_membership]
+        if not edge_only:
+            active_paths_mask = path_active[paths_membership]
+        else:
+            active_paths_mask = np.array([], dtype=bool)
         
         # Apply to edges (all edges from path p active if path_active[p] is True)
         active_edges_mask = path_active[edges_membership]
     
     # Combine active paths and edges
-    active_path_indices = np.where(active_paths_mask)[0]
-    active_edge_indices = np.where(active_edges_mask)[0] + len(paths_data)  # Offset for combined array
-    
-    active_indices = np.concatenate([active_path_indices, active_edge_indices])
+    # In edge_only mode, don't include paths and don't add offset
+    if edge_only:
+        active_indices = np.where(active_edges_mask)[0]
+    else:
+        active_path_indices = np.where(active_paths_mask)[0]
+        active_edge_indices = np.where(active_edges_mask)[0] + len(paths_data)  # Offset for combined array
+        active_indices = np.concatenate([active_path_indices, active_edge_indices])
     
     return active_indices
 
@@ -2741,7 +2751,8 @@ def train(config=None):
             user_config['independent_sampling_of_edges'],
             user_config['independent_sampling_of_forward_reverse'],
             user_config['use_undirected'],
-            meta
+            meta,
+            edge_only=user_config['edge_only']
         )
         combined_epoch_indices = active_indices
         combined_size_effective = len(active_indices)
@@ -2926,7 +2937,8 @@ def train(config=None):
                     user_config['independent_sampling_of_edges'],
                     user_config['independent_sampling_of_forward_reverse'],
                     user_config['use_undirected'],
-                    meta
+                    meta,
+                    edge_only=user_config['edge_only']
                 )
                 epoch_indices = active_indices
                 combined_size_effective = len(active_indices)
