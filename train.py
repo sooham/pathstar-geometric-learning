@@ -2052,6 +2052,16 @@ def train(config=None):
 
     # Validate config
     validate_config(user_config)
+
+    # set the sparsity and importance values as vectors of length d
+    if isinstance(user_config.get('sparsity'), (int, float)):
+        user_config['sparsity'] = np.array([user_config.get('sparsity')] * user_config['graph_d'])
+    elif isinstance(user_config.get('sparsity'), list):
+        assert len(user_config.get('sparsity')) == user_config['graph_d'], f"sparsity must be a list of length graph_d"
+    if isinstance(user_config.get('importance'), (int, float)):
+        user_config['importance'] = np.array([user_config.get('importance')] * user_config['graph_d'])
+    elif isinstance(user_config.get('importance'), list):
+        assert len(user_config.get('importance')) == user_config['graph_d'], f"importance must be a list of length graph_d"
     
     # Set random seed and backend configurations
     random.seed(config['seed'])
