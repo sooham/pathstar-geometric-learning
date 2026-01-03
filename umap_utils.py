@@ -20,9 +20,14 @@ def apply_umap(
     metric: str = 'euclidean',
     random_state: Optional[int] = 42,
     columns_are_samples: bool = False,
-) -> np.ndarray:
+    reference_reducer: Optional[umap.UMAP] = None,
+) -> Union[np.ndarray, Tuple[np.ndarray, umap.UMAP]]:
     """
     Apply UMAP dimensionality reduction to a matrix of vectors.
+    
+    Supports "anchored UMAP" for consistent projections across multiple datasets:
+    - If reference_reducer is None: fit new UMAP and return (reduced_data, fitted_reducer)
+    - If reference_reducer is provided: use .transform() to project into reference space
     
     Args:
         data: Input matrix. By default, rows are samples and columns are features.
@@ -35,34 +40,40 @@ def apply_umap(
         metric: Distance metric ('euclidean', 'cosine', 'manhattan', etc.).
         random_state: Random seed for reproducibility.
         columns_are_samples: If True, treat columns as samples (will transpose input).
+        reference_reducer: Optional pre-fitted UMAP reducer. If provided, uses .transform()
+                          instead of .fit_transform() for consistent coordinate systems.
     
     Returns:
-        np.ndarray: Reduced data with shape (n_samples, n_components).
+        If reference_reducer is None: Tuple of (reduced_data, fitted_reducer)
+        If reference_reducer is provided: reduced_data only (np.ndarray)
     
     Example:
-        >>> embeddings = np.random.randn(100, 64)  # 100 samples, 64 features
-        >>> reduced = apply_umap(embeddings, n_components=2)
-        >>> reduced.shape
-        (100, 2)
-        
-        >>> # If your samples are columns:
-        >>> data = np.random.randn(64, 100)  # 64 features, 100 samples as columns
-        >>> reduced = apply_umap(data, columns_are_samples=True)
-        >>> reduced.shape
-        (100, 2)
+        >>> # First checkpoint: fit and store reducer
+        >>> embeddings1 = np.random.randn(100, 64)
+        >>> reduced1, reducer = apply_umap(embeddings1, n_components=2)
+        >>> 
+        >>> # Subsequent checkpoints: use same coordinate system
+        >>> embeddings2 = np.random.randn(100, 64)
+        >>> reduced2 = apply_umap(embeddings2, reference_reducer=reducer)
+        >>> # Now reduced1 and reduced2 are in the same coordinate system!
     """
     if columns_are_samples:
         data = data.T  # Transpose so rows become samples
     
-    reducer = umap.UMAP(
-        n_components=n_components,
-        n_neighbors=n_neighbors,
-        min_dist=min_dist,
-        metric=metric,
-        random_state=random_state,
-    )
-    
-    return reducer.fit_transform(data)
+    if reference_reducer is not None:
+        # Use pre-fitted reducer to project into reference coordinate system
+        return reference_reducer.transform(data)
+    else:
+        # Fit new reducer and return both reduced data and fitted reducer
+        reducer = umap.UMAP(
+            n_components=n_components,
+            n_neighbors=n_neighbors,
+            min_dist=min_dist,
+            metric=metric,
+            random_state=random_state,
+        )
+        reduced = reducer.fit_transform(data)
+        return reduced, reducer
 
 
 def plot_umap(
@@ -99,7 +110,7 @@ def plot_umap(
         >>> fig, ax, coords = plot_umap(embeddings, labels=labels, save_path="umap.png")
     """
     # Apply UMAP
-    reduced = apply_umap(data, n_components=2, **umap_kwargs)
+    reduced, _ = apply_umap(data, n_components=2, **umap_kwargs)
     
     # Create plot
     fig, ax = plt.subplots(figsize=figsize)
@@ -153,7 +164,7 @@ def umap_with_annotations(
     Returns:
         Tuple of (figure, axes, reduced_data).
     """
-    reduced = apply_umap(data, n_components=2, **umap_kwargs)
+    reduced, _ = apply_umap(data, n_components=2, **umap_kwargs)
     
     fig, ax = plt.subplots(figsize=figsize)
     ax.scatter(reduced[:, 0], reduced[:, 1], alpha=0.7, s=20)
@@ -336,7 +347,7 @@ if __name__ == "__main__":
     print(f"Input shape: {data.shape}")
     
     # Basic UMAP
-    reduced = apply_umap(data)
+    reduced, _ = apply_umap(data)
     print(f"Reduced shape: {reduced.shape}")
     
     # Plot with labels

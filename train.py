@@ -2073,9 +2073,9 @@ def train(config=None):
         assert len(user_config.get('importance')) == user_config['graph_d'], f"importance must be a list of length graph_d"
     
     # Set random seed and backend configurations
-    random.seed(config['seed'])
-    torch.manual_seed(config['seed'])
-    np.random.seed(config['seed'])
+    random.seed(user_config['seed'])
+    torch.manual_seed(user_config['seed'])
+    np.random.seed(user_config['seed'])
     if torch.cuda.is_available():
         torch.cuda.manual_seed(user_config['seed'])
         torch.cuda.manual_seed_all(user_config['seed'])  # for multi-GPU
@@ -3278,15 +3278,30 @@ def train(config=None):
                         plot_filename = f'embedding_iter_{iter_num:06d}_epoch_{current_epoch:.1f}.png'
                         plot_path = os.path.join(embedding_plots_dir, plot_filename)
                         
-                        fig = model.plot_embeddings_umap(
+                        # Use anchored UMAP for smooth animations
+                        # First plot: fit UMAP and store reducer
+                        # Subsequent plots: use stored reducer for consistent coordinate system
+                        reference_reducer = meta.get('embedding_umap_reducer', None)
+                        
+                        result = model.plot_embeddings_umap(
                             save_path=plot_path,
                             epoch=int(current_epoch),
                             iteration=iter_num,
                             include_root=True,
                             include_special=False,
                             num_paths=user_config.get('embedding_gif_num_paths', 5),
-                            figsize=user_config.get('embedding_gif_figsize', (8, 6))
+                            figsize=user_config.get('embedding_gif_figsize', (8, 6)),
+                            reference_reducer=reference_reducer
                         )
+                        
+                        # Handle return value (tuple on first call, fig only on subsequent)
+                        if reference_reducer is None and isinstance(result, tuple):
+                            fig, fitted_reducer = result
+                            meta['embedding_umap_reducer'] = fitted_reducer
+                            LiveTrainingPanel.CONSOLE.print(f"[dim cyan]Fitted UMAP reducer for anchored projections (smooth animation)[/dim cyan]")
+                        else:
+                            fig = result
+                        
                         plt.close(fig)
                         embedding_plot_paths.append(plot_path)
                         LiveTrainingPanel.CONSOLE.print(f"[dim cyan]Saved embedding plot {len(embedding_plot_paths)}: {plot_filename}[/dim cyan]")

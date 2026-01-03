@@ -48,11 +48,15 @@ import matplotlib.pyplot as plt
 
 def plot_embeddings_2d_with_paths(embeddings, meta, save_path=None, epoch=None, iteration=None,
                                    include_root=True, include_special=False, num_paths=5,
-                                   figsize=(12, 10)):
+                                   figsize=(12, 10), reference_reducer=None):
     """
     Create a simple 2D visualization of embeddings with sampled paths highlighted.
     
     This is a refactored utility for quick visualization during training.
+    
+    Supports "anchored UMAP" for smooth animations:
+    - On first call (reference_reducer=None): fits UMAP and returns (fig, reducer)
+    - On subsequent calls: uses reference_reducer for consistent coordinate system
     
     Args:
         embeddings: numpy array of shape (vocab_size, n_embd)
@@ -64,9 +68,12 @@ def plot_embeddings_2d_with_paths(embeddings, meta, save_path=None, epoch=None, 
         include_special: Whether to include special tokens in UMAP (default: False)
         num_paths: Number of paths to highlight (default: 5)
         figsize: Figure size as (width, height) in inches (default: (12, 10))
+        reference_reducer: Optional pre-fitted UMAP reducer for anchored projections.
+                          If provided, all embeddings will be projected into the same space.
         
     Returns:
-        fig: matplotlib figure object
+        If reference_reducer is None: Tuple of (fig, fitted_reducer)
+        If reference_reducer is provided: fig only
     """
     
     vocab_size, n_embd = embeddings.shape
@@ -99,18 +106,32 @@ def plot_embeddings_2d_with_paths(embeddings, meta, save_path=None, epoch=None, 
     filtered_indices = np.where(umap_mask)[0]
     
     # Compute 2D projection
+    fitted_reducer = None
     if use_raw_2d:
         reduced_2d = filtered_embeddings
         viz_method = "Raw Embeddings"
     else:
         n_neighbors_val = min(15, filtered_embeddings.shape[0] - 1)
-        reduced_2d = apply_umap(
-            filtered_embeddings,
-            n_components=2,
-            n_neighbors=n_neighbors_val,
-            min_dist=0.1,
-            random_state=42
-        )
+        
+        if reference_reducer is not None:
+            # Use anchored UMAP for consistent coordinate system
+            reduced_2d = apply_umap(
+                filtered_embeddings,
+                n_components=2,
+                n_neighbors=n_neighbors_val,
+                min_dist=0.1,
+                random_state=42,
+                reference_reducer=reference_reducer
+            )
+        else:
+            # Fit new UMAP and return reducer for future anchoring
+            reduced_2d, fitted_reducer = apply_umap(
+                filtered_embeddings,
+                n_components=2,
+                n_neighbors=n_neighbors_val,
+                min_dist=0.1,
+                random_state=42
+            )
         viz_method = "UMAP"
     
     # Create token position mapping
@@ -215,7 +236,11 @@ def plot_embeddings_2d_with_paths(embeddings, meta, save_path=None, epoch=None, 
         fig.savefig(save_path, dpi=150, bbox_inches='tight')
         print(f"Saved embedding plot: {save_path}")
     
-    return fig
+    # Return fitted reducer if this was the first call (for anchored UMAP)
+    if fitted_reducer is not None:
+        return fig, fitted_reducer
+    else:
+        return fig
 
 
 def load_checkpoint_and_model(checkpoint_path, device='cpu'):
@@ -453,7 +478,7 @@ def visualize_all_embeddings(embeddings, labels, meta, save_dir='out', prefix='e
         viz_method_2d = "Raw Embeddings"
     else:
         print("  [1/3] Computing 2D UMAP (n_neighbors=15)...")
-        reduced_2d = apply_umap(
+        reduced_2d, _ = apply_umap(
             filtered_embeddings,
             n_components=2,
             n_neighbors=n_neighbors_val,
@@ -473,7 +498,7 @@ def visualize_all_embeddings(embeddings, labels, meta, save_dir='out', prefix='e
         viz_method_3d = "Raw Embeddings"
     else:
         print("  [2/3] Computing 3D UMAP (n_neighbors=15)...")
-        reduced_3d = apply_umap(
+        reduced_3d, _ = apply_umap(
             filtered_embeddings,
             n_components=3,
             n_neighbors=n_neighbors_val,
@@ -892,7 +917,7 @@ def visualize_paths_in_umap(embeddings, labels, meta, save_dir='out', prefix='em
         viz_method_2d = "Raw Embeddings"
     else:
         print("  Computing 2D UMAP projection (n_neighbors=15)...")
-        reduced_2d = apply_umap(
+        reduced_2d, _ = apply_umap(
             filtered_embeddings, 
             n_components=2, 
             n_neighbors=n_neighbors_val, 
@@ -912,7 +937,7 @@ def visualize_paths_in_umap(embeddings, labels, meta, save_dir='out', prefix='em
         viz_method_3d = "Raw Embeddings"
     else:
         print("  Computing 3D UMAP projection (n_neighbors=15)...")
-        reduced_3d = apply_umap(
+        reduced_3d, _ = apply_umap(
             filtered_embeddings, 
             n_components=3, 
             n_neighbors=n_neighbors_val, 
