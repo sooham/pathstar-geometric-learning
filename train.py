@@ -2402,7 +2402,7 @@ def train(config=None):
     def cleanup_and_create_gif():
         """Create embedding GIF from saved plots on normal exit or interruption"""
         if default_config.get('output_embedding_gif', False) and len(embedding_plot_paths) > 0:
-            gif_path = os.path.join(default_config['out_dir'], f'embedding_evolution_{custom_name}.gif')
+            gif_path = os.path.join("embedding_gifs", f'embedding_evolution_{custom_name}.gif')
             
             LiveTrainingPanel.CONSOLE.print(f"[cyan]Creating embedding evolution GIF from {len(embedding_plot_paths)} saved plots...[/cyan]")
             
