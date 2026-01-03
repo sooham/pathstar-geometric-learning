@@ -474,7 +474,13 @@ class InWeightsPathStar:
         # Determine which leaf nodes to sample from
         if split == 'val':
             if len(self.holdout_leaves) == 0:
-                raise ValueError("Cannot generate holdout_only data: no holdout paths available")
+                # Return empty tensors when there are no holdout paths
+                if size == 0:
+                    sequences = torch.empty((0, 0), dtype=torch.long)
+                    path_membership = np.array([], dtype=np.int32)
+                    return sequences, path_membership
+                else:
+                    raise ValueError("Cannot generate holdout_only data: no holdout paths available")
             leaf_nodes = self.holdout_leaves
         elif split == 'train':
             if len(self.train_leaves) == 0:
@@ -647,12 +653,19 @@ class InWeightsPathStar:
         
         # Generate validation set: only holdout paths (no edges)
         # NOTE: No pause tokens - they are added at runtime
-        print("Generating validation set (holdout paths only, no edges)...")
-        val_sequences, val_path_membership = self._generate_path_prediction_training_set(
-            size=num_val_path_samples,
-            split='val',
-            use_directional_tokens_in_path=use_directional_tokens_in_path,
-        )
+        if num_val_path_samples > 0:
+            print("Generating validation set (holdout paths only, no edges)...")
+            val_sequences, val_path_membership = self._generate_path_prediction_training_set(
+                size=num_val_path_samples,
+                split='val',
+                use_directional_tokens_in_path=use_directional_tokens_in_path,
+            )
+        else:
+            print("Skipping validation set generation (holdout_percentage=0)...")
+            # Create empty validation tensors with proper shape
+            # Need to match the sequence length of path sequences
+            val_sequences = torch.empty((0, path_seq_len), dtype=torch.long)
+            val_path_membership = np.array([], dtype=np.int32)
         
         # Debug: Print train and val sequences
         np.set_printoptions(threshold=np.inf, linewidth=np.inf)
