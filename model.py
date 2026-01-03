@@ -15,8 +15,6 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import numpy as np
-from visualize_embeddings_umap import plot_embeddings_2d_with_paths
-from umap_utils import create_embedding_gif
 import matplotlib.pyplot as plt
 
 
@@ -790,6 +788,7 @@ class GPT(nn.Module):
         Note:
             Requires metadata (self.meta) with 'paths_by_leaf' for path visualization.
         """
+        from visualize_embeddings_umap import plot_embeddings_2d_with_paths
         
         if self.meta is None or 'paths_by_leaf' not in self.meta:
             raise ValueError("Metadata with 'paths_by_leaf' is required for embedding visualization")
@@ -841,6 +840,8 @@ class GPT(nn.Module):
             ...     duration=800
             ... )
         """
+        from umap_utils import create_embedding_gif
+        
         figures = []
         
         print(f"Creating embedding GIF from {len(checkpoint_paths)} checkpoints...")
