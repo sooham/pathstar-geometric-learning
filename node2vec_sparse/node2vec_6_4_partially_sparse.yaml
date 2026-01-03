@@ -125,9 +125,9 @@ parameters:
   batch_size:
     value: 4000
   embedding_plot_interval:
-    value: 100
+    value: 50
   embedding_gif_duration:
-    value: 100 # milliseconds
+    value: 150 # milliseconds
   embedding_gif_num_paths:
     value: 6 # number of paths to highlight in embedding plots
   # run_type:

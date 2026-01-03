@@ -3174,7 +3174,7 @@ def train(config=None):
                             save_path=plot_path,
                             epoch=int(current_epoch),
                             iteration=iter_num,
-                            include_root=False,
+                            include_root=True,
                             include_special=False,
                             num_paths=default_config.get('embedding_gif_num_paths', 5)
                         )
