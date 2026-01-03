@@ -77,8 +77,7 @@ from filelock import FileLock
 
 
 class InWeightsPathStar:
-    def __init__(self, d=5, l=5, randomize_vocab_size=None, holdout_percentage=0.0, 
-                 sparsity=None, importance=None):
+    def __init__(self, d=5, l=5, randomize_vocab_size=None, holdout_percentage=0.0):
         """
         Generator instance for a pathstar graph with d spokes
         of length l.
@@ -88,43 +87,12 @@ class InWeightsPathStar:
             l: Length of each path (number of nodes from root to leaf)
             randomize_vocab_size: Optional vocabulary mapping size we want to randomize vertices with 
             holdout_percentage: Percentage of paths to hold out (0.0 to 1.0)
-            sparsity: Scalar or array of sparsity values (probability of exclusion) per path. 
-                      None or 0.0 = disabled. Range: [0, 1]
-            importance: Scalar or array of importance values (sampling weight) per path.
-                        None or 1.0 = uniform. Range: [0, ∞)
         """
 
         self.d = d
         self.l = l
         self.randomize_vocab_size = randomize_vocab_size
         
-        # Setup sparsity (scalar or per-path array)
-        if sparsity is None or sparsity == 0.0:
-            self.sparsity = np.zeros(d)  # Disabled
-        elif isinstance(sparsity, (int, float)):
-            self.sparsity = np.full(d, float(sparsity))
-        else:
-            self.sparsity = np.array(sparsity, dtype=np.float32)
-            assert len(self.sparsity) == d, f"Sparsity array length {len(self.sparsity)} != d={d}"
-        
-        # Setup importance (scalar or per-path array)
-        if importance is None or importance == 1.0:
-            self.importance = np.ones(d)  # Uniform
-        elif isinstance(importance, (int, float)):
-            self.importance = np.full(d, float(importance))
-        else:
-            self.importance = np.array(importance, dtype=np.float32)
-            assert len(self.importance) == d, f"Importance array length {len(self.importance)} != d={d}"
-        
-        # Validate ranges
-        assert np.all((self.sparsity >= 0) & (self.sparsity <= 1)), "Sparsity must be in [0, 1]"
-        assert np.all(self.importance >= 0), "Importance must be non-negative"
-        
-        # Warn if all weights are zero
-        weights = self.importance * (1.0 - self.sparsity)
-        if np.sum(weights) == 0:
-            print("WARNING: All paths have zero sampling weight (sparsity=1 or importance=0). No sequences will be sampled!")
-
         self.adj_list = {}
         self.num_vertices = d * (l-1) + 1
         self.num_graph_edges = d * (l-1)
@@ -812,11 +780,6 @@ class InWeightsPathStar:
             'pause_token': self.SPECIAL_TOKENS["PAUSE"],
             'pad_token': self.SPECIAL_TOKENS["PAD"],
             'special_tokens': self.SPECIAL_TOKENS,
-            
-            # Sparsity and importance for weighted sampling
-            'sparsity': self.sparsity.tolist(),
-            'importance': self.importance.tolist(),
-            'has_sparsity_sampling': not np.allclose(self.sparsity, 0.0),
 
             # NOTE: num_pause_tokens is NOT stored - it's a runtime config parameter
             'root_vertex': self.v_root,

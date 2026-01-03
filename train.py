@@ -66,7 +66,7 @@ def get_default_config():
         'log_attention_maps': False,  # If True, log attention map heatmaps to wandb
         'attention_map_interval': 500,  # How often to log attention maps (iterations)
         'attention_map_samples': 3,  # Number of samples to visualize
-        'log_activation_stats': True,  # If True, log activation mean/variance per layer to wandb
+        'log_activation_stats': False,  # If True, log activation mean/variance per layer to wandb
         'analyze_embedding_geometry': False,  # If True, compute and log embedding geometry metrics during eval
         'log_edge_memorization_metrics': False, # If True, show and log % of edges memorized by model (works in both normal and edge_only modes)
         'plot_cosine_similarity_matrix': False, # If True, plot pairwise cosine similarity matrix of embeddings (can be slow for large graphs)
@@ -2694,7 +2694,7 @@ def train(config=None):
     val_data_np = val_data
     
     # Check if sparsity sampling is enabled
-    has_sparsity = meta.get('has_sparsity_sampling', False) and paths_membership is not None
+    has_sparsity = default_config.get('sparsity', False) and paths_membership is not None
     if has_sparsity:
         sparsity_arr = np.array(meta.get('sparsity', [0.0] * meta['d']))
         importance_arr = np.array(meta.get('importance', [1.0] * meta['d']))
@@ -3140,10 +3140,6 @@ def train(config=None):
     live_panel = LiveTrainingPanel(default_config)
 
     
-    # Track running average of training loss for comparison with theoretical minimum
-    running_loss_sum = 0.0
-    running_loss_count = 0
-
     # Initialize with first batch from combined dataset
     X, Y, batch_path_membership = get_batch('combined')
     
@@ -3154,7 +3150,6 @@ def train(config=None):
         while True:
             # Set learning rate based on scheduler
             lr = get_lr(iter_num, warmup_iters, lr_decay_iters, default_config, lr_scheduler_obj=lr_scheduler_obj)
-
             for param_group in optimizer.param_groups:
                 param_group['lr'] = lr
             
@@ -3372,7 +3367,7 @@ def train(config=None):
             steps = default_config['gradient_accumulation_steps']
 
             # Track activation stats on the last micro_step only (to avoid overhead)
-            track_stats = default_config.get('log_activation_stats', True)
+            track_stats = default_config.get('log_activation_stats', False)
             last_activation_stats = None
             last_logits = None  # For NaN debugging
             
@@ -3518,28 +3513,15 @@ def train(config=None):
             
             # Track running average for comparison with theoretical minimum
             lossf = loss.item() * steps
-            running_loss_sum += lossf
-            running_loss_count += 1
-            
-            # Reset running average at epoch boundaries
-            if iter_num > 0 and iter_num % meta['batches_per_epoch'] == 0:
-                running_loss_sum = 0.0
-                running_loss_count = 0
             
             if iter_num % default_config['log_interval'] == 0:
                 tokens_per_sec = (X.numel() * steps) / dt
-                
-                # Compute mean cosine distance during training (at log intervals)
-                train_mean_cosine_distance = compute_mean_cosine_distance(model, meta)
                 
                 # DEBUG: Count how many edge vs path samples in this batch
                 EDGE_token = meta['special_tokens']['EDGE']
                 PATH_token = meta['special_tokens']['PATH']
                 num_edges_in_batch = (X[:, 0] == EDGE_token).sum().item()
                 num_paths_in_batch = (X[:, 0] == PATH_token).sum().item()
-                
-                # Calculate running average
-                running_avg_loss = running_loss_sum / running_loss_count if running_loss_count > 0 else 0.0
 
                 if default_config['wandb_log']:
                     # Use cached gradient statistics (computed before zero_grad)
