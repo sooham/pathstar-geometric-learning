@@ -1,4 +1,4 @@
-.PHONY: help setup venv sweep multi-sweep visualize clean viz
+.PHONY: help setup venv sweep multi-sweep visualize clean viz sp stash_and_pull
 
 # Default target
 help:
@@ -174,6 +174,7 @@ copy-zip:
 	@echo "Copy complete!"
 
 # Stash local changes, pull from remote, and reapply stashed changes
+sp: stash_and_pull
 stash_and_pull:
 	@echo "Stashing local changes..."
 	git stash
