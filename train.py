@@ -2785,15 +2785,30 @@ def train(config=None):
     # Initialize epoch indices for sampling without replacement
     if has_sparsity:
         # Sample active sequences for first epoch
-        active_indices = sample_active_sequences_for_epoch(
-            paths_data, edges_data, paths_membership, edges_membership,
-            sparsity_arr,
-            user_config['independent_sampling_of_edges'],
-            user_config['independent_sampling_of_forward_reverse'],
-            user_config['use_undirected'],
-            meta,
-            edge_only=user_config['edge_only']
-        )
+        # Keep resampling until we get at least 1 sequence (prevent empty batches)
+        max_resample_attempts = 10
+        for attempt in range(max_resample_attempts):
+            active_indices = sample_active_sequences_for_epoch(
+                paths_data, edges_data, paths_membership, edges_membership,
+                sparsity_arr,
+                user_config['independent_sampling_of_edges'],
+                user_config['independent_sampling_of_forward_reverse'],
+                user_config['use_undirected'],
+                meta,
+                edge_only=user_config['edge_only']
+            )
+            if len(active_indices) > 0:
+                break
+            if attempt < max_resample_attempts - 1:
+                print(f"WARNING: Epoch 0 sampled 0 sequences (attempt {attempt+1}/{max_resample_attempts}), resampling...")
+        
+        if len(active_indices) == 0:
+            raise ValueError(
+                f"Failed to sample any sequences after {max_resample_attempts} attempts. "
+                f"Sparsity values may be too high: {sparsity_arr}. "
+                f"Consider reducing sparsity or increasing dataset size."
+            )
+        
         combined_epoch_indices = active_indices
         combined_size_effective = len(active_indices)
         print(f"Epoch 0: Sampled {combined_size_effective}/{combined_size} sequences ({100*combined_size_effective/combined_size:.1f}%)")
@@ -2971,15 +2986,32 @@ def train(config=None):
         if batch_idx == 0 and epoch_completed:
             if dataset == 'combined' and has_sparsity:
                 # Resample active sequences for new epoch
-                active_indices = sample_active_sequences_for_epoch(
-                    paths_data, edges_data, paths_membership, edges_membership,
-                    sparsity_arr,
-                    user_config['independent_sampling_of_edges'],
-                    user_config['independent_sampling_of_forward_reverse'],
-                    user_config['use_undirected'],
-                    meta,
-                    edge_only=user_config['edge_only']
-                )
+                # Keep resampling until we get at least 1 sequence (prevent empty batches)
+                max_resample_attempts = 10
+                for attempt in range(max_resample_attempts):
+                    active_indices = sample_active_sequences_for_epoch(
+                        paths_data, edges_data, paths_membership, edges_membership,
+                        sparsity_arr,
+                        user_config['independent_sampling_of_edges'],
+                        user_config['independent_sampling_of_forward_reverse'],
+                        user_config['use_undirected'],
+                        meta,
+                        edge_only=user_config['edge_only']
+                    )
+                    if len(active_indices) > 0:
+                        break
+                    if attempt < max_resample_attempts - 1:
+                        current_epoch = iter_num / meta['batches_per_epoch']
+                        print(f"WARNING: Epoch {int(current_epoch)} sampled 0 sequences (attempt {attempt+1}/{max_resample_attempts}), resampling...")
+                
+                if len(active_indices) == 0:
+                    current_epoch = iter_num / meta['batches_per_epoch']
+                    raise ValueError(
+                        f"Failed to sample any sequences at epoch {int(current_epoch)} after {max_resample_attempts} attempts. "
+                        f"Sparsity values may be too high: {sparsity_arr}. "
+                        f"Consider reducing sparsity or increasing dataset size."
+                    )
+                
                 epoch_indices = active_indices
                 combined_size_effective = len(active_indices)
                 current_epoch = iter_num / meta['batches_per_epoch']
@@ -2990,6 +3022,23 @@ def train(config=None):
         start_idx = batch_idx * train_batch_size
         end_idx = min(start_idx + train_batch_size, dataset_size)
         batch_seq_indices = epoch_indices[start_idx:end_idx]
+        
+        # Safety check: if batch is empty, log warning and return dummy data
+        # This should never happen with the resampling logic above, but handle gracefully
+        if len(batch_seq_indices) == 0:
+            LiveTrainingPanel.CONSOLE.print(f"[red]WARNING: Empty batch encountered at iter {iter_num}! This should not happen.[/red]")
+            LiveTrainingPanel.CONSOLE.print(f"[red]  dataset={dataset}, start_idx={start_idx}, end_idx={end_idx}, dataset_size={dataset_size}[/red]")
+            # Force epoch completion and resample
+            batch_idx = 0
+            epoch_completed = True
+            # Recursively call to get a valid batch (will trigger resampling)
+            if dataset == 'combined':
+                combined_batch_idx = batch_idx
+                combined_epoch_completed = epoch_completed
+            elif dataset == 'val':
+                val_batch_idx = batch_idx
+                val_epoch_completed = epoch_completed
+            return get_batch(dataset)
         
         # Update batch index for next call
         # If we've exhausted the dataset, wrap to 0 and mark epoch as completed
@@ -3201,6 +3250,13 @@ def train(config=None):
     
     # Initialize with first batch from combined dataset
     X, Y, batch_path_membership = get_batch('combined')
+    
+    # Safety check: ensure initial batch is not empty
+    if X.size(0) == 0:
+        raise ValueError(
+            "Initial batch is empty! This indicates a severe sampling issue. "
+            "Check sparsity configuration and dataset size."
+        )
     
 
     with live_panel.context:
@@ -3587,8 +3643,8 @@ def train(config=None):
                     # Use cached gradient statistics (computed before zero_grad)
                     grad_stats = cached_grad_stats.copy()
                     
-                    # Add logits statistics if available
-                    if check_nan_interval > 0 and last_logits is not None:
+                    # Add logits statistics if available (handle empty tensors)
+                    if check_nan_interval > 0 and last_logits is not None and last_logits.numel() > 0:
                         grad_stats['train/logits_max'] = float(last_logits.max())
                         grad_stats['train/logits_min'] = float(last_logits.min())
                         grad_stats['train/logits_mean'] = float(last_logits.mean())
