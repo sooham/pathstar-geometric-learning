@@ -2738,7 +2738,11 @@ def train(config=None):
     val_data_np = val_data
     
     # Check if sparsity sampling is enabled
-    has_sparsity = user_config.get('sparsity', False) and paths_membership is not None
+    # Check if any path has non-zero sparsity
+    sparsity_val = user_config['sparsity']
+    has_nonzero_sparsity = any(s > 0 for s in sparsity_val)
+    
+    has_sparsity = has_nonzero_sparsity and paths_membership is not None
     if has_sparsity:
         sparsity_arr = np.array(user_config.get('sparsity', [0.0] * meta['d']))
         importance_arr = np.array(user_config.get('importance', [1.0] * meta['d']))
