@@ -860,7 +860,13 @@ class InWeightsPathStar:
         with open(meta_path, 'rb') as f:
             meta = pickle.load(f)
         
-        val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+        # Handle empty validation file (when holdout_percentage=0)
+        val_path = os.path.join(data_dir, 'val.bin')
+        if os.path.exists(val_path) and os.path.getsize(val_path) > 0:
+            val_data = np.memmap(val_path, dtype=np.uint16, mode='r')
+        else:
+            # Empty validation set (holdout_percentage=0)
+            val_data = np.array([], dtype=np.uint16)
         
         # Load separate paths.bin and edges.bin
         paths_data = np.memmap(os.path.join(data_dir, 'paths.bin'), dtype=np.uint16, mode='r')

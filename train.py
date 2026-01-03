@@ -1307,7 +1307,12 @@ def analyze_embedding_geometry(model, meta, paths_data_np, val_data_np, iter_num
     
     # Reshape the flat numpy arrays to (num_samples, seq_len)
     paths_data = paths_data_np.reshape(PATHS_DATASET_SIZE, seq_len)
-    val_data = val_data_np.reshape(VAL_DATASET_SIZE, seq_len)
+    
+    # Handle empty validation set (when holdout_percentage=0)
+    if VAL_DATASET_SIZE > 0:
+        val_data = val_data_np.reshape(VAL_DATASET_SIZE, seq_len)
+    else:
+        val_data = val_data_np.reshape(0, seq_len)
     
     def extract_path_nodes(sequence, meta):
         """
@@ -2226,12 +2231,23 @@ def train(config=None):
     # Calculate sequence lengths
     paths_seq_length = len(paths_data) // paths_size
     edges_seq_length = len(edges_data) // edges_size
-    val_seq_length = len(val_data) // VAL_DATASET_SIZE
+    
+    # Handle empty validation set (when holdout_percentage=0)
+    if VAL_DATASET_SIZE > 0:
+        val_seq_length = len(val_data) // VAL_DATASET_SIZE
+    else:
+        # When no validation data, use paths_seq_length as reference
+        val_seq_length = paths_seq_length
     
     # Reshape data for easier indexing (needed for memory calculation)
     paths_data = paths_data.reshape(paths_size, paths_seq_length)
     edges_data = edges_data.reshape(edges_size, edges_seq_length)
-    val_data = val_data.reshape(VAL_DATASET_SIZE, val_seq_length)
+    
+    if VAL_DATASET_SIZE > 0:
+        val_data = val_data.reshape(VAL_DATASET_SIZE, val_seq_length)
+    else:
+        # Empty validation set - create empty array with correct shape
+        val_data = val_data.reshape(0, val_seq_length)
 
     # Combine datasets for training
     if user_config['edge_only']:

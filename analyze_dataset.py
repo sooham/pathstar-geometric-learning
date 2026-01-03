@@ -25,7 +25,13 @@ def analyze_dataset(dataset_dir):
     # Load data files
     paths_data = np.memmap(os.path.join(dataset_dir, 'paths.bin'), dtype=np.uint16, mode='r')
     edges_data = np.memmap(os.path.join(dataset_dir, 'edges.bin'), dtype=np.uint16, mode='r')
-    val_data = np.memmap(os.path.join(dataset_dir, 'val.bin'), dtype=np.uint16, mode='r')
+    
+    # Handle empty validation file (when holdout_percentage=0)
+    val_path = os.path.join(dataset_dir, 'val.bin')
+    if os.path.exists(val_path) and os.path.getsize(val_path) > 0:
+        val_data = np.memmap(val_path, dtype=np.uint16, mode='r')
+    else:
+        val_data = np.array([], dtype=np.uint16)
     
     # Get parameters
     d = meta['d']
@@ -47,12 +53,21 @@ def analyze_dataset(dataset_dir):
     # Calculate sequence lengths
     paths_seq_len = len(paths_data) // PATHS_DATASET_SIZE
     edges_seq_len = len(edges_data) // EDGES_DATASET_SIZE
-    val_seq_len = len(val_data) // VAL_DATASET_SIZE
+    
+    # Handle empty validation set (when holdout_percentage=0)
+    if VAL_DATASET_SIZE > 0:
+        val_seq_len = len(val_data) // VAL_DATASET_SIZE
+    else:
+        val_seq_len = paths_seq_len  # Use paths_seq_len as reference
     
     # Reshape data
     paths_data = paths_data.reshape(PATHS_DATASET_SIZE, paths_seq_len)
     edges_data = edges_data.reshape(EDGES_DATASET_SIZE, edges_seq_len)
-    val_data = val_data.reshape(VAL_DATASET_SIZE, val_seq_len)
+    
+    if VAL_DATASET_SIZE > 0:
+        val_data = val_data.reshape(VAL_DATASET_SIZE, val_seq_len)
+    else:
+        val_data = val_data.reshape(0, val_seq_len)
     
     print("=" * 80)
     print(f"Dataset Analysis: {os.path.basename(dataset_dir)}")
