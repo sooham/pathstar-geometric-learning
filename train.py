@@ -66,6 +66,7 @@ def get_default_config():
         'log_activation_stats': True,  # If True, log activation mean/variance per layer to wandb
         'analyze_embedding_geometry': False,  # If True, compute and log embedding geometry metrics during eval
         'log_edge_memorization_metrics': False, # If True, show and log % of edges memorized by model (works in both normal and edge_only modes)
+        'plot_cosine_similarity_matrix': False, # If True, plot pairwise cosine similarity matrix of embeddings (can be slow for large graphs)
         # Debugging
         'debug_masking': False,          # If True, show target masks applied to Y
         'debug_masking_samples': 2,      # How many batch rows to show
@@ -1613,13 +1614,14 @@ def evaluate(estimate_metrics, config, meta, iter_num, lr, ctx, device, model, v
     # Plot pairwise cosine similarity matrix (at every eval_interval)
     # This helps diagnose associative vs geometric memory (see PathStar paper Figure 24)
     cosine_similarity_plot_path = None
-    try:
-        cosine_similarity_plot_path = plot_pairwise_cosine_similarity_matrix(
-            model, meta, iter_num, config,
-            out_dir=config.get('out_dir', 'out')
-        )
-    except Exception as e:
-        LiveTrainingPanel.CONSOLE.print(f"[yellow]Warning: Cosine similarity matrix plot failed: {e}[/yellow]")
+    if config.get('plot_cosine_similarity_matrix', False):
+        try:
+            cosine_similarity_plot_path = plot_pairwise_cosine_similarity_matrix(
+                model, meta, iter_num, config,
+                out_dir=config.get('out_dir', 'out')
+            )
+        except Exception as e:
+            LiveTrainingPanel.CONSOLE.print(f"[yellow]Warning: Cosine similarity matrix plot failed: {e}[/yellow]")
     
     # Evaluate edge memorization
     edge_memorization_pct = None
@@ -2652,6 +2654,18 @@ def train(config=None):
         importance_arr_normalized = np.ones(meta['d'])
         meta['importance_normalized'] = importance_arr_normalized
     
+    # Pre-compute flag for importance weighting (check once, not every batch)
+    # Importance weighting is needed if any importance value differs from 1.0
+    use_importance_weighting = not np.allclose(importance_arr_normalized, 1.0)
+    
+    # Pre-compute combined membership array for O(1) vectorized lookup (no Python loops!)
+    # This concatenates path and edge memberships once instead of computing per batch
+    if paths_membership is not None and edges_membership is not None:
+        combined_membership = np.concatenate([paths_membership, edges_membership])
+        print(f"Optimized: Pre-computed combined membership array ({len(combined_membership)} samples)")
+    else:
+        combined_membership = None
+    
     # Initialize epoch indices for sampling without replacement
     if has_sparsity:
         # Sample active sequences for first epoch
@@ -2940,21 +2954,10 @@ def train(config=None):
         else:
             y = apply_task_specific_target_mask(x, y, mask_dataset_type)
         
-        # Get path membership for this batch (if available)
-        if paths_membership is not None and edges_membership is not None:
-            # Determine path membership for each sample
-            # batch_seq_indices indexes into epoch_indices (which are indices into combined data)
-            # For combined: indices < len(paths_data) are paths, >= are edges
-            batch_path_membership = []
-            for idx in batch_seq_indices:
-                if idx < len(paths_data):
-                    # This is a path sequence
-                    batch_path_membership.append(paths_membership[idx])
-                else:
-                    # This is an edge sequence
-                    edge_idx = idx - len(paths_data)
-                    batch_path_membership.append(edges_membership[edge_idx])
-            batch_path_membership = np.array(batch_path_membership, dtype=np.int32)
+        # Get path membership for this batch using vectorized indexing (no Python loops!)
+        if combined_membership is not None:
+            # Vectorized lookup: O(batch_size) NumPy indexing instead of Python loop
+            batch_path_membership = combined_membership[batch_seq_indices]
         else:
             batch_path_membership = None
         
@@ -3013,7 +3016,8 @@ def train(config=None):
                     batch_path_membership = None
             
             # Compute importance weights (if importance weighting enabled)
-            if batch_path_membership is not None and (has_sparsity or not np.allclose(meta['importance_normalized'], 1.0)):
+            # Use pre-computed flag instead of checking array every batch
+            if batch_path_membership is not None and use_importance_weighting:
                 importance_weights = torch.tensor(
                     meta['importance_normalized'][batch_path_membership],
                     dtype=torch.float32,
@@ -3192,13 +3196,14 @@ def train(config=None):
                     
                     # Plot pairwise cosine similarity matrix (at every eval_interval)
                     cosine_similarity_plot_path = None
-                    try:
-                        cosine_similarity_plot_path = plot_pairwise_cosine_similarity_matrix(
-                            model, meta, iter_num, default_config,
-                            out_dir=default_config.get('out_dir', 'out')
-                        )
-                    except Exception as e:
-                        LiveTrainingPanel.CONSOLE.print(f"[yellow]Warning: Cosine similarity matrix plot failed: {e}[/yellow]")
+                    if default_config.get('plot_cosine_similarity_matrix', False):
+                        try:
+                            cosine_similarity_plot_path = plot_pairwise_cosine_similarity_matrix(
+                                model, meta, iter_num, default_config,
+                                out_dir=default_config.get('out_dir', 'out')
+                            )
+                        except Exception as e:
+                            LiveTrainingPanel.CONSOLE.print(f"[yellow]Warning: Cosine similarity matrix plot failed: {e}[/yellow]")
                     
                     if default_config['log_edge_memorization_metrics']:
                         LiveTrainingPanel.CONSOLE.print(f"\n[cyan]Evaluating edge memorization (edge_only mode, iter {iter_num})...[/cyan]")
@@ -3274,7 +3279,8 @@ def train(config=None):
             last_logits = None  # For NaN debugging
             
             # Compute importance weights for this batch (if importance weighting enabled)
-            if batch_path_membership is not None and (has_sparsity or not np.allclose(meta['importance_normalized'], 1.0)):
+            # Use pre-computed flag instead of checking array every batch
+            if batch_path_membership is not None and use_importance_weighting:
                 importance_weights = torch.tensor(
                     meta['importance_normalized'][batch_path_membership],
                     dtype=torch.float32,
