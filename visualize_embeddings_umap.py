@@ -42,7 +42,178 @@ import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 
 from model import GPTConfig, GPT
-from umap_utils import apply_umap
+from umap_utils import apply_umap, create_embedding_gif
+import matplotlib.pyplot as plt
+
+
+def plot_embeddings_2d_with_paths(embeddings, meta, save_path=None, epoch=None, iteration=None,
+                                   include_root=True, include_special=False, num_paths=5):
+    """
+    Create a simple 2D visualization of embeddings with sampled paths highlighted.
+    
+    This is a refactored utility for quick visualization during training.
+    
+    Args:
+        embeddings: numpy array of shape (vocab_size, n_embd)
+        meta: Metadata dictionary containing paths_by_leaf, special_tokens, etc.
+        save_path: Path to save the plot (if None, returns figure without saving)
+        epoch: Optional epoch number to display in title
+        iteration: Optional iteration number to display in title
+        include_root: Whether to include root vertex in UMAP (default: False)
+        include_special: Whether to include special tokens in UMAP (default: False)
+        num_paths: Number of paths to highlight (default: 5)
+        
+    Returns:
+        fig: matplotlib figure object
+    """
+    
+    vocab_size, n_embd = embeddings.shape
+    
+    # Check if we can use raw embeddings (skip UMAP when dimension matches)
+    use_raw_2d = (n_embd == 2)
+    
+    # Get metadata
+    paths_by_leaf = meta.get('paths_by_leaf', {})
+    train_leaves = meta.get('train_leaves', set())
+    root_vertex = meta.get('root_vertex', None)
+    special_tokens = meta.get('special_tokens', {})
+    
+    if not paths_by_leaf:
+        raise ValueError("paths_by_leaf not found in metadata")
+    
+    # Create filtering mask
+    is_special = np.zeros(vocab_size, dtype=bool)
+    for token_id in special_tokens.values():
+        if isinstance(token_id, int) and 0 <= token_id < vocab_size:
+            is_special[token_id] = True
+    
+    umap_mask = np.ones(vocab_size, dtype=bool)
+    if not include_special:
+        umap_mask &= ~is_special
+    if not include_root and root_vertex is not None:
+        umap_mask[root_vertex] = False
+    
+    filtered_embeddings = embeddings[umap_mask]
+    filtered_indices = np.where(umap_mask)[0]
+    
+    # Compute 2D projection
+    if use_raw_2d:
+        reduced_2d = filtered_embeddings
+        viz_method = "Raw Embeddings"
+    else:
+        n_neighbors_val = min(15, filtered_embeddings.shape[0] - 1)
+        reduced_2d = apply_umap(
+            filtered_embeddings,
+            n_components=2,
+            n_neighbors=n_neighbors_val,
+            min_dist=0.1,
+            random_state=42
+        )
+        viz_method = "UMAP"
+    
+    # Create token position mapping
+    token_to_pos = {token_id: i for i, token_id in enumerate(filtered_indices)}
+    
+    # Sample paths consistently
+    train_path_leaves = [leaf for leaf in paths_by_leaf.keys() if leaf in train_leaves]
+    num_paths_to_show = min(num_paths, len(train_path_leaves))
+    
+    np.random.seed(42)
+    sampled_leaves = []
+    if num_paths_to_show > 0:
+        sampled_leaves = np.random.choice(train_path_leaves, size=num_paths_to_show, replace=False).tolist()
+    
+    # Define colors
+    BRIGHT_COLORS = ['#FF6B6B', '#4ECDC4', '#FFD93D', '#6BCB77', '#C77DFF']
+    path_color_map = {leaf: BRIGHT_COLORS[i % len(BRIGHT_COLORS)] for i, leaf in enumerate(sampled_leaves)}
+    
+    # Create figure
+    fig, ax = plt.subplots(figsize=(12, 10))
+    
+    # Plot background nodes
+    background_tokens = [t for t in filtered_indices if not is_special[t]]
+    if root_vertex is not None and not include_root and root_vertex in background_tokens:
+        background_tokens.remove(root_vertex)
+    
+    if background_tokens:
+        background_positions = [token_to_pos[t] for t in background_tokens if t in token_to_pos]
+        if background_positions:
+            ax.scatter(
+                reduced_2d[background_positions, 0],
+                reduced_2d[background_positions, 1],
+                c='lightgray', alpha=0.2, s=10, label='Other nodes', zorder=1
+            )
+    
+    # Plot sampled paths with arrows
+    for path_idx, leaf_token in enumerate(sampled_leaves):
+        path_tokens = paths_by_leaf[leaf_token]
+        color = path_color_map[leaf_token]
+        
+        visible_path_tokens = [t for t in path_tokens if t in token_to_pos]
+        
+        if len(visible_path_tokens) > 0:
+            path_positions = [token_to_pos[t] for t in visible_path_tokens]
+            
+            # Plot nodes
+            ax.scatter(
+                reduced_2d[path_positions, 0],
+                reduced_2d[path_positions, 1],
+                c=color, alpha=0.8, s=50,
+                label=f'Path {path_idx+1}',
+                edgecolors='black', linewidths=0.5,
+                zorder=3
+            )
+            
+            # Draw arrows
+            for i in range(len(visible_path_tokens) - 1):
+                start_pos = token_to_pos[visible_path_tokens[i]]
+                end_pos = token_to_pos[visible_path_tokens[i + 1]]
+                
+                ax.annotate('', 
+                           xy=(reduced_2d[end_pos, 0], reduced_2d[end_pos, 1]),
+                           xytext=(reduced_2d[start_pos, 0], reduced_2d[start_pos, 1]),
+                           arrowprops=dict(arrowstyle='->', color=color, lw=1.5, alpha=0.6),
+                           zorder=2)
+    
+    # Highlight root if included
+    if include_root and root_vertex is not None and root_vertex in token_to_pos:
+        root_pos = token_to_pos[root_vertex]
+        ax.scatter(
+            reduced_2d[root_pos, 0],
+            reduced_2d[root_pos, 1],
+            c='black', s=300, marker='X',
+            label='Root',
+            edgecolors='white', linewidths=2,
+            zorder=10
+        )
+    
+    # Set labels and title
+    ax.set_xlabel(f'{viz_method} 1', fontsize=12)
+    ax.set_ylabel(f'{viz_method} 2', fontsize=12)
+    
+    # Build title with epoch/iteration info
+    title = f'Token Embeddings (2D {viz_method})'
+    if epoch is not None or iteration is not None:
+        title += '\n'
+        if epoch is not None:
+            title += f'Epoch {epoch}'
+        if iteration is not None:
+            if epoch is not None:
+                title += f', '
+            title += f'Iter {iteration}'
+    
+    ax.set_title(title, fontsize=14)
+    ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=9)
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    # Save if path provided
+    if save_path is not None:
+        fig.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"Saved embedding plot: {save_path}")
+    
+    return fig
 
 
 def load_checkpoint_and_model(checkpoint_path, device='cpu'):

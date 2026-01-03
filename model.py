@@ -14,6 +14,11 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import numpy as np
+from visualize_embeddings_umap import plot_embeddings_2d_with_paths
+from umap_utils import create_embedding_gif
+import matplotlib.pyplot as plt
+
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -761,3 +766,142 @@ class GPT(nn.Module):
         entropy = -torch.sum(probs * log_probs, dim=-1)  # shape: (b, t)
         
         return entropy
+
+    @torch.no_grad()
+    def plot_embeddings_umap(self, save_path=None, epoch=None, iteration=None,
+                            include_root=False, include_special=False, num_paths=5):
+        """
+        Plot token embeddings in 2D with path structure highlighted.
+        
+        Creates a simple 2D UMAP visualization showing sampled training paths
+        with distinct colors and arrows. Tracks epoch and iteration in the plot title.
+        
+        Args:
+            save_path: Path to save the plot (if None, returns figure without saving)
+            epoch: Optional epoch number to display in title
+            iteration: Optional iteration number to display in title
+            include_root: Whether to include root vertex in UMAP (default: False)
+            include_special: Whether to include special tokens in UMAP (default: False)
+            num_paths: Number of paths to highlight (default: 5)
+            
+        Returns:
+            fig: matplotlib figure object
+            
+        Note:
+            Requires metadata (self.meta) with 'paths_by_leaf' for path visualization.
+        """
+        
+        if self.meta is None or 'paths_by_leaf' not in self.meta:
+            raise ValueError("Metadata with 'paths_by_leaf' is required for embedding visualization")
+        
+        # Extract embeddings from the model
+        embeddings = self.transformer.wte.weight.detach().cpu().numpy()
+        
+        # Create visualization
+        fig = plot_embeddings_2d_with_paths(
+            embeddings=embeddings,
+            meta=self.meta,
+            save_path=save_path,
+            epoch=epoch,
+            iteration=iteration,
+            include_root=include_root,
+            include_special=include_special,
+            num_paths=num_paths
+        )
+        
+        return fig
+
+    @staticmethod
+    def create_embedding_gif_from_checkpoints(checkpoint_paths, output_path='embeddings.gif',
+                                             duration=500, loop=0, include_root=False,
+                                             include_special=False, num_paths=5, device='cpu'):
+        """
+        Create an animated GIF from embeddings across multiple checkpoint files.
+        
+        This is useful for visualizing how embeddings evolve during training.
+        
+        Args:
+            checkpoint_paths: List of paths to checkpoint files (.pt), in order
+            output_path: Path to save the output GIF (default: 'embeddings.gif')
+            duration: Duration of each frame in milliseconds (default: 500ms)
+            loop: Number of loops (0 = infinite loop, default: 0)
+            include_root: Whether to include root vertex in UMAP (default: False)
+            include_special: Whether to include special tokens in UMAP (default: False)
+            num_paths: Number of paths to highlight (default: 5)
+            device: Device to load checkpoints on (default: 'cpu')
+            
+        Returns:
+            None (saves GIF to disk)
+            
+        Example:
+            >>> checkpoints = [f'out/ckpt_epoch_{i}.pt' for i in range(0, 100, 10)]
+            >>> GPT.create_embedding_gif_from_checkpoints(
+            ...     checkpoints,
+            ...     output_path='training_evolution.gif',
+            ...     duration=800
+            ... )
+        """
+        figures = []
+        
+        print(f"Creating embedding GIF from {len(checkpoint_paths)} checkpoints...")
+        
+        for i, ckpt_path in enumerate(checkpoint_paths):
+            print(f"  [{i+1}/{len(checkpoint_paths)}] Loading {ckpt_path}...")
+            
+            # Load checkpoint
+            checkpoint = torch.load(ckpt_path, map_location=device)
+            model_args = checkpoint['model_args']
+            meta = checkpoint.get('meta', {})
+            
+            if meta is None or 'paths_by_leaf' not in meta:
+                raise ValueError(f"Checkpoint {ckpt_path} missing required metadata")
+            
+            # Create model
+            config = GPTConfig(**model_args)
+            model = GPT(config, meta=meta)
+            
+            # Load state dict
+            state_dict = checkpoint['model']
+            unwanted_prefix = '_orig_mod.'
+            for k in list(state_dict.keys()):
+                if k.startswith(unwanted_prefix):
+                    state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+            
+            # Remove neighborhood tensors if present
+            for k in ['neighborhood_tensor', 'neighborhood_sizes_tensor', 'inv_neighborhood_sizes_tensor']:
+                state_dict.pop(k, None)
+            
+            model.load_state_dict(state_dict)
+            model.to(device)
+            model.eval()
+            
+            # Extract epoch/iter info from checkpoint
+            epoch = checkpoint.get('epoch', None)
+            iter_num = checkpoint.get('iter_num', None)
+            
+            # Generate plot
+            fig = model.plot_embeddings_umap(
+                save_path=None,
+                epoch=epoch,
+                iteration=iter_num,
+                include_root=include_root,
+                include_special=include_special,
+                num_paths=num_paths
+            )
+            
+            figures.append(fig)
+        
+        # Create GIF from figures
+        print(f"Generating GIF...")
+        create_embedding_gif(
+            figures=figures,
+            output_path=output_path,
+            duration=duration,
+            loop=loop
+        )
+        
+        # Clean up figures
+        for fig in figures:
+            plt.close(fig)
+        
+        print(f"Done! Saved to: {output_path}")

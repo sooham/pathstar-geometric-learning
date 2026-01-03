@@ -19,6 +19,8 @@ import time
 import math
 import subprocess
 from contextlib import nullcontext
+import signal
+import sys
 
 import numpy as np
 import torch
@@ -33,6 +35,7 @@ from learning_rate_scheduler import get_lr, initialize_lr_scheduler
 
 from live_display import LiveTrainingPanel, get_rich_token_str
 from utils import clear_gpu_memory, get_git_commit_id, detect_device, set_dtype, compute_token_colors
+from umap_utils import create_embedding_gif_from_saved_plots
 
 
 # GOOD
@@ -67,6 +70,10 @@ def get_default_config():
         'analyze_embedding_geometry': False,  # If True, compute and log embedding geometry metrics during eval
         'log_edge_memorization_metrics': False, # If True, show and log % of edges memorized by model (works in both normal and edge_only modes)
         'plot_cosine_similarity_matrix': False, # If True, plot pairwise cosine similarity matrix of embeddings (can be slow for large graphs)
+        'output_embedding_gif': True,  # If True, save embedding plots during training and create GIF at end/interrupt
+        'embedding_plot_interval': 100,  # How often to save embedding plots for GIF (iterations). Should be multiple of eval_interval
+        'embedding_gif_duration': 500,  # Duration per frame in GIF (milliseconds)
+        'embedding_gif_num_paths': 5,  # Number of paths to highlight in embedding plots
         # Debugging
         'debug_masking': False,          # If True, show target masks applied to Y
         'debug_masking_samples': 2,      # How many batch rows to show
@@ -2380,6 +2387,66 @@ def train(config=None):
         iter_num = checkpoint['iter_num']
     else:
         iter_num = 0
+    
+    # Initialize embedding plot tracking for GIF generation
+    embedding_plot_paths = []
+    embedding_plots_dir = None
+    if default_config.get('output_embedding_gif', False):
+        embedding_plots_dir = os.path.join(default_config['out_dir'], 'embedding_plots', custom_name)
+        os.makedirs(embedding_plots_dir, exist_ok=True)
+        LiveTrainingPanel.CONSOLE.print(f"[cyan]Embedding GIF enabled - plots will be saved to: {embedding_plots_dir}[/cyan]")
+        LiveTrainingPanel.CONSOLE.print(f"[cyan]  Plot interval: every {default_config['embedding_plot_interval']} iterations[/cyan]")
+        LiveTrainingPanel.CONSOLE.print(f"[cyan]  GIF frame duration: {default_config['embedding_gif_duration']}ms[/cyan]")
+    
+    # Define cleanup function for GIF generation (called at end or on interrupt)
+    def cleanup_and_create_gif():
+        """Create embedding GIF from saved plots on normal exit or interruption"""
+        if default_config.get('output_embedding_gif', False) and len(embedding_plot_paths) > 0:
+            gif_path = os.path.join(default_config['out_dir'], f'embedding_evolution_{custom_name}.gif')
+            
+            LiveTrainingPanel.CONSOLE.print(f"[cyan]Creating embedding evolution GIF from {len(embedding_plot_paths)} saved plots...[/cyan]")
+            
+            try:
+                create_embedding_gif_from_saved_plots(
+                    embedding_plot_paths,
+                    gif_path,
+                    duration=default_config.get('embedding_gif_duration', 500),
+                    cleanup_images=True  # Keep source images by default
+                )
+                
+                LiveTrainingPanel.CONSOLE.print(f"[green]✓ Created embedding GIF: {gif_path}[/green]")
+                
+                # Log to wandb if enabled
+                if default_config.get('wandb_log', False) and wandb.run is not None:
+                    try:
+                        wandb.log({'embedding_evolution_gif': wandb.Video(gif_path, fps=1000/default_config.get('embedding_gif_duration', 500), format='gif')})
+                    except Exception as e:
+                        LiveTrainingPanel.CONSOLE.print(f"[yellow]Warning: Failed to log GIF to wandb: {e}[/yellow]")
+                
+            except Exception as e:
+                LiveTrainingPanel.CONSOLE.print(f"[red]Failed to create embedding GIF: {e}[/red]")
+    
+    # Register signal handlers for graceful interruption
+    interrupted = [False]  # Use list to allow modification in nested function
+    
+    def signal_handler(signum, frame):
+        """Handle interrupt signals (Ctrl+C, SIGTERM) gracefully"""
+        if interrupted[0]:
+            # Second interrupt - force exit
+            LiveTrainingPanel.CONSOLE.print("[red]Force interrupted! Exiting immediately...[/red]")
+            sys.exit(1)
+        
+        interrupted[0] = True
+        signal_name = 'SIGINT' if signum == signal.SIGINT else 'SIGTERM'
+        LiveTrainingPanel.CONSOLE.print(f"[yellow]\n{'='*60}[/yellow]")
+        LiveTrainingPanel.CONSOLE.print(f"[yellow]Received {signal_name} - gracefully shutting down...[/yellow]")
+        LiveTrainingPanel.CONSOLE.print(f"[yellow]Current iteration: {iter_num}[/yellow]")
+        LiveTrainingPanel.CONSOLE.print(f"[yellow]Press Ctrl+C again to force exit[/yellow]")
+        LiveTrainingPanel.CONSOLE.print(f"[yellow]{'='*60}[/yellow]")
+    
+    # Register handlers
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
 
     # Calculate and log theoretical minimum loss
     if default_config['wandb_log'] and wandb.run is not None:
@@ -3090,6 +3157,30 @@ def train(config=None):
             for param_group in optimizer.param_groups:
                 param_group['lr'] = lr
             
+            # Save embedding plot for GIF (if enabled and at interval)
+            if (default_config.get('output_embedding_gif', False) and 
+                iter_num > 0 and 
+                iter_num % default_config.get('embedding_plot_interval', 100) == 0):
+                try:
+                    if meta and 'paths_by_leaf' in meta:
+                        current_epoch = iter_num / meta['batches_per_epoch']
+                        plot_filename = f'embedding_iter_{iter_num:06d}_epoch_{current_epoch:.1f}.png'
+                        plot_path = os.path.join(embedding_plots_dir, plot_filename)
+                        
+                        fig = model.plot_embeddings_umap(
+                            save_path=plot_path,
+                            epoch=int(current_epoch),
+                            iteration=iter_num,
+                            include_root=False,
+                            include_special=False,
+                            num_paths=default_config.get('embedding_gif_num_paths', 5)
+                        )
+                        plt.close(fig)
+                        embedding_plot_paths.append(plot_path)
+                        LiveTrainingPanel.CONSOLE.print(f"[dim cyan]Saved embedding plot {len(embedding_plot_paths)}: {plot_filename}[/dim cyan]")
+                except Exception as e:
+                    LiveTrainingPanel.CONSOLE.print(f"[yellow]Warning: Failed to save embedding plot at iter {iter_num}: {e}[/yellow]")
+            
             # Evaluate
             if iter_num % default_config['eval_interval'] == 0:
                 if not default_config['edge_only']:
@@ -3268,6 +3359,11 @@ def train(config=None):
                     )
             
             if iter_num == 0 and default_config['eval_only']:
+                break
+            
+            # Check for graceful interruption
+            if interrupted[0]:
+                LiveTrainingPanel.CONSOLE.print(f"[yellow]Breaking training loop at iteration {iter_num}[/yellow]")
                 break
             
             # Forward backward update with batch prefetching for better GPU utilization
@@ -3513,6 +3609,12 @@ def train(config=None):
     # Cleanup and finalization
     LiveTrainingPanel.CONSOLE.print("Finalizing training run...")
     
+    # Create embedding GIF if enabled
+    try:
+        cleanup_and_create_gif()
+    except Exception as e:
+        LiveTrainingPanel.CONSOLE.print(f"[red]Error creating embedding GIF: {e}[/red]")
+    
     # Clear GPU memory before finishing
     if device_type == 'cuda':
         try:
@@ -3530,7 +3632,10 @@ def train(config=None):
             wandb.finish()
         # In sweep mode, don't call finish - let the agent handle it
     
-    LiveTrainingPanel.CONSOLE.print("Training complete!")
+    if interrupted[0]:
+        LiveTrainingPanel.CONSOLE.print("[yellow]Training interrupted by user[/yellow]")
+    else:
+        LiveTrainingPanel.CONSOLE.print("[green]Training complete![/green]")
 
 
 def sweep_train():
