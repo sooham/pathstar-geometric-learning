@@ -47,7 +47,7 @@ parameters:
     # value: [1.0, 2.0, 0.5, ...]  # Per-path example
   
   independent_sampling_of_edges:
-    value: false  # If true, each edge sampled independently; if false, all edges from a path sampled together
+    value: true  # If true, each edge sampled independently; if false, all edges from a path sampled together
   
   independent_sampling_of_forward_reverse:
     value: false  # Only matters when independent_sampling_of_edges=true
