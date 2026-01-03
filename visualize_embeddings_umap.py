@@ -117,7 +117,7 @@ def plot_embeddings_2d_with_paths(embeddings, meta, save_path=None, epoch=None, 
     token_to_pos = {token_id: i for i, token_id in enumerate(filtered_indices)}
     
     # Sample paths consistently
-    train_path_leaves = [leaf for leaf in paths_by_leaf.keys() if leaf in train_leaves]
+    train_path_leaves = [leaf for leaf in paths_by_leaf.keys()]
     num_paths_to_show = min(num_paths, len(train_path_leaves))
     
     np.random.seed(42)
