@@ -768,16 +768,12 @@ class GPT(nn.Module):
     @torch.no_grad()
     def plot_embeddings_umap(self, save_path=None, epoch=None, iteration=None,
                             include_root=False, include_special=False, num_paths=5,
-                            figsize=(10, 8), reference_reducer=None):
+                            figsize=(10, 8)):
         """
         Plot token embeddings in 2D with path structure highlighted.
         
         Creates a simple 2D UMAP visualization showing sampled training paths
         with distinct colors and arrows. Tracks epoch and iteration in the plot title.
-        
-        Supports "anchored UMAP" for smooth animations:
-        - On first call (reference_reducer=None): fits UMAP and returns (fig, reducer)
-        - On subsequent calls: uses reference_reducer for consistent coordinate system
         
         Args:
             save_path: Path to save the plot (if None, returns figure without saving)
@@ -787,12 +783,9 @@ class GPT(nn.Module):
             include_special: Whether to include special tokens in UMAP (default: False)
             num_paths: Number of paths to highlight (default: 5)
             figsize: Figure size as (width, height) in inches (default: (10, 8))
-            reference_reducer: Optional pre-fitted UMAP reducer for anchored projections.
-                              If provided, embeddings will be projected into the same space.
             
         Returns:
-            If reference_reducer is None: Tuple of (fig, fitted_reducer)
-            If reference_reducer is provided: fig only
+            fig: matplotlib figure object
             
         Note:
             Requires metadata (self.meta) with 'paths_by_leaf' for path visualization.
@@ -805,8 +798,8 @@ class GPT(nn.Module):
         # Extract embeddings from the model
         embeddings = self.transformer.wte.weight.detach().cpu().numpy()
         
-        # Create visualization (returns fig or (fig, reducer) depending on reference_reducer)
-        result = plot_embeddings_2d_with_paths(
+        # Create visualization
+        fig = plot_embeddings_2d_with_paths(
             embeddings=embeddings,
             meta=self.meta,
             save_path=save_path,
@@ -815,11 +808,10 @@ class GPT(nn.Module):
             include_root=include_root,
             include_special=include_special,
             num_paths=num_paths,
-            figsize=figsize,
-            reference_reducer=reference_reducer
+            figsize=figsize
         )
         
-        return result
+        return fig
 
     @staticmethod
     def create_embedding_gif_from_checkpoints(checkpoint_paths, output_path='embeddings.gif',
