@@ -1,0 +1,140 @@
+# Minimal sweep configuration for quick testing
+# Focuses on a few key hyperparameters
+program: train.py
+method: grid
+metric:
+  name: train/loss/overall
+  goal: minimize
+
+parameters:
+  # Dataset parameters - small fixed values for quick iteration
+  graph_d:
+    values: [6]
+  graph_l:
+    values: [4]
+  graph_vocab_size:
+    value: '1max'
+  graph_holdout_percentage:
+    value: 0
+  num_pause_tokens:
+    values: [0] 
+  use_undirected:
+    value: true
+  use_directional_tokens:
+    values: [false]
+  balance_interleaved_datasets:
+    values: [false]
+  weight_tying:
+    values: [true] # weight tying requires that the input to the unembedding matrix match the embedding of the output, so x + W_0 (attn from v) needs to be close.
+  edge_only:
+    value: true
+  use_pos_embeddings:
+    value: false
+  predict_direction_for_edge_task:
+    values: [false]
+  use_directional_tokens_in_path:
+    values: [false] # for now test this
+  p_autoregressive_substitution:
+    values: [0]
+  
+  # Sparsity & Importance Sampling
+  sparsity:
+    value: [0.9, 0.9, 0.9, 0.9, 0.9, 0]  # Scalar: uniform across all paths (0.0 = disabled)
+    # value: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]  # Per-path example
+  
+  importance:
+    value: 1.0  # Scalar: uniform importance (1.0 = equal weight)
+    # value: [1.0, 2.0, 0.5, ...]  # Per-path example
+  
+  independent_sampling_of_edges:
+    value: true  # If true, each edge sampled independently; if false, all edges from a path sampled together
+  
+  independent_sampling_of_forward_reverse:
+    value: false  # Only matters when independent_sampling_of_edges=true
+                  # If true, (u,v) and (v,u) sampled independently
+                  # If false, (u,v) and (v,u) sampled together
+  
+  # Model + Training config combinations (partial cross-product)
+  # Lists within a dict are expanded into cross products
+  # Single values remain fixed for that config group
+  model_config:
+    values:
+      # Deep models (n_layer=5): sweep MLP and LayerNorm (2x2 = 4 configs)
+      - n_layer: [0]
+        n_head: 1
+        n_embd: [2]
+        dropout: [0]
+        embed_dropout: 0
+        bias: [false]
+        base: 100
+        learning_rate: 1e-3
+        weight_decay: [0]
+        lr_scheduler: "Constant" #'ReduceLROnPlateau'
+        epochs: 10_000
+        use_mlp: [false]
+        use_layernorm: [false]
+        seed: [4731]
+
+  # Other training hyperparameters (not in model_config)
+  label_smoothing:
+    values: [0]
+  adam_beta1:
+    value: 0.9
+  adam_beta2:
+    value: 0.95
+  grad_clip:
+    value: 1.0
+
+  # LR schedule params (when lr_scheduler is set in model_config)
+  plateau_factor:
+    value: 0.80
+  plateau_patience:
+    value: 30
+  plateau_threshold:
+    value: 1e-4
+  plateau_cooldown:
+    value: 0
+  lr_warmup_frac:
+    value: 0.1
+  min_learning_rate:
+    value: 1e-5
+  early_terimation_val_loss_threshold:
+    value: 0.001
+  gradient_accumulation_steps:
+    value: 1  # Reduced from 4 for fewer optimizer steps, better GPU utilization
+  compile:
+    value: true
+  eval_interval:
+    value: 10  # Increased from 50 to reduce evaluation overhead
+  log_interval:
+    value: 10  # Increased from 10 to reduce print overhead
+  eval_verbose_interval:
+    value: 30
+  live_display:
+    value: false
+  live_display_update_interval:
+    value: 10
+  debug_masking:
+    value: false
+  debug_attention_maps:
+    value: false
+  log_edge_memorization_metrics:
+    value: true
+  debug_attention_map_interval:
+    value: 8000
+  batch_size:
+    value: 4000
+  embedding_plot_interval:
+    value: 50
+  embedding_gif_duration:
+    value: 150 # milliseconds
+  embedding_gif_num_paths:
+    value: 6 # number of paths to highlight in embedding plots
+  # run_type:
+  #   value: resume
+  
+  wandb_project:
+    value: node2vec_sparse
+  # wandb_run_name:
+  #   value: 20260102T023816_2e73091_DSET_G50L20P0PeUdir_L0E4H1MlpAgeluLnBiasNoPosD0WtEp10000Seed4731
+
